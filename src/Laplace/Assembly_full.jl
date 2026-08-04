@@ -61,9 +61,9 @@ function H_G_full_direct_2d!(dad::BEMdata{<:Scalar}; npg=20, threaded=true)
         end
     end
 
+    # Free term for discontinuous collocation: 1/2 boundary, 1 interior
     @inbounds for i in 1:dad.nt
-        H[i, i] = 0.0
-        H[i, i] = -sum(H[i, :])
+        H[i, i] = free_term(dad, i)
     end
     return H, G
 end
@@ -115,8 +115,7 @@ function H_G_full_direct_3d!(dad::BEMdata{<:Scalar}; npg=12, threaded=true)
         end
     end
     @inbounds for i in 1:dad.nt
-        H[i, i] = 0.0
-        H[i, i] = -sum(H[i, :])
+        H[i, i] = free_term(dad, i)  # 1/2 boundary, 1 interior (discontinuous)
     end
     return H, G
 end

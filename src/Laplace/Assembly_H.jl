@@ -12,7 +12,7 @@
 # outside — same pattern as DIBEM  M x = D (c ∘ x) + diag ∘ x.
 #
 export H_G_Hmat, corrige_diagonais!, MixedBCOperator, ColWeightedOp
-export correct_nearfield!, node_weights
+export correct_nearfield!, node_weights, free_term
 # all_points / point live in Structures.jl
 
 """
@@ -278,15 +278,16 @@ function correct_nearfield!(
                 j > n && continue
                 # pointwise collocation (same as far-field compressed kernel×w)
                 # — do not index H.K/G.K (HMatrix disables getindex)
-                hp = 0.0
-                gp = 0.0
-                if i != j
-                    r_node = dad.Nodes[j] - pf
-                    n_node = dad.Normal[j]
-                    U, Tker = fundamental(dad, r_node, n_node)
-                    hp = Tker * H.w[j]
-                    gp = U * G.w[j]
+                # Free term (½ / 1) is applied on the diagonal separately — do not
+                # put singular self-contribution into corr (avoids double-counting).
+                if i == j
+                    continue
                 end
+                r_node = dad.Nodes[j] - pf
+                n_node = dad.Normal[j]
+                U, Tker = fundamental(dad, r_node, n_node)
+                hp = Tker * H.w[j]
+                gp = U * G.w[j]
                 dh = hv[k] - hp
                 dg = gv[k] - gp
                 if abs(dh) > 0
@@ -332,24 +333,58 @@ function _assemble_HG_bare(KDq, KDu, Xclt, Yclt_H, Yclt_G, fmt::Symbol;
 end
 
 """
-    corrige_diagonais!(dad, H, G)
+    free_term(dad, i) -> Float64
 
-Fill free-term diagonals on [`ColWeightedOp`](@ref) (or classical `HMatrix`).
+Diagonal free-term entry placed in ``H_ii`` for discontinuous collocation.
 
-- `H`: constant-field identity → `d_i = -∑_j H_ij` (with current d=0)
-- `G`: linear-field identity with `H`
+Analytical jump coefficients are ``c=1/2`` (smooth boundary) and ``c=1``
+(domain). This code stores **``H_ii = -c``** so that, with the double-layer
+sign convention of [`fundamental`](@ref), constant fields satisfy
+``∑_j H_ij ≈ 0`` (same as the classical row-sum fix).
+
+| location | ``c`` | ``H_ii = free_term`` |
+|----------|-------|----------------------|
+| boundary | ``1/2`` | ``-1/2`` |
+| internal | ``1`` | ``-1`` |
 """
-function corrige_diagonais!(dad::BEMdata{<:Laplace}, H::ColWeightedOp, G::ColWeightedOp)
+@inline free_term(dad::BEMdata, i::Integer) = i <= dad.n ? -0.5 : -1.0
+
+"""
+    corrige_diagonais!(dad, H, G; free_term=:explicit)
+
+Diagonal coefficients for [`ColWeightedOp`](@ref) / `HMatrix`.
+
+# Keywords
+- `free_term = :explicit` (default): discontinuous elements —
+  ``H_ii = 1/2`` on the boundary, ``H_ii = 1`` inside the domain.
+- `free_term = :rowsum`: ``H_ii = -∑_{j≠i} H_ij`` (classical identity; useful if
+  far-field is approximate and you want to enforce ``H 1 = 0`` exactly).
+
+`G_ii` is always from the linear-field identity (not a free term).
+"""
+function corrige_diagonais!(dad::BEMdata{<:Laplace}, H::ColWeightedOp, G::ColWeightedOp;
+        free_term::Symbol = :explicit)
     n = dad.n
     nt = dad.nt
     k = float(dad.properties.k)
 
-    # H free term: row sums of off-diagonal part
-    hsum = H * ones(nt)   # with d=0 → Dq*(wH.*1)
-    @inbounds for i in 1:nt
-        H.d[i] = -hsum[i]
+    # --- H diagonal (free term) ---
+    if free_term === :explicit
+        # discontinuous collocation: c = 1/2 (boundary), c = 1 (domain)
+        @inbounds for i in 1:nt
+            H.d[i] = BEM.free_term(dad, i)
+        end
+    elseif free_term === :rowsum
+        fill!(H.d, 0.0)
+        hsum = H * ones(nt)   # off-diagonal + corr only
+        @inbounds for i in 1:nt
+            H.d[i] = -hsum[i]
+        end
+    else
+        throw(ArgumentError("free_term must be :explicit or :rowsum, got $free_term"))
     end
 
+    # --- G diagonal (linear field; not a free-term coefficient) ---
     pts = all_points(dad)
     if dad.dimension == 2
         xlin = [p[1] + p[2] for p in pts]
@@ -358,6 +393,7 @@ function corrige_diagonais!(dad::BEMdata{<:Laplace}, H::ColWeightedOp, G::ColWei
         xlin = [p[1] + p[2] + p[3] for p in pts]
         qlin = [-k * sum(dad.Normal[j]) for j in 1:n]
     end
+    fill!(G.d, 0.0)
     resid = H * xlin - G * qlin
     @inbounds for i in 1:n
         denom = qlin[i]
@@ -366,15 +402,27 @@ function corrige_diagonais!(dad::BEMdata{<:Laplace}, H::ColWeightedOp, G::ColWei
     return nothing
 end
 
-# Classical HMatrix path (legacy)
-function corrige_diagonais!(dad::BEMdata{<:Laplace}, Hmat::HMatrix, Gmat::HMatrix)
+function corrige_diagonais!(dad::BEMdata{<:Laplace}, Hmat::HMatrix, Gmat::HMatrix;
+        free_term::Symbol = :explicit)
     n = dad.n
     nt = dad.nt
     k = float(dad.properties.k)
 
-    hsum = Hmat * ones(nt)
-    _set_diagonal!(Hmat) do i
-        -hsum[i]
+    if free_term === :explicit
+        _set_diagonal!(Hmat) do i
+            BEM.free_term(dad, i)
+        end
+    elseif free_term === :rowsum
+        # zero diagonal then row-sum (legacy H-matrix path)
+        _set_diagonal!(Hmat) do _
+            0.0
+        end
+        hsum = Hmat * ones(nt)
+        _set_diagonal!(Hmat) do i
+            -hsum[i]
+        end
+    else
+        throw(ArgumentError("free_term must be :explicit or :rowsum, got $free_term"))
     end
 
     pts = all_points(dad)
