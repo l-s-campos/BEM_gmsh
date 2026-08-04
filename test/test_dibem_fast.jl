@@ -74,3 +74,34 @@ end
     T = solve_Houbolt(dad, 0.05, 0.15)
     @test all(isfinite, T)
 end
+
+@testset "DIBEM HODLR / HSS / H2 ≈ dense matvec" begin
+    dad = _dad_square(6, 3; nome="dibem_st0")
+    Md = DIBEM(dad; method=:dense)
+    n = size(Md, 1)
+    x = randn(n)
+    yd = Md * x
+
+    for (meth, kw) in (
+            (:hodlr, (; nmax=12, atol=1e-5)),
+            (:hss, (; nmax=12, rtol=1e-4, hss_method=:dense)),
+            (:h2, (; nmax=12, rtol=1e-4, alpha=1.0)),
+        )
+        dadm = _dad_square(6, 3; nome="dibem_st_$meth")
+        Mm = DIBEM(dadm; method=meth, kw...)
+        @test size(Mm, 1) == n
+        ym = Mm * x
+        rel = norm(yd - ym) / (norm(yd) + 1e-14)
+        @info "DIBEM $meth vs dense" rel T=typeof(Mm)
+        @test rel < 0.55
+        @test size(Mm) == size(Md)
+        @test all(isfinite, ym)
+    end
+    # HBS alias of HSS
+    dadb = _dad_square(6, 3; nome="dibem_hbs")
+    Mb = DIBEM(dadb; method=:hbs, nmax=12, rtol=1e-4)
+    @test size(Mb, 1) == n
+    yb = Mb * x
+    @test all(isfinite, yb)
+    @test norm(yd - yb) / (norm(yd) + 1e-14) < 0.5
+end

@@ -1,6 +1,6 @@
 # =============================================================================
 # Método Modal Modificado (MMM) — Prodonoff & Zepka (1983)
-# Thesis: Áquila Santos, Ch.4 §4.5 (TESE_AQUILA_BANCAdef.pdf)
+# Thesis: Áquila Santos, Ch.4 §4.5 
 #
 # Non-symmetric BEM mass/stiffness (DIBEM):
 #   D = M̄⁻¹ K̄
