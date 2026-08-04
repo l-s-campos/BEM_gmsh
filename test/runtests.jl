@@ -371,6 +371,10 @@ ti = time()
         include(joinpath(@__DIR__, "test_diffuse_advective.jl"))
     end
 
+    @testset "DIBEM Hmat/FMM" begin
+        include(joinpath(@__DIR__, "test_dibem_fast.jl"))
+    end
+
     @testset "MMM modal smoke" begin
         include(joinpath(@__DIR__, "test_mmm.jl"))
     end

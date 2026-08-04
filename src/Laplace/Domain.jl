@@ -1,22 +1,20 @@
-export DIBEM, dibem!
+export DIBEM_dense, dibem!
 
 """
-    DIBEM(dad; rbf=PHS())
-    dibem!(dad; rbf=PHS())   # alias
+    DIBEM_dense(dad; rbf=PHS())
 
-**Direct Interpolation Boundary Element Method** (DIBEM).
-
-Builds the regularized domain-integral operator `M` such that
+Dense **Direct Interpolation BEM** operator `M`:
 
 ```
 ∫_Ω β(X) u*(ξ,X) dΩ  ≈  (M β)(ξ)
 ```
 
-Stores `M` in `dad.cache.M` and **returns** `M`. Used for inertia / body force
-and as the DIBEM kernel of diffuse–advective assembly
-([`dibem_diffuse_advective!`](@ref)).
+Stores `M` in `dad.cache.M` and returns it.
+
+For large problems see [`DIBEM`](@ref) with `method=:hmatrix` or `:fmm`
+([`DIBEM_Hmat`](@ref), [`DIBEM_FMM`](@ref) in `Domain_fast.jl`).
 """
-function DIBEM(dad::BEMdata{<:Laplace}; rbf=PHS())
+function DIBEM_dense(dad::BEMdata{<:Laplace}; rbf=PHS())
 
     npoly = binomial(dad.dimension + rbf.poly_deg, rbf.poly_deg)
     mon = MonomialBasis(dad.dimension, rbf.poly_deg)
@@ -75,21 +73,20 @@ function DIBEM(dad::BEMdata{<:Laplace}; rbf=PHS())
         M[i, i] = 0
         M[i, i] = -sum(M[i, :]) + ID[i]
     end
-    set_cache!(dad; M, dibem_F=F, dibem_rbf=rbf)
+    set_cache!(dad; M, dibem_F=F, dibem_rbf=rbf, dibem_method=:dense)
     return M
 end
 
-const dibem! = DIBEM
-
 """
-    dibem_matrix(dad; rbf=PHS(), rebuild=false) -> M
+    dibem_matrix(dad; rbf=PHS(), rebuild=false, method=:dense) -> M
 
-Return the DIBEM operator `M` from [`DIBEM`](@ref). Rebuilds if missing or
+Return the DIBEM operator `M`. Rebuilds via [`DIBEM`](@ref) if missing or
 `rebuild=true`.
 """
-function dibem_matrix(dad::BEMdata{<:Laplace}; rbf=PHS(), rebuild::Bool=false)
+function dibem_matrix(dad::BEMdata{<:Laplace}; rbf=PHS(), rebuild::Bool=false,
+        method::Symbol=:dense, kwargs...)
     if rebuild || !has_cache(dad, :M)
-        return DIBEM(dad; rbf=rbf)
+        return DIBEM(dad; method=method, rbf=rbf, kwargs...)
     end
     return dad.M
 end

@@ -3,19 +3,26 @@
 ## Classic DIBEM (domain / mass operator)
 
 ```julia
-DIBEM(dad; rbf=PHS())
-# alias: dibem!(dad)
+DIBEM(dad; method=:dense)      # default — Domain.jl dense M
+DIBEM(dad; method=:hmatrix)    # H-matrix F + M (ACA)
+DIBEM(dad; method=:fmm)        # FMM Laplace factor + matrix-free M
+# aliases: dibem!, DIBEM_dense, DIBEM_Hmat, DIBEM_FMM
 ```
 
-Builds `dad.cache.M` for inertia and body-force style domain terms (wave/heat).
-
-Call after `H_G_full_direct` (and internal poles if needed):
+Builds `dad.cache.M` ≈ domain integral operator
+`∫ β u* dΩ ≈ M β` (inertia / body force / diffuse–advective).
 
 ```julia
 H_G_full_direct(dad)
-DIBEM(dad)
+DIBEM(dad; method=:fmm)   # or :hmatrix for large nt
 solve_Houbolt(dad, Δt, tf)
 ```
+
+| method | `F` (RBF) | `D` / `M` (FS) | `M` type |
+|--------|-----------|----------------|----------|
+| `:dense` | dense | dense | `Matrix` |
+| `:hmatrix` | H-matrix + GMRES | H-matrix | `HMatrix` |
+| `:fmm` | dense or H-matrix | FMM matvec | `DibemFMMOperator` |
 
 ## Diffuse–advective (variable velocity)
 
