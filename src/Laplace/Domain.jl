@@ -1,5 +1,14 @@
-export DIBEM
+export DIBEM, dibem!
 
+"""
+    DIBEM(dad; rbf=PHS())
+    dibem!(dad; rbf=PHS())   # alias
+
+**Direct Interpolation Boundary Element Method** (DIBEM).
+
+Builds the regularized domain-integral operator `M` (`dad.cache.M`) for inertia /
+body-force terms using Laplace fundamentals + RBFs (Loeffler–Mansur et al.).
+"""
 function DIBEM(dad::BEMdata{<:Laplace}; rbf=PHS())
 
     npoly = binomial(dad.dimension + rbf.poly_deg, rbf.poly_deg)
@@ -62,3 +71,5 @@ function DIBEM(dad::BEMdata{<:Laplace}; rbf=PHS())
     set_cache!(dad; M)
     return nothing
 end
+
+const dibem! = DIBEM

@@ -2,7 +2,7 @@
 
 **Boundary Element Method in Julia**, driven by [Gmsh](https://gmsh.info/) meshes.
 
-Laplace & elasticity · dense / H-matrix / FMM · DIBEM & MECID domain terms ·  
+Laplace & elasticity · dense / H-matrix / FMM · DIBEM domain terms ·  
 transient (Houbolt, DiffEq) · modal MMM · dual BEM + cohesive contact · plates.
 
 > Package module name: **`BEM`**. Repository name: **`BEM_gmsh`**.
@@ -40,7 +40,7 @@ solve(dad)
 |-------|------------|
 | Steady Laplace | `solve`, `H_G_full_direct` / `H_G_Hmat` |
 | Domain source / Poisson | `DIBEM`, `solve_poisson_rbf_bem!` |
-| Variable velocity (MECID alt) | `solve_mecid_alt!`, `scripts/mecid_c8e1_demo.jl` |
+| Variable velocity (DIBEM alt) | `solve_dibem_alt!`, `scripts/dibem_c8e1_demo.jl` |
 | Heat / wave in time | `solve_Houbolt`, `solve_transient`, `solve_transient_o2` |
 | Modal transient (MMM) | `solve_mmm!`, `scripts/mmm_membrane_demo.jl` |
 | Elasticity | `Elasticity`, same assembly path |
@@ -54,7 +54,7 @@ solve(dad)
 src/
   BEM.jl           # module entry (includes below)
   Core/            # mesh I/O, elements, RBF, integration
-  Laplace/         # assembly, BC, solvers, DIBEM, MECID, MMM
+  Laplace/         # assembly, BC, solvers, DIBEM, MMM
   Elasticity/ Helmholtz/ Crack/ Contact/ Plate/ MultiRegion/
   Hmat/ FMM/       # hierarchical & multipole accelerators
 data/              # Gmsh .geo/.msh builders + analytics (include as needed)
@@ -69,9 +69,9 @@ Design notes and cleanup plan: [`docs/architecture.md`](docs/architecture.md).
 
 ```bash
 julia --project=. test/runtests.jl
-julia --project=. test/test_mecid_alt.jl
+julia --project=. test/test_dibem_alt.jl
 julia --project=. test/test_mmm.jl
-julia --project=. scripts/mecid_c8e1_demo.jl
+julia --project=. scripts/dibem_c8e1_demo.jl
 julia --project=. scripts/mmm_membrane_demo.jl
 julia --project=. scripts/wave_propagation.jl
 ```
@@ -88,7 +88,7 @@ julia --project=. docs/make.jl
 
 Implementations track standard BEM texts and local theses, including:
 
-- Direct interpolation (MECID / DIBEM) — Loeffler, Mansur, Pinheiro (Ch.8 alternative)
+- Direct interpolation (DIBEM) — Loeffler, Mansur; Pinheiro Ch.8 alternative advection
 - Modal modified method (MMM) — Prodonoff & Zepka; Santos thesis Ch.4
 - Dual BEM + cohesive laws — package `Crack` module
 

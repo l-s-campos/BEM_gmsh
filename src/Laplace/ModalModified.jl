@@ -2,7 +2,7 @@
 # Método Modal Modificado (MMM) — Prodonoff & Zepka (1983)
 # Thesis: Áquila Santos, Ch.4 §4.5 (TESE_AQUILA_BANCAdef.pdf)
 #
-# Non-symmetric BEM mass/stiffness (MECID / DIBEM):
+# Non-symmetric BEM mass/stiffness (DIBEM):
 #   D = M̄⁻¹ K̄
 #   Right:  (D − ω² I) φ  = 0
 #   Left:   (Dᵀ − ω² I) φ̃ = 0
@@ -33,7 +33,7 @@ Condensed free-displacement operators for the scalar wave BEM system
 M̄ ü + K̄ u = f(t)
 ```
 
-built from MECID/DIBEM matrices `(H, G, M)` after eliminating unknown fluxes
+built from DIBEM matrices `(H, G, M)` after eliminating unknown fluxes
 on Dirichlet nodes (thesis eqs. 4.7–4.12).
 """
 struct ModalSystem

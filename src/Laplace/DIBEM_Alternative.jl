@@ -1,6 +1,9 @@
 # =============================================================================
-# MECID Alternative — variable velocity advection–diffusion
-# Vitor Pancieri Pinheiro, Ch.8 (Formulação Alternativa da Interpolação Direta)
+# DIBEM alternative — variable-velocity advection–diffusion
+# (Pinheiro thesis Ch.8 — alternative direct-interpolation formulation)
+#
+# Classic domain mass/inertia: [`DIBEM`](@ref) in Domain.jl.
+# This file: alternative *advection* operator (implicit ∇·v treatment).
 #
 # Governing (α = diffusivity):
 #   α ∇²u = v · ∇u = b
@@ -12,28 +15,28 @@
 #   (H − M_ID) u = G q
 # =============================================================================
 
-export mecid_alt_variable_velocity!
-export build_mecid_S_matrix, build_mecid_Mprime
-export solve_mecid_alt!
-export mecid_c8e1_analytic, mecid_c8e1_velocity
-export setup_mecid_c8e1, test_mecid_c8e1
+export dibem_alt_variable_velocity!
+export build_dibem_S_matrix, build_dibem_Mprime
+export solve_dibem_alt!
+export dibem_c8e1_analytic, dibem_c8e1_velocity, dibem_c8e1_flux
+export setup_dibem_c8e1, test_dibem_c8e1
 
 """
-    build_mecid_S_matrix(dad; rbf=PHS(3; poly_deg=-1), k=dad.properties.k) -> S
+    build_dibem_S_matrix(dad; rbf=PHS(3; poly_deg=-1), k=dad.properties.k) -> S
 
-Build the regularized DIBEM operator `S` such that
+Regularized DIBEM operator `S` such that
 
 ```
 ∫_Ω β(X) u*(ξ,X) dΩ  ≈  (S β)(ξ)
 ```
 
-for a nodal density `β` (thesis §8.1.1–8.1.2, same structure as [`DIBEM`](@ref)).
+(thesis §8.1.1–8.1.2; same regularization idea as classic [`DIBEM`](@ref)).
 """
-function build_mecid_S_matrix(dad::BEMdata{<:Laplace};
+function build_dibem_S_matrix(dad::BEMdata{<:Laplace};
         rbf=PHS(3; poly_deg=-1), k=nothing)
     kk = k === nothing ? float(dad.properties.k) : float(k)
     nt = dad.nt
-    pts = _mecid_points(dad)
+    pts = _dibem_points(dad)
 
     F = zeros(nt, nt)
     D = zeros(nt, nt)
@@ -44,15 +47,14 @@ function build_mecid_S_matrix(dad::BEMdata{<:Laplace};
             D[i, j] = -log(r2) / (4π * kk)   # u* (2D Laplace)
         end
     end
-    # ridge for stability
     ε = 1e-12 * (tr(F) / nt + 1)
     @inbounds for i in 1:nt
         F[i, i] += ε
     end
 
-    # N[j] = ∫_Γ η^j dΓ,  η = n · ∇ψ,  ∇²ψ = F^j   (independent of source)
+    # N[j] = ∫_Γ η^j dΓ,  η = n · ∇ψ,  ∇²ψ = F^j
     N = zeros(nt)
-    ID = zeros(nt)   # ∫_Γ n·∇G* dΓ for each source (Galerkin remainder)
+    ID = zeros(nt)
     @inbounds for j in 1:nt
         xj = pts[j]
         for elem in dad.elements
@@ -79,16 +81,13 @@ function build_mecid_S_matrix(dad::BEMdata{<:Laplace};
                 R < 1e-14 && continue
                 wJ = dad.elem_weight[q] * elem.Jacobian[q]
                 n_dot = dot(dad.Normal[ind], rvec) / R^2
-                # G*,k n_k = (1/4π){1/2 − ln r} r_k n_k   (thesis 8.10)
-                # Domain.jl uses ∫ −(2 R² ln R − R²)/(8π k) n·r/R²
                 ID[i] += -(2 * R^2 * log(R) - R^2) / (8 * π * kk) * wJ * n_dot
             end
         end
     end
 
-    # cᵀ = Nᵀ F⁻¹   →   S_raw[i,j] = c[j] * D[i,j] = (Nᵀ F⁻¹ Λ)_ij
     c = F \ N
-    S = D .* c'          # S[i,j] = D[i,j] * c[j]
+    S = D .* c'
     @inbounds for i in 1:nt
         srow = sum(view(S, i, :))
         S[i, i] = 0.0
@@ -98,7 +97,7 @@ function build_mecid_S_matrix(dad::BEMdata{<:Laplace};
 end
 
 """
-    build_mecid_Mprime(dad, velocity; rbf=...) -> M′
+    build_dibem_Mprime(dad, velocity; rbf=...) -> M′
 
 DRM-style gradient recovery (thesis 8.18–8.21):
 
@@ -107,14 +106,12 @@ u = F β,  β = F⁻¹ u
 u_,ℓ = F_,ℓ β = F_,ℓ F⁻¹ u
 b = v₁ u_,1 + v₂ u_,2 = M′ u
 ```
-
-`velocity(p::SVector) -> SVector{2}` (or 3) at collocation point `p`.
 """
-function build_mecid_Mprime(dad::BEMdata{<:Laplace}, velocity;
+function build_dibem_Mprime(dad::BEMdata{<:Laplace}, velocity;
         rbf=PHS(3; poly_deg=-1))
     nt = dad.nt
     dim = dad.dimension
-    pts = _mecid_points(dad)
+    pts = _dibem_points(dad)
 
     F = zeros(nt, nt)
     @inbounds for j in 1:nt, i in 1:nt
@@ -126,14 +123,11 @@ function build_mecid_Mprime(dad::BEMdata{<:Laplace}, velocity;
     end
     Finv = inv(F)
 
-    # Fx[i,j] = ∂φ_j/∂x_i at point i (pole j)
     Fx = zeros(nt, nt)
     Fy = zeros(nt, nt)
     Fz = dim == 3 ? zeros(nt, nt) : nothing
     @inbounds for j in 1:nt, i in 1:nt
-        if i == j
-            continue
-        end
+        i == j && continue
         Fx[i, j] = ∂(rbf, 1, pts[i], pts[j])
         Fy[i, j] = ∂(rbf, 2, pts[i], pts[j])
         if dim == 3
@@ -153,7 +147,6 @@ function build_mecid_Mprime(dad::BEMdata{<:Laplace}, velocity;
         end
     end
 
-    # M′ = (diag(vx) Fx + diag(vy) Fy) Finv
     Gx = Fx * Finv
     Gy = Fy * Finv
     M′ = Diagonal(vx) * Gx + Diagonal(vy) * Gy
@@ -164,41 +157,35 @@ function build_mecid_Mprime(dad::BEMdata{<:Laplace}, velocity;
 end
 
 """
-    mecid_alt_variable_velocity!(dad, velocity; rbf, α=1.0, modify_H=true) -> M_ID
+    dibem_alt_variable_velocity!(dad, velocity; rbf, α=1.0, modify_H=true) -> M_ID
 
-Assemble the **alternative MECID** transport matrix `M_ID = S M′` (thesis 8.22)
-for variable velocity `v(X)` and optionally replace
+Assemble the **alternative DIBEM** transport matrix `M_ID = S M′` (thesis 8.22)
+for variable velocity `v(X)` and optionally
 
 ```
 H ← H − M_ID / α
 ```
 
-so that the standard Laplace solver `H u = G q` solves the advection–diffusion
-problem `α ∇²u = v·∇u`.
+so `H u = G q` solves `α ∇²u = v·∇u`.
 
-# Arguments
-- `velocity`: `p -> SVector` velocity field
-- `α`: diffusivity (default 1, as in the thesis)
-- `rbf`: radial basis (default `PHS(3; poly_deg=-1)`)
+“Alternative” = advection treatment (implicit `∇·v`), not a different method name.
 """
-function mecid_alt_variable_velocity!(dad::BEMdata{<:Laplace}, velocity;
+function dibem_alt_variable_velocity!(dad::BEMdata{<:Laplace}, velocity;
         rbf=PHS(3; poly_deg=-1), α::Real=1.0, modify_H::Bool=true)
     has_cache(dad, :H) || error("call H_G_full_direct(dad) first")
     has_cache(dad, :G) || error("call H_G_full_direct(dad) first")
     α = float(α)
     α > 0 || throw(ArgumentError("α must be > 0"))
 
-    S = build_mecid_S_matrix(dad; rbf=rbf, k=dad.properties.k)
-    M′ = build_mecid_Mprime(dad, velocity; rbf=rbf)
+    S = build_dibem_S_matrix(dad; rbf=rbf, k=dad.properties.k)
+    M′ = build_dibem_Mprime(dad, velocity; rbf=rbf)
     M_ID = S * M′
-
-    # H u − G q = (1/α) M_ID u   because α ∇²u = b ⇒ ∇²u = b/α
     M_trans = M_ID ./ α
-    set_cache!(dad; M_ID=M_trans, M_prime=M′, S_mecid=S)
+    set_cache!(dad; M_ID=M_trans, M_prime=M′, S_dibem=S)
 
     if modify_H
-        H0 = has_cache(dad, :H0_mecid) ? dad.H0_mecid : copy(dad.H)
-        set_cache!(dad; H0_mecid=H0)
+        H0 = has_cache(dad, :H0_dibem_alt) ? dad.H0_dibem_alt : copy(dad.H)
+        set_cache!(dad; H0_dibem_alt=H0)
         dad.H .= H0 .- M_trans
         if has_cache(dad, :A)
             dad.cache.A = nothing
@@ -208,12 +195,12 @@ function mecid_alt_variable_velocity!(dad::BEMdata{<:Laplace}, velocity;
 end
 
 """
-    solve_mecid_alt!(dad, velocity; kwargs...) -> T
+    solve_dibem_alt!(dad, velocity; kwargs...) -> T
 
-Build alternative MECID operators and call [`solve`](@ref).
+Build alternative DIBEM advection operators and call [`solve`](@ref).
 """
-function solve_mecid_alt!(dad::BEMdata{<:Laplace}, velocity; kwargs...)
-    mecid_alt_variable_velocity!(dad, velocity; kwargs...)
+function solve_dibem_alt!(dad::BEMdata{<:Laplace}, velocity; kwargs...)
+    dibem_alt_variable_velocity!(dad, velocity; kwargs...)
     return solve(dad)
 end
 
@@ -222,13 +209,13 @@ end
 # ---------------------------------------------------------------------------
 
 """Analytic field for C8E1: `u = exp(m x y)`."""
-mecid_c8e1_analytic(m::Real) = (p) -> exp(float(m) * p[1] * p[2])
+dibem_c8e1_analytic(m::Real) = (p) -> exp(float(m) * p[1] * p[2])
 
 """Velocity for C8E1: `v = (m y, m x)` (divergence-free)."""
-mecid_c8e1_velocity(m::Real) = (p) -> SVector(float(m) * p[2], float(m) * p[1])
+dibem_c8e1_velocity(m::Real) = (p) -> SVector(float(m) * p[2], float(m) * p[1])
 
 """Normal flux for C8E1 with package convention `q = -k ∂u/∂n` (k=1)."""
-function mecid_c8e1_flux(m::Real)
+function dibem_c8e1_flux(m::Real)
     return (p, nrm) -> begin
         u = exp(float(m) * p[1] * p[2])
         dudx = float(m) * p[2] * u
@@ -238,20 +225,20 @@ function mecid_c8e1_flux(m::Real)
 end
 
 """C8E1 setup from an existing Gmsh mesh (all-Dirichlet `u=e^{mxy}` + internal poles)."""
-function setup_mecid_c8e1(msh; m=1.0, n_int=5, ordem=1)
+function setup_dibem_c8e1(msh; m=1.0, n_int=5, ordem=1)
     dad = format2d(msh, Laplace(1.0); tipo=ordem, pontointerno=false)
-    return _mecid_c8e1_bc_and_poles!(dad, m, n_int)
+    return _dibem_c8e1_bc_and_poles!(dad, m, n_int)
 end
 
-function setup_mecid_c8e1(; m=1.0, ndiv=10, n_int=5, ordem=1, nome="c8e1",
+function setup_dibem_c8e1(; m=1.0, ndiv=10, n_int=5, ordem=1, nome="c8e1",
         mesh_fn=nothing)
-    mesh_fn === nothing && error("setup_mecid_c8e1(; mesh_fn=quadrado) or pass a mesh")
+    mesh_fn === nothing && error("setup_dibem_c8e1(; mesh_fn=quadrado) or pass a mesh")
     msh = mesh_fn(; ndiv=ndiv, ordem=ordem, show=false, nome=nome)
-    return setup_mecid_c8e1(msh; m=m, n_int=n_int, ordem=ordem)
+    return setup_dibem_c8e1(msh; m=m, n_int=n_int, ordem=ordem)
 end
 
-function _mecid_c8e1_bc_and_poles!(dad, m, n_int)
-    uana = mecid_c8e1_analytic(m)
+function _dibem_c8e1_bc_and_poles!(dad, m, n_int)
+    uana = dibem_c8e1_analytic(m)
     for i in 1:dad.n
         dad.BC[i] = 0
         dad.BV[i] = uana(dad.Nodes[i])
@@ -269,21 +256,19 @@ function _mecid_c8e1_bc_and_poles!(dad, m, n_int)
 end
 
 """
-    test_mecid_c8e1(; m=1.0, ndiv=16, n_int=7, npg=12) -> NamedTuple
+    test_dibem_c8e1(dad; m=1.0, npg=12) -> NamedTuple
 
-Run Pinheiro §8.2.1: mean relative flux error on **right** and **bottom** edges
-(as in the thesis).
+Pinheiro §8.2.1: mean relative flux error on **right** and **bottom** edges.
 """
-function test_mecid_c8e1(dad::BEMdata{<:Laplace}; m=1.0, npg=12,
+function test_dibem_c8e1(dad::BEMdata{<:Laplace}; m=1.0, npg=12,
         rbf=PHS(3; poly_deg=-1), verbose=true)
     H_G_full_direct(dad, npg)
-    solve_mecid_alt!(dad, mecid_c8e1_velocity(m); rbf=rbf, α=1.0)
+    solve_dibem_alt!(dad, dibem_c8e1_velocity(m); rbf=rbf, α=1.0)
 
-    uana = mecid_c8e1_analytic(m)
-    qana = mecid_c8e1_flux(m)
+    uana = dibem_c8e1_analytic(m)
+    qana = dibem_c8e1_flux(m)
     T = dad.T
     q = dad.q
-    # mean |q − q_ana| / max|q_ana| on bottom (y≈0) and right (x≈1) — thesis §8.2.1
     err_s = 0.0
     n_s = 0
     qmax = 0.0
@@ -300,12 +285,11 @@ function test_mecid_c8e1(dad::BEMdata{<:Laplace}; m=1.0, npg=12,
     end
     err_u = sum(abs(T[i] - uana(dad.Nodes[i])) for i in 1:dad.n) / dad.n
     flux_err_pct = (qmax > 0 && n_s > 0) ? 100 * (err_s / n_s) / qmax : NaN
-    verbose && @info "C8E1 MECID-alt" m n=dad.n nPI=dad.ni flux_err_pct err_u n_flux=n_s
+    verbose && @info "C8E1 DIBEM-alt" m n=dad.n nPI=dad.ni flux_err_pct err_u n_flux=n_s
     return (; flux_err_pct, err_u, dad, n_flux=n_s, qmax)
 end
 
-# helpers
-function _mecid_points(dad::BEMdata)
+function _dibem_points(dad::BEMdata)
     nt = dad.nt
     pts = Vector{typeof(dad.Nodes[1])}(undef, nt)
     @inbounds for i in 1:dad.n

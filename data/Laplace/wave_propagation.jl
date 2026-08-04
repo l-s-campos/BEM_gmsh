@@ -1,6 +1,6 @@
 # =============================================================================
 # Scalar wave-propagation benchmarks (DIBEM + Houbolt / DiffEq)
-# Classic bar / membrane problems used in MECID wave literature.
+# Classic bar / membrane problems used in DIBEM wave literature.
 #
 # Scalar wave  ü = c² ∇²u  (c = 1 unless noted), via
 # stationary Laplace FS + DIBEM mass + full-system Houbolt / DiffEq.
