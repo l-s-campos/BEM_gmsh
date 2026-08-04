@@ -6,7 +6,7 @@ Snapshot review of **BEM.jl** / `BEM_gmsh` for clarity, dead code, and next clea
 
 A Julia BEM toolkit: Gmsh meshes → collocation assembly → dense / H-matrix / FMM
 solvers for Laplace, elasticity, cracks (DBEM + cohesive), plates, contact, RBF/DIBEM
-domain terms, and modal / DIBEM variants.
+domain terms, and modal / diffuse–advective DIBEM.
 
 ## Mental model (target for newcomers)
 
@@ -15,7 +15,7 @@ mesh (Gmsh)  →  format2d → BEMdata
                     ↓
               H_G_full_direct / H_G_Hmat
                     ↓
-         optional: DIBEM / RBF particular
+         optional: DIBEM / diffuse–advective / RBF particular
                     ↓
               applyBC → solve / solve_Houbolt / solve_mmm!
                     ↓
@@ -29,7 +29,7 @@ Keep this path **one screen** in the README. Everything else is an optional bran
 | Path | Role | Clarity |
 |------|------|---------|
 | `Core/` | Mesh I/O, elements, integration, RBF, cache | Mixed — `Input.jl` is large |
-| `Laplace/` | Assembly, BC, solvers, DIBEM, MMM, DRM | Growing — split OK but names overlap |
+| `Laplace/` | Assembly, BC, solvers, DIBEM, diffuse–advective, MMM, DRM | Growing — split OK but names overlap |
 | `Hmat/`, `FMM/` | Vendored accelerators | Fine; treat as deps |
 | `Crack/` | Dual BEM + cohesive | Dense but coherent |
 | `Contact/`, `Plate/`, `MultiRegion/` | Specializations | OK as submodules |
@@ -52,7 +52,7 @@ Keep this path **one screen** in the README. Everything else is an optional bran
    without reexporting everything.
 
 3. **Naming inconsistency**  
-   `DIBEM` vs `dibem_alt` vs `solve_mmm!` vs `solve_Houbolt`.  
+   `DIBEM` vs `solve_diffuse_advective!` vs `solve_mmm!` vs `solve_Houbolt`.  
    **Fix:** glossary in docs + stable aliases (`dibem!` = `DIBEM`, …).
 
 4. **Mesh builders live in `data/`**  
@@ -64,12 +64,12 @@ Keep this path **one screen** in the README. Everything else is an optional bran
    **Fix:** document cache keys; optional typed `LaplaceCache` / `WaveCache`.
 
 6. **Tests not all in `runtests.jl`**  
-   New suites (`test_mmm`, `test_dibem_alt`, `test_poisson_drm`, cohesive, IGA)
+   New suites (`test_mmm`, `test_diffuse_advective`, `test_poisson_drm`, cohesive, IGA)
    are easy to forget in CI.  
    **Fix:** `@testset` includes or a `test/Project.toml` + matrix in CI.
 
 7. **Portuguese/English split is good** — keep; add a one-page “recipe book”
-   (Laplace steady, wave Houbolt, MMM, DIBEM-alt C8E1, cohesive mode I).
+   (Laplace steady, wave Houbolt, MMM, diffuse–advective C8E1, cohesive mode I).
 
 ## Unused / suspect code
 
@@ -95,7 +95,7 @@ Heuristic: if a file is only referenced by itself and one old script, mark
 - [ ] Slim README: 15-line quickstart + feature table + link to recipes
 - [ ] `docs/src/recipes.md`: 5 copy-paste workflows
 - [ ] Public API page listing *only* supported entry points
-- [ ] Wire `test_mmm.jl`, `test_dibem_alt.jl`, cohesive, IGA into CI
+- [ ] Wire `test_mmm.jl`, `test_diffuse_advective.jl`, cohesive, IGA into CI
 - [ ] `.gitignore`: `*.txt` profiles, `*.msh` regenerable noise if desired
 
 ### P1 — package hygiene (3–5 days)
@@ -112,7 +112,7 @@ Heuristic: if a file is only referenced by itself and one old script, mark
 
 ### P3 — science quality
 - [ ] Benchmark notebook vs Pinheiro/Áquila thesis tables
-- [ ] Classical DIBEM variable-velocity (Ch.7) next to alternative (Ch.8)
+- [ ] Classical variable-velocity DIBEM (Ch.7) next to diffuse–advective form (Ch.8)
 - [ ] Flux sign convention documented once (`q = -k ∂u/∂n`)
 
 ## “Easy to understand” checklist
@@ -122,7 +122,7 @@ A new user should, in **&lt; 30 minutes**:
 1. `Pkg.instantiate()` without GPU/Makie pain  
 2. Run square Laplace `T=x` and plot  
 3. Find “how do I add a domain source?” → DIBEM / particular  
-4. Find “variable velocity advection?” → DIBEM alt  
+4. Find “variable velocity advection?” → diffuse–advective DIBEM  
 5. Find “crack with cohesion?” → `scripts/cohesive_gmsh_modeI.jl`  
 
 If any step needs reading 3 source files, the API failed.

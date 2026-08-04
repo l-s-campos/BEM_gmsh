@@ -81,7 +81,7 @@ include("Laplace/DLIM.jl")
 include("Laplace/DiBFM_HMLS.jl")
 include("Laplace/ParticularSolution.jl")
 include("Laplace/ModalModified.jl")
-include("Laplace/DIBEM_Alternative.jl")
+include("Laplace/DiffuseAdvective.jl")
 
 # ---------------------------------------------------------------------------
 # Multi-region / interfaces / frictional contact BEM
