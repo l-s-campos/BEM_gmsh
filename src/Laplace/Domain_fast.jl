@@ -452,11 +452,10 @@ function DIBEM_structured(
     @info "DIBEM_structured: F" format=fmt nt
     treeM = ClusterTree(pts, splitter)
 
-    # H²: RBF Gram is not ideal for proxy H²; solve F densely (or HODLR), keep
-    # structured compression on the Laplace/scaled-M side via HODLR.
+    # --- solve F c = IF ---
+    # H² on the RBF Gram is unreliable → dense F for :H2; structured F otherwise.
     if fmt === :H2
         c = _dibem_solve_Fc!(dad, pts, IF, rbf; f_method=:dense, atol=atol, rtol=rtol)
-        m_fmt = :HODLR
     else
         KF = DibemFKernel(rbf, pts)
         Fst = assemble_structured(KF, tree; format=fmt, adm=adm, comp=comp,
@@ -469,13 +468,32 @@ function DIBEM_structured(
         if !stats.solved
             @warn "DIBEM_structured: GMRES(F) incomplete" format=fmt stats.status
         end
-        m_fmt = fmt
     end
 
-    @info "DIBEM_structured: M" format=m_fmt nt
+    @info "DIBEM_structured: M" format=fmt nt
+
+    # --- off-diagonal / full M ---
+    #
+    # H²: proxies see geometry only. Writing K=c(y)u* as one kernel fails H²
+    # low-rank (product kernel). But c_j = c(y_j) still holds, so use the
+    # factorization identical to FMM:
+    #   (M x)_i = [D (c ∘ x)]_i + diag_i x_i
+    # with D ≈ u* compressed as H² (true Newtonian kernel).
+    if fmt === :H2
+        KD = _dibem_ustar_kernelmatrix(pts, props, n_dummy)
+        D_h2 = assemble_h2(Float64, KD, treeM; rtol=rtol, rank=rank, alpha=alpha,
+            global_index=true, symmetric=true)
+        rowsum_off = D_h2 * c
+        diagv = .-rowsum_off .+ ID
+        @assert all(isfinite, c) && all(isfinite, diagv)
+        Mop = DibemFMMOperator(nt, c, diagv, D_h2)
+        set_cache!(dad; M=Mop, dibem_c=c, dibem_ID=ID, dibem_rbf=rbf,
+            dibem_method=:h2, dibem_D=D_h2)
+        return Mop
+    end
 
     KM = DibemMKernel(pts, c, props, n_dummy)
-    Moff = assemble_structured(KM, treeM; format=m_fmt, adm=adm, comp=comp,
+    Moff = assemble_structured(KM, treeM; format=fmt, adm=adm, comp=comp,
         threads=threads, rtol=rtol, rank=rank, alpha=alpha,
         method=hss_method, global_index=true)
 
@@ -502,23 +520,42 @@ DIBEM_HSS(dad; kwargs...)   = DIBEM_structured(dad; format=:HSS, kwargs...)
 DIBEM_HBS(dad; kwargs...)   = DIBEM_structured(dad; format=:HBS, kwargs...)
 DIBEM_H2(dad; kwargs...)    = DIBEM_structured(dad; format=:H2, kwargs...)
 
-"""H² needs [`KernelMatrix`](@ref); other formats use abstract `getindex` kernels."""
-function _dibem_F_as_kernel(fmt::Symbol, rbf, pts)
-    if fmt === :H2
-        return KernelMatrix((x, y) -> float(rbf(sqeuclidean(x, y))), pts, pts)
+"""
+RBF interpolant of nodal weights `c` with `c_j = c(y_j)`.
+
+Useful if a format needs `c(y)` off-mesh (e.g. product-kernel experiments).
+H² DIBEM uses the **factored** form instead: `M x = D(c ∘ x)` with H² on plain `u*`.
+"""
+function _dibem_c_field(rbf, pts, c::AbstractVector)
+    n = length(pts)
+    length(c) == n || throw(DimensionMismatch("c vs points"))
+    F = zeros(n, n)
+    @inbounds for j in 1:n, i in 1:n
+        F[i, j] = rbf(sqeuclidean(pts[i], pts[j]))
     end
-    return DibemFKernel(rbf, pts)
+    ε = 1e-12 * (tr(F) / n + 1)
+    @inbounds for i in 1:n
+        F[i, i] += ε
+    end
+    α = F \ collect(Float64, c)
+    return function cfield(y)
+        s = 0.0
+        @inbounds for k in 1:n
+            s += α[k] * rbf(sqeuclidean(y, pts[k]))
+        end
+        return s
+    end
 end
 
-"""Plain single-layer kernel via [`fundamental`](@ref) as `KernelMatrix`."""
-function _dibem_ustar_kernelmatrix(pts, props)
-    n_dummy = pts[1] isa SVector{2} ? SVector(0.0, 1.0) : SVector(0.0, 0.0, 1.0)
-    function ustar(x, y)
+"""Plain `u*` as [`KernelMatrix`](@ref) via [`fundamental`](@ref) (for H² on `D`)."""
+function _dibem_ustar_kernelmatrix(pts, props, n_dummy)
+    function ustar(x, y)::Float64
         r = y - x
-        norm(r) < 1e-15 && return 0.0
-        return fundamental(props, r, n_dummy).U
+        R = norm(r)
+        R < 1e-15 && return 0.0
+        return float(fundamental(props, r, n_dummy).U)
     end
-    return KernelMatrix(ustar, pts, pts)
+    return KernelMatrix{typeof(ustar), typeof(pts), typeof(pts), Float64}(ustar, pts, pts)
 end
 
 # Keep DIBEM_Hmat as the dedicated H path (two trees, same as before)

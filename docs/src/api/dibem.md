@@ -27,7 +27,11 @@ solve_Houbolt(dad, Δt, tf)
 | `:hmatrix` | H + GMRES | H | `HMatrix` |
 | `:hodlr` | HODLR + GMRES | HODLR off-diag + diag | `DibemStructuredOperator` |
 | `:hss` / `:hbs` | HSS + GMRES | HSS off-diag + diag | `DibemStructuredOperator` |
-| `:h2` | dense `F` solve | HODLR scaled `M` | `DibemStructuredOperator` (H² API entry; RBF Gram uses dense `F`) |
+| `:h2` | dense `F` solve | H² on plain `u*`, then `M x = D(c∘x)+diag∘x` | `DibemFMMOperator{H2Matrix}` |
+
+**H² note:** Discrete weights satisfy `c_j = c(y_j)`. Compressing the product
+kernel `K(x,y)=c(y)u*(x,y)` with proxies fails; the correct H² path is the
+**factored** form (same as FMM): H² only on Newtonian `u*`, scale columns via `c`.
 | `:fmm` | dense/H | FMM matvec | `DibemFMMOperator` |
 
 ## Diffuse–advective (variable velocity)
