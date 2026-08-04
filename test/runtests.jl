@@ -367,7 +367,7 @@ ti = time()
     end
 
 
-    @testset "Diffuse-advective DIBEM smoke (C8E1)" begin
+    @testset "Diffuse-advective DIBEM smoke (exp mxy)" begin
         include(joinpath(@__DIR__, "test_diffuse_advective.jl"))
     end
 

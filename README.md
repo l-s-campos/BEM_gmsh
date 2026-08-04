@@ -40,7 +40,7 @@ solve(dad)
 |-------|------------|
 | Steady Laplace | `solve`, `H_G_full_direct` / `H_G_Hmat` |
 | Domain source / Poisson | `DIBEM`, `solve_poisson_rbf_bem!` |
-| Diffuse–advective (variable v) | `solve_diffuse_advective!`, `scripts/diffuse_advective_c8e1.jl` |
+| Diffuse–advective (variable v) | `solve_diffuse_advective!`, `scripts/diffuse_advective_exp_mxy.jl` |
 | Heat / wave in time | `solve_Houbolt`, `solve_transient`, `solve_transient_o2` |
 | Modal transient (MMM) | `solve_mmm!`, `scripts/mmm_membrane_demo.jl` |
 | Elasticity | `Elasticity`, same assembly path |

@@ -18,8 +18,8 @@
 export dibem_diffuse_advective!, assemble_diffuse_advective!
 export build_da_S_matrix, build_da_Mprime
 export solve_diffuse_advective!
-export da_c8e1_analytic, da_c8e1_velocity, da_c8e1_flux
-export setup_da_c8e1, test_da_c8e1
+export exp_mxy_solution, exp_mxy_velocity, exp_mxy_flux
+export setup_da_square_exp_mxy, test_da_square_exp_mxy
 
 """
     build_da_S_matrix(dad; rbf=PHS(3; poly_deg=-1), k=dad.properties.k) -> S
@@ -206,17 +206,18 @@ end
 const assemble_diffuse_advective! = dibem_diffuse_advective!
 
 # ---------------------------------------------------------------------------
-# Example 8.2.1 helpers (Pinheiro thesis C8E1)
+# Manufactured example: unit square, u=exp(m x y), v=(m y, m x)
+# (Pinheiro thesis Ch.8 §8.2.1)
 # ---------------------------------------------------------------------------
 
-"""Analytic field for C8E1: `u = exp(m x y)`."""
-da_c8e1_analytic(m::Real) = (p) -> exp(float(m) * p[1] * p[2])
+"""Manufactured potential `u = exp(m x y)` (diffuse–advective test)."""
+exp_mxy_solution(m::Real) = (p) -> exp(float(m) * p[1] * p[2])
 
-"""Velocity for C8E1: `v = (m y, m x)` (divergence-free)."""
-da_c8e1_velocity(m::Real) = (p) -> SVector(float(m) * p[2], float(m) * p[1])
+"""Matching velocity `v = (m y, m x)` so that `∇²u = v·∇u` when `u = exp(m x y)`."""
+exp_mxy_velocity(m::Real) = (p) -> SVector(float(m) * p[2], float(m) * p[1])
 
-"""Normal flux for C8E1 with package convention `q = -k ∂u/∂n` (k=1)."""
-function da_c8e1_flux(m::Real)
+"""Boundary flux `q = -∂u/∂n` for `u = exp(m x y)` (package sign convention)."""
+function exp_mxy_flux(m::Real)
     return (p, nrm) -> begin
         u = exp(float(m) * p[1] * p[2])
         dudx = float(m) * p[2] * u
@@ -225,21 +226,26 @@ function da_c8e1_flux(m::Real)
     end
 end
 
-"""C8E1 setup from an existing Gmsh mesh (all-Dirichlet `u=e^{mxy}` + internal poles)."""
-function setup_da_c8e1(msh; m=1.0, n_int=5, ordem=1)
+"""
+    setup_da_square_exp_mxy(msh; m=1.0, n_int=5)
+
+Unit-square diffuse–advective problem with manufactured field `u=exp(m x y)`,
+Dirichlet data from `u`, and a regular grid of internal DIBEM poles.
+"""
+function setup_da_square_exp_mxy(msh; m=1.0, n_int=5, ordem=1)
     dad = format2d(msh, Laplace(1.0); tipo=ordem, pontointerno=false)
-    return _da_c8e1_bc_and_poles!(dad, m, n_int)
+    return _da_square_exp_mxy_bc_and_poles!(dad, m, n_int)
 end
 
-function setup_da_c8e1(; m=1.0, ndiv=10, n_int=5, ordem=1, nome="c8e1",
+function setup_da_square_exp_mxy(; m=1.0, ndiv=10, n_int=5, ordem=1, nome="da_exp_mxy",
         mesh_fn=nothing)
-    mesh_fn === nothing && error("setup_da_c8e1(; mesh_fn=quadrado) or pass a mesh")
+    mesh_fn === nothing && error("setup_da_square_exp_mxy(; mesh_fn=quadrado) or pass a mesh")
     msh = mesh_fn(; ndiv=ndiv, ordem=ordem, show=false, nome=nome)
-    return setup_da_c8e1(msh; m=m, n_int=n_int, ordem=ordem)
+    return setup_da_square_exp_mxy(msh; m=m, n_int=n_int, ordem=ordem)
 end
 
-function _da_c8e1_bc_and_poles!(dad, m, n_int)
-    uana = da_c8e1_analytic(m)
+function _da_square_exp_mxy_bc_and_poles!(dad, m, n_int)
+    uana = exp_mxy_solution(m)
     for i in 1:dad.n
         dad.BC[i] = 0
         dad.BV[i] = uana(dad.Nodes[i])
@@ -257,17 +263,19 @@ function _da_c8e1_bc_and_poles!(dad, m, n_int)
 end
 
 """
-    test_da_c8e1(dad; m=1.0, npg=12) -> NamedTuple
+    test_da_square_exp_mxy(dad; m=1.0, npg=12) -> NamedTuple
 
-Pinheiro §8.2.1: mean relative flux error on **right** and **bottom** edges.
+Solve the unit-square manufactured problem `u=exp(m x y)`, `v=(m y, m x)` and
+report mean relative flux error on the **right** and **bottom** edges
+(same metric as Pinheiro Ch.8 §8.2.1).
 """
-function test_da_c8e1(dad::BEMdata{<:Laplace}; m=1.0, npg=12,
+function test_da_square_exp_mxy(dad::BEMdata{<:Laplace}; m=1.0, npg=12,
         rbf=PHS(3; poly_deg=-1), verbose=true)
     H_G_full_direct(dad, npg)
-    solve_diffuse_advective!(dad, da_c8e1_velocity(m); rbf=rbf, α=1.0)
+    solve_diffuse_advective!(dad, exp_mxy_velocity(m); rbf=rbf, α=1.0)
 
-    uana = da_c8e1_analytic(m)
-    qana = da_c8e1_flux(m)
+    uana = exp_mxy_solution(m)
+    qana = exp_mxy_flux(m)
     T = dad.T
     q = dad.q
     err_s = 0.0
@@ -286,7 +294,7 @@ function test_da_c8e1(dad::BEMdata{<:Laplace}; m=1.0, npg=12,
     end
     err_u = sum(abs(T[i] - uana(dad.Nodes[i])) for i in 1:dad.n) / dad.n
     flux_err_pct = (qmax > 0 && n_s > 0) ? 100 * (err_s / n_s) / qmax : NaN
-    verbose && @info "C8E1 diffuse-advective DIBEM" m n=dad.n nPI=dad.ni flux_err_pct err_u n_flux=n_s
+    verbose && @info "da square exp(mxy)" m n=dad.n nPI=dad.ni flux_err_pct err_u n_flux=n_s
     return (; flux_err_pct, err_u, dad, n_flux=n_s, qmax)
 end
 

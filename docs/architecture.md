@@ -69,7 +69,7 @@ Keep this path **one screen** in the README. Everything else is an optional bran
    **Fix:** `@testset` includes or a `test/Project.toml` + matrix in CI.
 
 7. **Portuguese/English split is good** — keep; add a one-page “recipe book”
-   (Laplace steady, wave Houbolt, MMM, diffuse–advective C8E1, cohesive mode I).
+   (Laplace steady, wave Houbolt, MMM, diffuse–advective exp(mxy) square, cohesive mode I).
 
 ## Unused / suspect code
 
