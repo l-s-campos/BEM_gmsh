@@ -96,21 +96,11 @@ prob = CohesiveDBEMProblem(mesh, law)  # rebuild pairs
 
 ## Laws
 
-```@docs
-BilinearCZM
-PPRLaw
-AlfanoSaccoLaw
-evaluate_surface!
-```
+_See source docstrings in `src/` (HTML `@docs` disabled in lightweight build)._
 
 ## Problem API
 
-```@docs
-CohesiveDBEMProblem
-build_cohesive_pairs
-solve_cohesive_dbem!
-modeI_patch_mesh
-```
+_See source docstrings in `src/` (HTML `@docs` disabled in lightweight build)._
 
 ## Sign convention (calibrated)
 

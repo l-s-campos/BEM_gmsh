@@ -1,8 +1,10 @@
-# BEM.jl
+# BEM_gmsh
+
+Julia package module: **`BEM`**.
 
 > 🌐 **English** · [Português (BR)](pt-br/index.md)
 
-**BEM.jl** is a Julia package for the **Boundary Element Method**, with:
+**BEM_gmsh** (`using BEM`) is a Julia package for the **Boundary Element Method**, with:
 
 - 2D/3D **Laplace** (potential / heat conduction) and **linear elasticity**
 - Mesh generation and I/O through **Gmsh**
@@ -72,6 +74,7 @@ docs/
 ## Next pages
 
 - [Getting started](getting_started.md)
+- [Recipes](recipes.md)
 - [Theory notes](theory.md)
 - [Examples](examples.md)
 - API reference under **API**

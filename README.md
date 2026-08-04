@@ -1,5 +1,8 @@
 # BEM_gmsh
 
+[![Docs](https://img.shields.io/badge/docs-stable-blue.svg)](https://l-s-campos.github.io/BEM_gmsh/)
+[![GitHub](https://img.shields.io/badge/GitHub-BEM__gmsh-black?logo=github)](https://github.com/l-s-campos/BEM_gmsh)
+
 **Boundary Element Method in Julia**, driven by [Gmsh](https://gmsh.info/) meshes.
 
 Laplace & elasticity · dense / H-matrix / FMM · DIBEM domain terms ·  
@@ -78,10 +81,13 @@ julia --project=. scripts/wave_propagation.jl
 
 ## Documentation
 
+**Online:** [https://l-s-campos.github.io/BEM_gmsh/](https://l-s-campos.github.io/BEM_gmsh/)
+
+Build locally:
+
 ```bash
-julia --project=. docs/make.jl
-# docs/build/index.html
-# docs/build/pt-br/   (Português)
+julia --project=docs docs/make.jl
+# open docs/build/index.html
 ```
 
 ## Citation / theory hooks

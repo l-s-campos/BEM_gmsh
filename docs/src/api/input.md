@@ -1,11 +1,6 @@
 # Mesh I/O
 
-```@docs
-format2d
-format3d
-format2d_iga
-apply_analytical_bc!
-```
+_See source docstrings in `src/` (HTML `@docs` disabled in lightweight build)._
 
 For multi-step Gmsh pipelines use
 `format2d(...; finalize=false, reopen=false)` inside [`with_gmsh`](@ref)

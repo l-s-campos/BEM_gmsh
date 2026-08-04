@@ -1,4 +1,6 @@
 name = "BEM"
+uuid = "fa9a2255-4635-4715-9e52-f44f730e9c4c"
+version = "0.1.0"
 
 [deps]
 ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"

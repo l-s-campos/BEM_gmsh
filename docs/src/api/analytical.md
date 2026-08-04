@@ -1,17 +1,6 @@
 # Analytical solutions
 
-```@docs
-AnalyticalSolution
-attach_analytical!
-analytical
-rel_error
-ana_laplace_linear
-ana_laplace_quadratic
-ana_heat_1d
-ana_heat_insulated_sides
-ana_heat_dirichlet_square
-ana_elasticity_patch
-```
+_See source docstrings in `src/` (HTML `@docs` disabled in lightweight build)._
 
 Typical verification pattern:
 

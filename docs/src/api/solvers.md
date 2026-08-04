@@ -1,11 +1,6 @@
 # Solvers
 
-```@docs
-solve
-solve_Houbolt
-solve_transient
-solve_transient_o2
-```
+_See source docstrings in `src/` (HTML `@docs` disabled in lightweight build)._
 
 | Function | Equation | Notes |
 |----------|----------|-------|

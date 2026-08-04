@@ -1,9 +1,6 @@
 # Visualization
 
-```@docs
-plot_geo
-export_results_to_gmsh
-```
+_See source docstrings in `src/` (HTML `@docs` disabled in lightweight build)._
 
 `plot_geo` draws:
 

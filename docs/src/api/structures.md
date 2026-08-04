@@ -1,19 +1,6 @@
 # Data structures
 
-```@docs
-Point2D
-Point3D
-BEMdata
-BEMCache
-set_cache!
-has_cache
-Element
-Laplace
-Helmholtz
-Elasticity
-AnisotropicElasticity
-LekhnitskiiParams
-```
+_See source docstrings in `src/` (HTML `@docs` disabled in lightweight build)._
 
 Core types live in `src/Structures.jl`.
 

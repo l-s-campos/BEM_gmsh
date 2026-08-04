@@ -1,39 +1,38 @@
-using Documenter
-using DrWatson
-@quickactivate :BEM
+# Build HTML docs (markdown sources; no full BEM precompile required).
+using Pkg
+Pkg.activate(@__DIR__)
+Pkg.instantiate()
 
-# Multilingual docs with Documenter.jl
-# ------------------------------------
-# Documenter has **no** built-in i18n (unlike Jekyll + jekyll-polyglot).
-# Practical approach used here:
-#   • English sources:  docs/src/*.md          (default sidebar)
-#   • Portuguese BR:    docs/src/pt-br/*.md    (section "Português (BR)")
-#   • One `makedocs` build serves both; pages cross-link via 🌐 banners.
-# API `@docs` pages stay in English (Julia symbol names).
+using Documenter
+
+const REPO = "github.com/l-s-campos/BEM_gmsh.git"
+const PAGES_URL = "https://l-s-campos.github.io/BEM_gmsh/"
 
 makedocs(;
-    modules=[BEM],
-    authors="BEM.jl contributors",
-    sitename="BEM.jl",
-    remotes=nothing,  # local / no git origin required
-    format=Documenter.HTML(;
-        prettyurls=get(ENV, "CI", "false") == "true",
-        canonical="https://example.com/BEM.jl",
-        assets=String[],
-        lang="en",
-        footer="BEM.jl · English + Português (BR)",
+    modules = Module[],
+    authors = "BEM_gmsh contributors",
+    sitename = "BEM_gmsh",
+    remotes = nothing,
+    format = Documenter.HTML(;
+        prettyurls = get(ENV, "CI", "false") == "true",
+        canonical = PAGES_URL,
+        repolink = "https://github.com/l-s-campos/BEM_gmsh",
+        assets = String[],
+        sidebar_sitename = true,
+        footer = "BEM_gmsh · [GitHub](https://github.com/l-s-campos/BEM_gmsh)",
     ),
-    pages=[
-        # --- English (default) ---
+    pages = [
         "Home" => "index.md",
         "Getting started" => "getting_started.md",
+        "Recipes" => "recipes.md",
         "Theory notes" => "theory.md",
-        "API" => [
+        "API guide" => [
             "Data structures" => "api/structures.md",
             "Fundamental solutions" => "api/fundamentals.md",
             "Mesh I/O" => "api/input.md",
             "Assembly" => "api/assembly.md",
             "Solvers" => "api/solvers.md",
+            "DIBEM & diffuse–advective" => "api/dibem.md",
             "Analytical solutions" => "api/analytical.md",
             "Visualization" => "api/visualization.md",
             "H-matrices" => "api/hmatrices.md",
@@ -43,7 +42,7 @@ makedocs(;
         ],
         "Examples" => "examples.md",
         "Performance" => "performance.md",
-        # --- Português (BR) ---
+        "Architecture" => "architecture.md",
         "Português (BR)" => [
             "Início" => "pt-br/index.md",
             "Começando" => "pt-br/getting_started.md",
@@ -53,9 +52,8 @@ makedocs(;
             "API (links EN)" => "pt-br/api.md",
         ],
     ],
-    checkdocs=:none,
-    warnonly=true,
+    checkdocs = :none,
+    warnonly = true,
 )
 
-# Optional:
-# deploydocs(repo = "github.com/USER/BEM_gmsh.git")
+@info "Docs built → docs/build (open index.html)"
