@@ -318,7 +318,7 @@ end
     transform(dad, qsi2, elem, pf::Point3D) -> (η1, η2, J1, J2)
 
 Legacy tensor-sinh API (compatible with older 3D loops).
-For strong near-field prefer `transform_surface` / updated `integraelem`.
+For strong near-field prefer `transform_surface` / updated `integrate_element`.
 """
 function transform(dad, qsi2, elem, pf::Point3D)
     nodes = dad.Nodes[elem.index]

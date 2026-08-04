@@ -61,9 +61,9 @@ const Elasticity = BEM.Elasticity
         pf = Point2D(0.5, -d)
         Hd = zeros(2, 4); Gd = zeros(2, 4)
         BEM.integraelem_dumont!(Hd, Gd, dad, elem, nodes, pf, qsi, w)
-        # also through integraelem dispatch
+        # also through integrate_element dispatch
         Hi = zeros(2, 4); Gi = zeros(2, 4)
-        BEM.integraelem(dad, elem, nodes, pf, Hi, Gi)
+        BEM.integrate_element(dad, elem, nodes, pf, Hi, Gi)
         @test Hi ≈ Hd
         @test Gi ≈ Gd
 

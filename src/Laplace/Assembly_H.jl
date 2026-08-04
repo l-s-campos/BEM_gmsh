@@ -12,7 +12,7 @@
 # outside — same pattern as DIBEM  M x = D (c ∘ x) + diag ∘ x.
 #
 export H_G_Hmat, corrige_diagonais!, MixedBCOperator, ColWeightedOp
-export node_weights
+export correct_nearfield!, node_weights
 # all_points / point live in Structures.jl
 
 """
@@ -93,7 +93,12 @@ mutable struct ColWeightedOp{TK} <: AbstractMatrix{Float64}
     d::Vector{Float64}
     nrows::Int
     ncols::Int
+    """Optional sparse near-field correction: full ∫ − pointwise kernel×w."""
+    corr::Union{Nothing, SparseMatrixCSC{Float64,Int}}
 end
+
+ColWeightedOp(K, w, d, nrows, ncols) =
+    ColWeightedOp(K, w, d, nrows, ncols, nothing)
 
 Base.size(A::ColWeightedOp) = (A.nrows, A.ncols)
 Base.IndexStyle(::Type{<:ColWeightedOp}) = IndexCartesian()
@@ -102,6 +107,9 @@ function Base.getindex(A::ColWeightedOp, i::Int, j::Int)
     val = A.w[j] * A.K[i, j]
     if i == j && j <= length(A.d)
         val += A.d[i]
+    end
+    if A.corr !== nothing && 1 <= i <= size(A.corr, 1) && 1 <= j <= size(A.corr, 2)
+        val += A.corr[i, j]
     end
     return val
 end
@@ -112,6 +120,9 @@ function LinearAlgebra.mul!(y::AbstractVector, A::ColWeightedOp, x::AbstractVect
     n = min(A.nrows, A.ncols, length(A.d))
     @inbounds for i in 1:n
         y[i] += A.d[i] * x[i]
+    end
+    if A.corr !== nothing
+        mul!(y, A.corr, x, 1, 1)  # y += corr * x
     end
     return y
 end
@@ -162,6 +173,8 @@ function H_G_Hmat(
     rank = typemax(Int),
     alpha = 1.0,
     hss_method = :dense,
+    nearfield::Bool = true,
+    near_factor::Real = 2.0,
 )
     points = collect(all_points(dad))
     w = node_weights(dad)
@@ -195,9 +208,100 @@ function H_G_Hmat(
     H = ColWeightedOp(Dq, wH, zeros(nt), nt, nt)
     G = ColWeightedOp(Du, copy(w), zeros(nt), nt, n)
 
+    # Near-field: full element integration vs pointwise when r < near_factor * L
+    nearfield && correct_nearfield!(dad, H, G; factor=near_factor)
     corrige_diagonais!(dad, H, G)
     set_cache!(dad; H=H, G=G, H_bare=Dq, G_bare=Du, bem_weights=w)
     return H, G
+end
+
+"""
+    correct_nearfield!(dad, H, G; factor=2.0)
+
+For compressed / factored [`ColWeightedOp`](@ref) operators, correct all
+entries involving element `e` when
+
+```
+min_k ‖x_source − x_node_k‖ < factor · Length(e)
+```
+
+(same criterion as dense assembly). Correction per column `j` of element `e`:
+
+```
+ΔH_ij = h_j^∫ − (∂u*/∂n_j) w_j
+ΔG_ij = g_j^∫ − u*_j w_j
+```
+
+where `(h^∫, g^∫) =` [`integrate_element`](@ref) and the second terms are the
+pointwise collocation contributions already in `H.K`/`G.K`×`w`.
+Diagonal free-term is applied afterwards by [`corrige_diagonais!`](@ref).
+
+Pass `nearfield=false` to [`H_G_Hmat`](@ref) to skip (diagonal-only).
+"""
+function correct_nearfield!(
+    dad::BEMdata{<:Laplace},
+    H::ColWeightedOp,
+    G::ColWeightedOp;
+    factor::Real = 2.0,
+)
+    nt = H.nrows
+    n = G.ncols
+    n == dad.n || throw(DimensionMismatch("G columns"))
+    # COO accumulators
+    Ih = Int[]; Jh = Int[]; Vh = Float64[]
+    Ig = Int[]; Jg = Int[]; Vg = Float64[]
+
+    elems = dad.elements
+    Xel = [[dad.Nodes[j] for j in elem.index] for elem in elems]
+
+    nn_max = maximum(length(el) for el in elems; init=3)
+    hloc = zeros(nn_max)
+    gloc = zeros(nn_max)
+
+    @inbounds for i in 1:nt
+        pf = point(dad, i)
+        for (ej, elem) in enumerate(elems)
+            xj = Xel[ej]
+            # same trigger as Assembly_full dense path
+            r0 = euclidean(pf, xj[1])
+            r0 < factor * elem.Length || continue
+
+            nn = length(elem)
+            fill!(hloc, 0.0)
+            fill!(gloc, 0.0)
+            hv = @view hloc[1:nn]
+            gv = @view gloc[1:nn]
+            integrate_element(dad, elem, xj, pf, hv, gv)
+
+            for k in 1:nn
+                j = elem.index[k]
+                j > n && continue
+                # pointwise collocation (same as far-field compressed kernel×w)
+                # — do not index H.K/G.K (HMatrix disables getindex)
+                hp = 0.0
+                gp = 0.0
+                if i != j
+                    r_node = dad.Nodes[j] - pf
+                    n_node = dad.Normal[j]
+                    U, Tker = fundamental(dad, r_node, n_node)
+                    hp = Tker * H.w[j]
+                    gp = U * G.w[j]
+                end
+                dh = hv[k] - hp
+                dg = gv[k] - gp
+                if abs(dh) > 0
+                    push!(Ih, i); push!(Jh, j); push!(Vh, dh)
+                end
+                if abs(dg) > 0
+                    push!(Ig, i); push!(Jg, j); push!(Vg, dg)
+                end
+            end
+        end
+    end
+
+    H.corr = isempty(Vh) ? spzeros(nt, nt) : sparse(Ih, Jh, Vh, nt, nt)
+    G.corr = isempty(Vg) ? spzeros(nt, n) : sparse(Ig, Jg, Vg, nt, n)
+    return nothing
 end
 
 function _assemble_HG_bare(KDq, KDu, Xclt, Yclt_H, Yclt_G, fmt::Symbol;

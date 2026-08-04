@@ -66,7 +66,7 @@ end
         Hd = zeros(2, 4); Gd = zeros(2, 4)
         BEM.integraelem_dumont!(Hd, Gd, dad, elem, nodes, pf, qsi, w)
         Hi = zeros(2, 4); Gi = zeros(2, 4)
-        BEM.integraelem(dad, elem, nodes, pf, Hi, Gi)
+        BEM.integrate_element(dad, elem, nodes, pf, Hi, Gi)
         @test Hi ≈ Hd atol=1e-14
         @test Gi ≈ Gd atol=1e-14
 

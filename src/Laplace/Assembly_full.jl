@@ -5,7 +5,7 @@ export H_G_full_direct, H_G_full_direct!
 
 Assemble dense influence matrices `H` and `G`.
 
-**2D near-field integration** (`integraelem`):
+**2D near-field integration** (`integrate_element`):
 - Laplace → **Dumont** (GL + C_G / C₁)
 - 2D Elasticity (Kelvin) → **Dumont** (log U + H1/H2 on T)
 - 2D AnisotropicElasticity (Lekhnitskii) → **SST** (Cordeiro & Leonel 2020)
@@ -76,7 +76,7 @@ function _assemble_row_2d_scalar!(dad, H, G, i, elems, Xel)
         if r0 < 2 * elem_j.Length
             h = @view H[i, elem_j.index]
             g = @view G[i, elem_j.index]
-            integraelem(dad, elem_j, xj, pf, h, g)
+            integrate_element(dad, elem_j, xj, pf, h, g)
         else
             for k in eachindex(elem_j.index)
                 node = elem_j.index[k]
@@ -129,7 +129,7 @@ function _assemble_row_3d_scalar!(dad, H, G, i, elems, Xel, qsi, w)
         if r0 < 2 * elem_j.Length
             h = @view H[i, elem_j.index]
             g = @view G[i, elem_j.index]
-            integraelem(dad, elem_j, xj, pf, qsi, w, h, g)
+            integrate_element(dad, elem_j, xj, pf, qsi, w, h, g)
         else
             for k in eachindex(elem_j.index)
                 node = elem_j.index[k]
@@ -189,7 +189,7 @@ function _assemble_row_2d_vec!(dad, H, G, i, elems, Xel)
         if r0 < 2 * elem_j.Length
             h = @view H[ii, jj]
             g = @view G[ii, jj]
-            integraelem(dad, elem_j, xj, pf, h, g)
+            integrate_element(dad, elem_j, xj, pf, h, g)
         else
             for k in eachindex(elem_j.index)
                 node = elem_j.index[k]
@@ -244,7 +244,7 @@ function _assemble_row_3d_vec!(dad, H, G, i, elems, Xel, qsi, w)
         if r0 < 2 * elem_j.Length
             h = @view H[ii, jj]
             g = @view G[ii, jj]
-            integraelem(dad, elem_j, xj, pf, qsi, w, h, g)
+            integrate_element(dad, elem_j, xj, pf, qsi, w, h, g)
         else
             for k in eachindex(elem_j.index)
                 node = elem_j.index[k]
@@ -265,7 +265,16 @@ end
 # Element integration
 # =============================================================================
 
-function integraelem(dad::BEMdata{<:Scalar}, elem, x::Vector{Point2D}, pf::Point2D, h, g, f=fundamental)
+"""
+    integrate_element(dad, elem, x, pf, h, g; f=fundamental)
+
+Integrate double/single layer contributions of one boundary element for source
+`pf` into local vectors `h`, `g` (length = `#nodes` of `elem`).
+
+Uses Dumont singular integration when applicable, otherwise sinh-transformed
+Gauss quadrature. Formerly named `integraelem`.
+"""
+function integrate_element(dad::BEMdata{<:Scalar}, elem, x::Vector{Point2D}, pf::Point2D, h, g, f=fundamental)
     qsi, w = _quad_rule(dad)
     iso_iga = elem.controls !== nothing && dad.element_type isa Bernstein &&
         length(elem) == length(elem.controls)
@@ -338,7 +347,7 @@ function _quad_rule(dad)
     return gausslegendre(12)
 end
 
-function integraelem(dad::BEMdata{<:Scalar}, elem, x::Vector{Point3D}, pf::Point3D, qsi, w, h, g)
+function integrate_element(dad::BEMdata{<:Scalar}, elem, x::Vector{Point3D}, pf::Point3D, qsi, w, h, g)
     # flattened near-field: polar+sinh when d/L small, else tensor sinh
     η1, η2, ww = transform_surface(dad, elem, pf; qsi2=qsi)
     N, dN1, dN2 = shapefun2D_points(dad.element_type, η1, η2)
@@ -360,7 +369,7 @@ function integraelem(dad::BEMdata{<:Scalar}, elem, x::Vector{Point3D}, pf::Point
     return nothing
 end
 
-function integraelem(dad::BEMdata{<:Vectorial}, elem, x::Vector{Point2D}, pf::Point2D, h, g, f=fundamental)
+function integrate_element(dad::BEMdata{<:Vectorial}, elem, x::Vector{Point2D}, pf::Point2D, h, g, f=fundamental)
     qsi, w = _quad_rule(dad)
     if supports_dumont(dad) && dad.dimension == 2 && f === fundamental && elem.controls === nothing
         integraelem_dumont!(h, g, dad, elem, x, pf, qsi, w)
@@ -387,7 +396,7 @@ function integraelem(dad::BEMdata{<:Vectorial}, elem, x::Vector{Point2D}, pf::Po
     return nothing
 end
 
-function integraelem(dad::BEMdata{<:Vectorial}, elem, x::Vector{Point3D}, pf::Point3D, qsi, w, h, g)
+function integrate_element(dad::BEMdata{<:Vectorial}, elem, x::Vector{Point3D}, pf::Point3D, qsi, w, h, g)
     η1, η2, ww = transform_surface(dad, elem, pf; qsi2=qsi)
     N, dN1, dN2 = shapefun2D_points(dad.element_type, η1, η2)
     pg = N * x
@@ -411,3 +420,6 @@ function integraelem(dad::BEMdata{<:Vectorial}, elem, x::Vector{Point3D}, pf::Po
     end
     return nothing
 end
+
+# backward-compatible alias
+const integraelem = integrate_element
