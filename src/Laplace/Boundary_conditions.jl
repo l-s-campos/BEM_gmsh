@@ -8,7 +8,8 @@ function applyBC(dad::BEMdata{<:Union{Laplace,OrthotropicLaplace}})
     H = dad.H
     G = dad.G
 
-    if H isa HMatrices.HMatrix
+    # hierarchical or factored (ColWeightedOp) — matrix-free mixed BC
+    if H isa HMatrices.HMatrix || H isa ColWeightedOp
         return applyBC_Hmat(dad)
     end
 
