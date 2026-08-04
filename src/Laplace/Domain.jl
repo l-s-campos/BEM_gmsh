@@ -6,8 +6,15 @@ export DIBEM, dibem!
 
 **Direct Interpolation Boundary Element Method** (DIBEM).
 
-Builds the regularized domain-integral operator `M` (`dad.cache.M`) for inertia /
-body-force terms using Laplace fundamentals + RBFs (Loeffler–Mansur et al.).
+Builds the regularized domain-integral operator `M` such that
+
+```
+∫_Ω β(X) u*(ξ,X) dΩ  ≈  (M β)(ξ)
+```
+
+Stores `M` in `dad.cache.M` and **returns** `M`. Used for inertia / body force
+and as the DIBEM kernel of diffuse–advective assembly
+([`dibem_diffuse_advective!`](@ref)).
 """
 function DIBEM(dad::BEMdata{<:Laplace}; rbf=PHS())
 
@@ -68,8 +75,23 @@ function DIBEM(dad::BEMdata{<:Laplace}; rbf=PHS())
         M[i, i] = 0
         M[i, i] = -sum(M[i, :]) + ID[i]
     end
-    set_cache!(dad; M)
-    return nothing
+    set_cache!(dad; M, dibem_F=F, dibem_rbf=rbf)
+    return M
 end
 
 const dibem! = DIBEM
+
+"""
+    dibem_matrix(dad; rbf=PHS(), rebuild=false) -> M
+
+Return the DIBEM operator `M` from [`DIBEM`](@ref). Rebuilds if missing or
+`rebuild=true`.
+"""
+function dibem_matrix(dad::BEMdata{<:Laplace}; rbf=PHS(), rebuild::Bool=false)
+    if rebuild || !has_cache(dad, :M)
+        return DIBEM(dad; rbf=rbf)
+    end
+    return dad.M
+end
+
+export dibem_matrix

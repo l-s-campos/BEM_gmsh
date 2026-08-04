@@ -5,13 +5,12 @@
 # Governing (α = diffusivity, v = velocity):
 #   α ∇²u = v · ∇u = b          (steady diffuse–advective / advection–diffusion)
 #
-# Classic inertia/mass DIBEM: [`DIBEM`](@ref) in Domain.jl.
-# Here DIBEM builds the *transport* operator for the advective term.
+# Domain integral of density β uses the same operator M from Domain.jl:
+#   ∫ β u* dΩ ≈ M β     ←  DIBEM(dad) / dibem_matrix(dad)
 #
-# Regularize ∫ b u* dΩ, approximate [b−b(ξ)] u* by RBFs,
-# ∇u ≈ (∇F) F⁻¹ u  (DRM-style),  b = M′ u.
+# Gradients of u via DRM-style RBF:  ∇u ≈ (∇F) F⁻¹ u,  b = M′ u.
 # Discrete system (thesis 8.22):
-#   H u − G q = M_DA u
+#   H u − G q = M_DA u ,   M_DA = M * M′ / α
 #   (H − M_DA) u = G q
 # =============================================================================
 
@@ -22,82 +21,23 @@ export exp_mxy_solution, exp_mxy_velocity, exp_mxy_flux
 export setup_da_square_exp_mxy, test_da_square_exp_mxy
 
 """
-    build_da_S_matrix(dad; rbf=PHS(3; poly_deg=-1), k=dad.properties.k) -> S
+    build_da_S_matrix(dad; rbf=PHS(), rebuild=false) -> M
 
-Regularized DIBEM operator `S` such that
+Return the regularized DIBEM domain operator **from [`Domain.jl`](@ref DIBEM)**:
 
 ```
-∫_Ω β(X) u*(ξ,X) dΩ  ≈  (S β)(ξ)
+∫_Ω β u* dΩ ≈ M β
 ```
 
-(thesis §8.1.1–8.1.2; same regularization idea as classic [`DIBEM`](@ref)).
+This is exactly `dad.cache.M` produced by [`DIBEM`](@ref) / [`dibem_matrix`](@ref).
+No separate assembly path — diffuse–advective reuses the same matrix.
 """
-function build_da_S_matrix(dad::BEMdata{<:Laplace};
-        rbf=PHS(3; poly_deg=-1), k=nothing)
-    kk = k === nothing ? float(dad.properties.k) : float(k)
-    nt = dad.nt
-    pts = _da_points(dad)
-
-    F = zeros(nt, nt)
-    D = zeros(nt, nt)
-    @inbounds for j in 1:nt, i in 1:nt
-        r2 = sqeuclidean(pts[i], pts[j])
-        F[i, j] = rbf(r2)
-        if r2 > 0
-            D[i, j] = -log(r2) / (4π * kk)   # u* (2D Laplace)
-        end
-    end
-    ε = 1e-12 * (tr(F) / nt + 1)
-    @inbounds for i in 1:nt
-        F[i, i] += ε
-    end
-
-    # N[j] = ∫_Γ η^j dΓ,  η = n · ∇ψ,  ∇²ψ = F^j
-    N = zeros(nt)
-    ID = zeros(nt)
-    @inbounds for j in 1:nt
-        xj = pts[j]
-        for elem in dad.elements
-            for q in eachindex(elem.index)
-                ind = elem.index[q]
-                xq = ind <= dad.n ? dad.Nodes[ind] : dad.internalNodes[ind - dad.n]
-                rvec = xq - xj
-                R = norm(rvec)
-                R < 1e-14 && continue
-                wJ = dad.elem_weight[q] * elem.Jacobian[q]
-                n_dot = dot(dad.Normal[ind], rvec) / R^2
-                N[j] += int(rbf, xq, xj) * wJ * n_dot
-            end
-        end
-    end
-    @inbounds for i in 1:nt
-        xi = pts[i]
-        for elem in dad.elements
-            for q in eachindex(elem.index)
-                ind = elem.index[q]
-                xq = ind <= dad.n ? dad.Nodes[ind] : dad.internalNodes[ind - dad.n]
-                rvec = xq - xi
-                R = norm(rvec)
-                R < 1e-14 && continue
-                wJ = dad.elem_weight[q] * elem.Jacobian[q]
-                n_dot = dot(dad.Normal[ind], rvec) / R^2
-                ID[i] += -(2 * R^2 * log(R) - R^2) / (8 * π * kk) * wJ * n_dot
-            end
-        end
-    end
-
-    c = F \ N
-    S = D .* c'
-    @inbounds for i in 1:nt
-        srow = sum(view(S, i, :))
-        S[i, i] = 0.0
-        S[i, i] = -srow + ID[i]
-    end
-    return S
+function build_da_S_matrix(dad::BEMdata{<:Laplace}; rbf=PHS(), rebuild::Bool=false)
+    return Matrix{Float64}(dibem_matrix(dad; rbf=rbf, rebuild=rebuild))
 end
 
 """
-    build_da_Mprime(dad, velocity; rbf=...) -> M′
+    build_da_Mprime(dad, velocity; rbf=PHS()) -> M′
 
 DRM-style gradient recovery (thesis 8.18–8.21):
 
@@ -106,18 +46,25 @@ u = F β,  β = F⁻¹ u
 u_,ℓ = F_,ℓ β = F_,ℓ F⁻¹ u
 b = v₁ u_,1 + v₂ u_,2 = M′ u
 ```
+
+If `DIBEM` already stored `dibem_F` with the same basis, that factorization is reused.
 """
-function build_da_Mprime(dad::BEMdata{<:Laplace}, velocity;
-        rbf=PHS(3; poly_deg=-1))
+function build_da_Mprime(dad::BEMdata{<:Laplace}, velocity; rbf=PHS())
     nt = dad.nt
     dim = dad.dimension
     pts = _da_points(dad)
 
-    F = zeros(nt, nt)
-    @inbounds for j in 1:nt, i in 1:nt
-        F[i, j] = rbf(sqeuclidean(pts[i], pts[j]))
+    # Prefer F from DIBEM when available and size matches
+    F = if has_cache(dad, :dibem_F) && size(dad.dibem_F) == (nt, nt)
+        Matrix{Float64}(dad.dibem_F)
+    else
+        Fnew = zeros(nt, nt)
+        @inbounds for j in 1:nt, i in 1:nt
+            Fnew[i, j] = rbf(sqeuclidean(pts[i], pts[j]))
+        end
+        Fnew
     end
-    ε = 1e-12 * (tr(F) / nt + 1)
+    ε = 1e-12 * (tr(F) / max(nt, 1) + 1)
     @inbounds for i in 1:nt
         F[i, i] += ε
     end
@@ -157,46 +104,52 @@ function build_da_Mprime(dad::BEMdata{<:Laplace}, velocity;
 end
 
 """
-    dibem_diffuse_advective!(dad, velocity; rbf, α=1.0, modify_H=true) -> M_DA
+    dibem_diffuse_advective!(dad, velocity; rbf=PHS(), α=1.0, modify_H=true) -> M_DA
 
-Assemble the diffuse–advective transport matrix `M_DA = S M′` (thesis 8.22)
-for variable velocity `v(X)` and optionally
+Assemble the diffuse–advective transport matrix
 
 ```
-H ← H − M_DA / α
+M_DA = M * M′ / α
 ```
 
-so `H u = G q` solves the steady **diffuse–advective** problem `α ∇²u = v·∇u`.
-Uses DIBEM with implicit treatment of `∇·v`.
+where **`M` comes from [`DIBEM`](@ref)** (`Domain.jl`) and `M′` maps `u → v·∇u`.
+
+Optionally
+
+```
+H ← H − M_DA
+```
+
+so `H u = G q` solves `α ∇²u = v·∇u`.
 """
 function dibem_diffuse_advective!(dad::BEMdata{<:Laplace}, velocity;
-        rbf=PHS(3; poly_deg=-1), α::Real=1.0, modify_H::Bool=true)
+        rbf=PHS(), α::Real=1.0, modify_H::Bool=true, rebuild_M::Bool=false)
     has_cache(dad, :H) || error("call H_G_full_direct(dad) first")
     has_cache(dad, :G) || error("call H_G_full_direct(dad) first")
     α = float(α)
     α > 0 || throw(ArgumentError("α must be > 0"))
 
-    S = build_da_S_matrix(dad; rbf=rbf, k=dad.properties.k)
+    # M from Domain.jl (DIBEM)
+    M = build_da_S_matrix(dad; rbf=rbf, rebuild=rebuild_M)
     M′ = build_da_Mprime(dad, velocity; rbf=rbf)
-    M_DA = S * M′
-    M_trans = M_DA ./ α
-    set_cache!(dad; M_DA=M_trans, M_prime=M′, S_da=S)
+    M_DA = (M * M′) ./ α
+    set_cache!(dad; M_DA=M_DA, M_prime=M′, S_da=M)
 
     if modify_H
         H0 = has_cache(dad, :H0_da) ? dad.H0_da : copy(dad.H)
         set_cache!(dad; H0_da=H0)
-        dad.H .= H0 .- M_trans
+        dad.H .= H0 .- M_DA
         if has_cache(dad, :A)
             dad.cache.A = nothing
         end
     end
-    return M_trans
+    return M_DA
 end
 
 """
     solve_diffuse_advective!(dad, velocity; kwargs...) -> T
 
-Build diffuse–advective DIBEM operators and call [`solve`](@ref).
+Build diffuse–advective operators (`DIBEM` + `M′`) and call [`solve`](@ref).
 """
 function solve_diffuse_advective!(dad::BEMdata{<:Laplace}, velocity; kwargs...)
     dibem_diffuse_advective!(dad, velocity; kwargs...)
@@ -270,7 +223,7 @@ report mean relative flux error on the **right** and **bottom** edges
 (same metric as Pinheiro Ch.8 §8.2.1).
 """
 function test_da_square_exp_mxy(dad::BEMdata{<:Laplace}; m=1.0, npg=12,
-        rbf=PHS(3; poly_deg=-1), verbose=true)
+        rbf=PHS(), verbose=true)
     H_G_full_direct(dad, npg)
     solve_diffuse_advective!(dad, exp_mxy_velocity(m); rbf=rbf, α=1.0)
 

@@ -29,12 +29,19 @@ discretized with **DIBEM** on the advective density \(b = v·∇u\)
 (Pinheiro thesis Ch.8 formulation).
 
 ```julia
-solve_diffuse_advective!(dad, velocity; α=1.0, rbf=PHS(3; poly_deg=-1))
-# or step-by-step:
-dibem_diffuse_advective!(dad, velocity; α=1.0)  # H ← H − M_DA/α
+solve_diffuse_advective!(dad, velocity; α=1.0)
+# Internally:
+#   M  = DIBEM(dad)              # Domain.jl  — ∫ β u* dΩ ≈ M β
+#   M′ = build_da_Mprime(...)    # b = v·∇u ≈ M′ u
+#   M_DA = M * M′ / α
+#   H ← H − M_DA
+
+# explicit steps:
+DIBEM(dad)
+dibem_diffuse_advective!(dad, velocity; α=1.0)  # reuses dad.M
 solve(dad)
 
-S  = build_da_S_matrix(dad)
+M  = build_da_S_matrix(dad)   # == dad.M from Domain.jl
 Mp = build_da_Mprime(dad, velocity)
 ```
 

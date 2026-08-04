@@ -10,7 +10,11 @@ include(joinpath(@__DIR__, "..", "data", "Laplace", "Laplace_dad.jl"))
     msh = Base.invokelatest(quadrado; ndiv=6, show=false, nome="da_op")
     dad = setup_da_square_exp_mxy(msh; m=1.0, n_int=3)
     H_G_full_direct(dad, 10)
+    # S must be the Domain.jl DIBEM matrix M
+    M_dom = DIBEM(dad)
     S = build_da_S_matrix(dad)
+    @test S ≈ M_dom
+    @test S === dad.M || S ≈ dad.M
     M′ = build_da_Mprime(dad, exp_mxy_velocity(1.0))
     @test size(S) == (dad.nt, dad.nt)
     @test size(M′) == (dad.nt, dad.nt)
@@ -18,6 +22,7 @@ include(joinpath(@__DIR__, "..", "data", "Laplace", "Laplace_dad.jl"))
     M_DA = dibem_diffuse_advective!(dad, exp_mxy_velocity(1.0))
     @test size(M_DA) == (dad.nt, dad.nt)
     @test all(isfinite, M_DA)
+    @test M_DA ≈ (M_dom * M′)   # α=1
 end
 
 @testset "exp(mxy) PDE residual ∇²u = v·∇u" begin
