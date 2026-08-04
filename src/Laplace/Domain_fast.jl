@@ -27,7 +27,7 @@ Boundary integrals for DIBEM:
 """
 function _dibem_IF_ID(dad::BEMdata{<:Laplace}, rbf)
     nt = dad.nt
-    k = float(dad.properties.k)
+    props = dad.properties
     pts = _dibem_collocation_points(dad)
     IF = zeros(nt)
     ID = zeros(nt)
@@ -40,10 +40,9 @@ function _dibem_IF_ID(dad::BEMdata{<:Laplace}, rbf)
                 r = xj - x
                 R = norm(r)
                 R < 1e-10 && continue
-                wJ = dad.elem_weight[j] * elem.Jacobian[j]
-                n_dot = dot(dad.Normal[ind], r) / R^2
-                IF[i] += int(rbf, x, xj) * wJ * n_dot
-                ID[i] += -(2 * R^2 * log(R) - R^2) / (8 * π * k) * wJ * n_dot
+                wJn = dad.elem_weight[j] * elem.Jacobian[j] * dot(dad.Normal[ind], r) / R^2
+                IF[i] += int(rbf, x, xj) * wJn
+                ID[i] += _galerkin_n_dot_gradG(props, R) * wJn
             end
         end
     end
@@ -66,26 +65,20 @@ end
 
 """
 Column-scaled fundamental kernel for DIBEM off-diagonal:
-``M[i,j] = c[j] · u*(x_i, x_j)`` (diagonal left 0 until correction).
+``M[i,j] = c[j] · u*(x_i, x_j)`` with ``u*`` from [`fundamental`](@ref).
 """
-struct DibemMKernel{P} <: AbstractMatrix{Float64}
+struct DibemMKernel{P,Prop} <: AbstractMatrix{Float64}
     points::Vector{P}
     c::Vector{Float64}
-    k::Float64
-    dim::Int
+    props::Prop
+    n_dummy::P          # normal placeholder for fundamental(::, r, n)
 end
 Base.size(K::DibemMKernel) = (length(K.points), length(K.points))
 function Base.getindex(K::DibemMKernel, i::Int, j::Int)
     i == j && return 0.0
     r = K.points[j] - K.points[i]
-    R = norm(r)
-    R < 1e-15 && return 0.0
-    # Match Domain.jl: -log(R²)/(4πk) = -log(R)/(2πk)
-    u = if K.dim == 2
-        -log(R) / (2π * K.k)
-    else
-        1 / (4π * K.k * R)
-    end
+    norm(r) < 1e-15 && return 0.0
+    u = fundamental(K.props, r, K.n_dummy).U
     return K.c[j] * u
 end
 
@@ -115,9 +108,9 @@ function DIBEM_Hmat(
     gmres_itmax = 0,
 )
     nt = dad.nt
-    k = float(dad.properties.k)
-    dim = dad.dimension
+    props = dad.properties
     IF, ID, pts = _dibem_IF_ID(dad, rbf)
+    n_dummy = pts[1] isa SVector{2} ? SVector(0.0, 1.0) : SVector(0.0, 0.0, 1.0)
 
     splitter = PrincipalComponentSplitter(; nmax=nmax)
     Xclt = ClusterTree(pts, splitter)
@@ -140,7 +133,7 @@ function DIBEM_Hmat(
     end
 
     # --- M off-diagonal as H-matrix ---
-    KM = DibemMKernel(pts, c, k, dim)
+    KM = DibemMKernel(pts, c, props, n_dummy)
     @info "DIBEM_Hmat: assembling M" nt
     # fresh trees (same geometry)
     Xclt2 = ClusterTree(pts, splitter)
@@ -262,7 +255,8 @@ function DIBEM_FMM(
     threads = true,
 )
     nt = dad.nt
-    k = float(dad.properties.k)
+    props = dad.properties
+    k = float(props.k)
     dim = dad.dimension
     IF, ID, pts = _dibem_IF_ID(dad, rbf)
 
@@ -270,9 +264,7 @@ function DIBEM_FMM(
     c = _dibem_solve_Fc!(dad, pts, IF, rbf; f_method=f_method, atol=eps,
         rtol=rtol, nmax=f_nmax, eta=eta, threads=threads)
 
-    # --- FMM operator for D ~ u* ---
-    # Domain: u* = -log(R)/(2π k) in 2D,  1/(4π k R) in 3D
-    P = reduce(hcat, pts)  # d × nt if pts are SVectors - need d×N
+    # --- FMM for D ~ fundamental.U (same scale as Fundamental.jl) ---
     d = length(pts[1])
     Pmat = Matrix{Float64}(undef, d, nt)
     @inbounds for j in 1:nt, a in 1:d
@@ -280,11 +272,11 @@ function DIBEM_FMM(
     end
 
     D_fmm = if dim == 2
-        # fmm returns log(R); we need -log(R)/(2πk)
+        # rfmm2d pot ~ log(R); fundamental.U = -log(R)/(2π k)
         raw = FMM.fmm_laplace2d_matrix(Pmat; eps=Float64(eps), nmax=nmax)
         _ScaledFMM(raw, -1 / (2π * k))
     else
-        # fmm returns 1/(4π R); Domain uses 1/(4π k R)
+        # lfmm3d pot ~ 1/(4π R); fundamental.U = 1/(4π k R)
         raw = FMM.fmm_laplace3d_matrix(Pmat; eps=Float64(eps), nmax=nmax)
         _ScaledFMM(raw, 1 / k)
     end
@@ -447,9 +439,9 @@ function DIBEM_structured(
 )
     fmt = something(_dibem_struct_format(format), format)
     nt = dad.nt
-    k = float(dad.properties.k)
-    dim = dad.dimension
+    props = dad.properties
     IF, ID, pts = _dibem_IF_ID(dad, rbf)
+    n_dummy = pts[1] isa SVector{2} ? SVector(0.0, 1.0) : SVector(0.0, 0.0, 1.0)
 
     splitter = PrincipalComponentSplitter(; nmax=nmax)
     tree = ClusterTree(pts, splitter)
@@ -482,7 +474,7 @@ function DIBEM_structured(
 
     @info "DIBEM_structured: M" format=m_fmt nt
 
-    KM = DibemMKernel(pts, c, k, dim)
+    KM = DibemMKernel(pts, c, props, n_dummy)
     Moff = assemble_structured(KM, treeM; format=m_fmt, adm=adm, comp=comp,
         threads=threads, rtol=rtol, rank=rank, alpha=alpha,
         method=hss_method, global_index=true)
@@ -518,15 +510,13 @@ function _dibem_F_as_kernel(fmt::Symbol, rbf, pts)
     return DibemFKernel(rbf, pts)
 end
 
-"""Plain fundamental-solution kernel (no column scaling) as `KernelMatrix`."""
-function _dibem_ustar_kernelmatrix(pts, k, dim)
-    kk = float(k)
-    dd = Int(dim)
+"""Plain single-layer kernel via [`fundamental`](@ref) as `KernelMatrix`."""
+function _dibem_ustar_kernelmatrix(pts, props)
+    n_dummy = pts[1] isa SVector{2} ? SVector(0.0, 1.0) : SVector(0.0, 0.0, 1.0)
     function ustar(x, y)
         r = y - x
-        R = norm(r)
-        R < 1e-15 && return 0.0
-        return dd == 2 ? -log(R) / (2π * kk) : 1 / (4π * kk * R)
+        norm(r) < 1e-15 && return 0.0
+        return fundamental(props, r, n_dummy).U
     end
     return KernelMatrix(ustar, pts, pts)
 end

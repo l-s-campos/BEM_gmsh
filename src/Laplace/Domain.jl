@@ -27,13 +27,16 @@ function DIBEM_dense(dad::BEMdata{<:Laplace}; rbf=PHS())
     k = dad.properties.k
 
 
+    props = dad.properties
+    n0 = dad.Normal[1]  # dummy normal — only U from fundamental is used in D
     @showprogress "Assembling F and D" for j in 1:dad.nt, i in 1:dad.nt
         x = i <= dad.n ? dad.Nodes[i] : dad.internalNodes[i-dad.n]
         xj = j <= dad.n ? dad.Nodes[j] : dad.internalNodes[j-dad.n]
         r2 = sqeuclidean(x, xj)
         F[i, j] = rbf(r2)
         if r2 > 0
-            D[i, j] = -log(r2) / (4π * k)
+            # single-layer u* from Fundamental.jl (same as H,G assembly)
+            D[i, j] = fundamental(props, xj - x, n0).U
         end
     end
 
@@ -54,8 +57,10 @@ function DIBEM_dense(dad::BEMdata{<:Laplace}; rbf=PHS())
                 if i == 1
                     IP += int(mon, x, xj) * dad.elem_weight[j] * elem.Jacobian[j] * dot(dad.Normal[ind], r) / R^2
                 end
-                IF[i] += int(rbf, x, xj) * dad.elem_weight[j] * elem.Jacobian[j] * dot(dad.Normal[ind], r) / R^2
-                ID[i] += -(2 * R^2 * log(R) - R^2) / (8 * π * k) * dad.elem_weight[j] * elem.Jacobian[j] * dot(dad.Normal[ind], r) / R^2
+                wJn = dad.elem_weight[j] * elem.Jacobian[j] * dot(dad.Normal[ind], r) / R^2
+                IF[i] += int(rbf, x, xj) * wJn
+                # Galerkin tensor remainder ∫ n·∇G* dΓ (primitive of u* = fundamental.U)
+                ID[i] += _galerkin_n_dot_gradG(props, R) * wJn
             end
 
         end
@@ -92,3 +97,17 @@ function dibem_matrix(dad::BEMdata{<:Laplace}; rbf=PHS(), rebuild::Bool=false,
 end
 
 export dibem_matrix
+
+"""
+    _galerkin_n_dot_gradG(props, R) → scalar
+
+Radial factor in `n·∇G*` for the Galerkin tensor of the Laplace single layer,
+such that `∫ (n·∇G*) dΓ = ∫ _galerkin_n_dot_gradG(R) (n·r/R²) dΓ`.
+
+For 2D: G* = -(2 R² ln R − R²)/(8π k) with ∇²G* = u* = fundamental.U.
+"""
+function _galerkin_n_dot_gradG(props::Laplace, R::Real)
+    k = float(props.k)
+    # matches legacy: -(2 R² log R − R²) / (8π k)
+    return -(2 * R^2 * log(R) - R^2) / (8 * π * k)
+end
