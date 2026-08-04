@@ -4,7 +4,7 @@ export Laplace, Helmholtz, Elasticity, AnisotropicElasticity, LekhnitskiiParams
 export OrthotropicLaplace, AxisymmetricElasticity
 export BEMCache, has_cache, set_cache!
 export shear_modulus, lame_λ, plane_strain_κ
-export point, all_points, all_points!
+export point, all_points, all_points!, set_internal_nodes!
 
 """
     Point2D
@@ -293,15 +293,27 @@ end
 # Main problem container
 # =============================================================================
 
+"""
+    BEMdata
+
+Collocation geometry lives in one vector `collocation`:
+
+| indices | view | meaning |
+|---------|------|---------|
+| `1:n` | `dad.Nodes` | boundary |
+| `n+1:nt` | `dad.internalNodes` | internal poles |
+
+`all_points(dad)` is `collocation` (no copy). Prefer [`point`](@ref)`(dad,i)`
+in hot loops. Replace internals with [`set_internal_nodes!`](@ref).
+"""
 @kwdef mutable struct BEMdata{P<:Problem}
     name::AbstractString
     dimension::Int
     elements::Vector{Element}
     element_type::AbstractPolynomial
     elem_weight::SVector
-    Nodes::Vector{<:Point}
-    Normal::Vector{<:Point}
-    internalNodes::Vector{<:Point}
+    collocation::Vector{<:Point}   # boundary then internal
+    Normal::Vector{<:Point}        # boundary only, length n
     properties::P
     BC::Vector{Int}
     BV::Vector{Float64}
@@ -311,13 +323,23 @@ end
     cache::BEMCache = BEMCache()
 end
 
-# Forward cache fields as `dad.H`, `dad.T`, …
+# Forward cache fields as `dad.H`, `dad.T`, … and views for Nodes / internalNodes
 function Base.getproperty(dad::BEMdata, sym::Symbol)
-    if sym in fieldnames(typeof(dad))
+    if sym === :Nodes
+        c = getfield(dad, :collocation)
+        n = Int(getfield(dad, :n))
+        return view(c, 1:n)
+    elseif sym === :internalNodes
+        c = getfield(dad, :collocation)
+        n = Int(getfield(dad, :n))
+        nt = Int(getfield(dad, :nt))
+        return view(c, (n + 1):nt)
+    elseif sym === :points
+        return getfield(dad, :collocation)
+    elseif sym in fieldnames(typeof(dad))
         return getfield(dad, sym)
     end
     c = getfield(dad, :cache)
-    # backward-compat alias: `.t` → time grid if set, else traction
     if sym === :t
         if c.time !== nothing
             return c.time
@@ -336,11 +358,15 @@ function Base.getproperty(dad::BEMdata, sym::Symbol)
 end
 
 function Base.setproperty!(dad::BEMdata, sym::Symbol, val)
-    if sym in fieldnames(typeof(dad))
+    if sym === :internalNodes
+        return set_internal_nodes!(dad, val)
+    elseif sym === :Nodes
+        throw(ArgumentError(
+            "dad.Nodes is a view into collocation[1:n]; assign elements or rebuild BEMdata"))
+    elseif sym in fieldnames(typeof(dad))
         return setfield!(dad, sym, val)
     end
     if sym === :t
-        # write both aliases when user sets dad.t = ...
         c = getfield(dad, :cache)
         c.time = val
         return val
@@ -353,7 +379,7 @@ end
 function Base.propertynames(dad::BEMdata, private::Bool=false)
     c = getfield(dad, :cache)
     cached = Symbol[s for s in fieldnames(BEMCache) if s !== :extras && getfield(c, s) !== nothing]
-    return (fieldnames(typeof(dad))..., cached..., keys(c.extras)...)
+    return (:Nodes, :internalNodes, :points, fieldnames(typeof(dad))..., cached..., keys(c.extras)...)
 end
 
 # ---------------------------------------------------------------------------
@@ -363,49 +389,51 @@ end
 """
     point(dad, i) -> Point
 
-Collocation point with global index `i ∈ 1:dad.nt`:
-
-- `1:dad.n` → `dad.Nodes`
-- `dad.n+1:dad.nt` → `dad.internalNodes`
-
-**Zero allocations.** Prefer this in hot loops over [`all_points`](@ref).
+Collocation point `collocation[i]` (`i ∈ 1:nt`). Zero allocations.
 """
 @inline function point(dad::BEMdata, i::Integer)
-    @boundscheck begin
-        (1 <= i <= dad.nt) || throw(BoundsError(dad, i))
-    end
-    if i <= dad.n
-        return @inbounds dad.Nodes[i]
-    else
-        return @inbounds dad.internalNodes[i-dad.n]
-    end
-end
-
-"""
-    all_points!(pts, dad) -> pts
-
-Fill a preallocated vector `pts` with length `dad.nt` (or resize).
-Avoids allocation when `pts` is reused across calls.
-"""
-function all_points!(pts::AbstractVector, dad::BEMdata)
-    nt = dad.nt
-    length(pts) == nt || resize!(pts, nt)
-    @inbounds for i in 1:nt
-        pts[i] = point(dad, i)
-    end
-    return pts
+    @boundscheck (1 <= i <= dad.nt) || throw(BoundsError(dad, i))
+    return @inbounds getfield(dad, :collocation)[i]
 end
 
 """
     all_points(dad) -> Vector
 
-**Allocating** snapshot `vcat(Nodes, internalNodes)`.
-Use only when an API needs a dense `Vector` (e.g. `ClusterTree`).
-For element access use [`point`](@ref)`(dad, i)` instead.
+Return the live `collocation` storage (boundary then internal). **No copy.**
+`ClusterTree` defaults to `copy_elements=true`, so it will not permute in place.
 """
-function all_points(dad::BEMdata)
-    isempty(dad.internalNodes) && return dad.Nodes
-    return all_points!(Vector{eltype(dad.Nodes)}(undef, dad.nt), dad)
+all_points(dad::BEMdata) = getfield(dad, :collocation)
+
+"""
+    all_points!(pts, dad) -> pts
+
+Copy collocation into `pts` (resize if needed). Use when the consumer mutates.
+"""
+function all_points!(pts::AbstractVector, dad::BEMdata)
+    c = getfield(dad, :collocation)
+    nt = length(c)
+    length(pts) == nt || resize!(pts, nt)
+    copyto!(pts, c)
+    return pts
+end
+
+"""
+    set_internal_nodes!(dad, pts) -> dad
+
+Replace internal collocation poles. Boundary `1:n` is unchanged.
+Updates `ni`, `nt`, and resizes `collocation`.
+"""
+function set_internal_nodes!(dad::BEMdata, pts)
+    n = Int(getfield(dad, :n))
+    coll = getfield(dad, :collocation)
+    ni = length(pts)
+    resize!(coll, n + ni)
+    @inbounds for k in 1:ni
+        coll[n + k] = pts[k]
+    end
+    setfield!(dad, :ni, Int64(ni))
+    setfield!(dad, :nt, Int64(n + ni))
+    return dad
 end
 
 function Base.show(io::IO, d::BEMdata{P}) where {P<:Problem}

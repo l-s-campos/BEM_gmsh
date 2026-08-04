@@ -205,12 +205,8 @@ function _da_square_exp_mxy_bc_and_poles!(dad, m, n_int)
     end
     if n_int > 0
         xs = range(0.5 / (n_int + 1), 1 - 0.5 / (n_int + 1); length=n_int)
-        empty!(dad.internalNodes)
-        for y in xs, x in xs
-            push!(dad.internalNodes, SVector(float(x), float(y)))
-        end
-        dad.ni = length(dad.internalNodes)
-        dad.nt = dad.n + dad.ni
+        internals = [SVector(float(x), float(y)) for y in xs for x in xs]
+        set_internal_nodes!(dad, internals)
     end
     return dad
 end

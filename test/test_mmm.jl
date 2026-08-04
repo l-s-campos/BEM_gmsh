@@ -16,10 +16,7 @@ function _fixed_square_dad(ndiv; n_int=4, nome="mmm_sq")
     # internal collocation grid for DIBEM inertia
     xs = range(0.15, 0.85; length=n_int)
     internals = [SVector(x, y) for y in xs for x in xs]
-    empty!(dad.internalNodes)
-    append!(dad.internalNodes, internals)
-    dad.ni = length(dad.internalNodes)
-    dad.nt = dad.n + dad.ni
+    set_internal_nodes!(dad, internals)
     H_G_full_direct(dad, 12)
     DIBEM(dad)
     return dad

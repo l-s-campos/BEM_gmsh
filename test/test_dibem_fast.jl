@@ -11,12 +11,7 @@ function _dad_square(ndiv, n_int; nome="dibem_fast")
     dad = format2d(msh, Laplace(1.0); tipo=1, pontointerno=false)
     if n_int > 0
         xs = range(0.2, 0.8; length=n_int)
-        empty!(dad.internalNodes)
-        for y in xs, x in xs
-            push!(dad.internalNodes, SVector(float(x), float(y)))
-        end
-        dad.ni = length(dad.internalNodes)
-        dad.nt = dad.n + dad.ni
+        set_internal_nodes!(dad, [SVector(float(x), float(y)) for y in xs for x in xs])
     end
     H_G_full_direct(dad, 10)
     return dad
