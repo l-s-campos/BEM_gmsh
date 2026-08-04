@@ -12,7 +12,8 @@
 # outside — same pattern as DIBEM  M x = D (c ∘ x) + diag ∘ x.
 #
 export H_G_Hmat, corrige_diagonais!, MixedBCOperator, ColWeightedOp
-export node_weights, all_points
+export node_weights
+# all_points / point live in Structures.jl
 
 """
     node_weights(dad::BEMdata) -> Vector{Float64}
@@ -27,12 +28,6 @@ function node_weights(dad::BEMdata)
         end
     end
     return w
-end
-
-"""Boundary nodes followed by internal nodes."""
-function all_points(dad::BEMdata)
-    isempty(dad.internalNodes) && return dad.Nodes
-    return vcat(dad.Nodes, dad.internalNodes)
 end
 
 # ---------------------------------------------------------------------------

@@ -25,19 +25,15 @@ export DIBEM_FMM, DibemFactoredOperator, DibemFMMOperator, dibem!
 # Geometry / IF, ID
 # ---------------------------------------------------------------------------
 
-function _dibem_collocation_points(dad::BEMdata)
-    return isempty(dad.internalNodes) ? collect(dad.Nodes) :
-           vcat(collect(dad.Nodes), collect(dad.internalNodes))
-end
-
 function _dibem_IF_ID(dad::BEMdata{<:Laplace}, rbf)
     nt = dad.nt
     props = dad.properties
-    pts = _dibem_collocation_points(dad)
+    # optional dense snapshot only when callers need Vector (ClusterTree)
+    pts = all_points(dad)
     IF = zeros(nt)
     ID = zeros(nt)
     @inbounds for i in 1:nt
-        x = pts[i]
+        x = point(dad, i)
         for elem in dad.elements
             for j in eachindex(elem.index)
                 ind = elem.index[j]

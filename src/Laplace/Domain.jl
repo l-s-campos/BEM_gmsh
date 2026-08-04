@@ -30,8 +30,8 @@ function DIBEM_dense(dad::BEMdata{<:Laplace}; rbf=PHS())
     props = dad.properties
     n0 = dad.Normal[1]  # dummy normal — only U from fundamental is used in D
     @showprogress "Assembling F and D" for j in 1:dad.nt, i in 1:dad.nt
-        x = i <= dad.n ? dad.Nodes[i] : dad.internalNodes[i-dad.n]
-        xj = j <= dad.n ? dad.Nodes[j] : dad.internalNodes[j-dad.n]
+        x = point(dad, i)
+        xj = point(dad, j)
         r2 = sqeuclidean(x, xj)
         F[i, j] = rbf(r2)
         if r2 > 0
@@ -41,7 +41,7 @@ function DIBEM_dense(dad::BEMdata{<:Laplace}; rbf=PHS())
     end
 
     @showprogress "Integrating fundamental solutions and radial basis functions" for i in 1:dad.nt
-        x = i <= dad.n ? dad.Nodes[i] : dad.internalNodes[i-dad.n]
+        x = point(dad, i)
         P[:, i] = mon(x)
         for elem in dad.elements
             for j in eachindex(elem.index)

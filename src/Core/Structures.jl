@@ -4,6 +4,7 @@ export Laplace, Helmholtz, Elasticity, AnisotropicElasticity, LekhnitskiiParams
 export OrthotropicLaplace, AxisymmetricElasticity
 export BEMCache, has_cache, set_cache!
 export shear_modulus, lame_λ, plane_strain_κ
+export point, all_points, all_points!
 
 """
     Point2D
@@ -353,6 +354,58 @@ function Base.propertynames(dad::BEMdata, private::Bool=false)
     c = getfield(dad, :cache)
     cached = Symbol[s for s in fieldnames(BEMCache) if s !== :extras && getfield(c, s) !== nothing]
     return (fieldnames(typeof(dad))..., cached..., keys(c.extras)...)
+end
+
+# ---------------------------------------------------------------------------
+# Collocation point access (boundary + internal)
+# ---------------------------------------------------------------------------
+
+"""
+    point(dad, i) -> Point
+
+Collocation point with global index `i ∈ 1:dad.nt`:
+
+- `1:dad.n` → `dad.Nodes`
+- `dad.n+1:dad.nt` → `dad.internalNodes`
+
+**Zero allocations.** Prefer this in hot loops over [`all_points`](@ref).
+"""
+@inline function point(dad::BEMdata, i::Integer)
+    @boundscheck begin
+        (1 <= i <= dad.nt) || throw(BoundsError(dad, i))
+    end
+    if i <= dad.n
+        return @inbounds dad.Nodes[i]
+    else
+        return @inbounds dad.internalNodes[i-dad.n]
+    end
+end
+
+"""
+    all_points!(pts, dad) -> pts
+
+Fill a preallocated vector `pts` with length `dad.nt` (or resize).
+Avoids allocation when `pts` is reused across calls.
+"""
+function all_points!(pts::AbstractVector, dad::BEMdata)
+    nt = dad.nt
+    length(pts) == nt || resize!(pts, nt)
+    @inbounds for i in 1:nt
+        pts[i] = point(dad, i)
+    end
+    return pts
+end
+
+"""
+    all_points(dad) -> Vector
+
+**Allocating** snapshot `vcat(Nodes, internalNodes)`.
+Use only when an API needs a dense `Vector` (e.g. `ClusterTree`).
+For element access use [`point`](@ref)`(dad, i)` instead.
+"""
+function all_points(dad::BEMdata)
+    isempty(dad.internalNodes) && return dad.Nodes
+    return all_points!(Vector{eltype(dad.Nodes)}(undef, dad.nt), dad)
 end
 
 function Base.show(io::IO, d::BEMdata{P}) where {P<:Problem}

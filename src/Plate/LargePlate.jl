@@ -154,7 +154,7 @@ function membrane_bodyforce_from_N(prob::LargePlateProblem, Nxx, Nyy, Nxy)
     dad = prob.dad_pe
     bn = zeros(T, 2 * dad.nt)
     for i in 1:dad.nt
-        p = i <= dad.n ? dad.Nodes[i] : dad.internalNodes[i-dad.n]
+        p = point(dad, i)
         best, bd = 1, Inf
         @inbounds for k in eachindex(prob.pts)
             d = (prob.pts[k][1] - p[1])^2 + (prob.pts[k][2] - p[2])^2

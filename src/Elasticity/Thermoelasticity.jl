@@ -46,16 +46,7 @@ function eval_temperature(dad::BEMdata, θ)
     end
 end
 
-function _all_points(dad::BEMdata)
-    pts = Vector{Point2D}(undef, dad.nt)
-    @inbounds for i in 1:dad.n
-        pts[i] = dad.Nodes[i]
-    end
-    @inbounds for i in 1:length(dad.internalNodes)
-        pts[dad.n+i] = dad.internalNodes[i]
-    end
-    return pts
-end
+const _all_points = all_points  # Structures.jl
 
 # =============================================================================
 # RBF gradient operators (montaFs-style, PHS + optional poly)
@@ -173,7 +164,7 @@ function dibem_elasticity!(dad::BEMdata{<:Elasticity}; npg=10, rbf=PHS(3; poly_d
     dim = dad.dimension
     @assert dim == 2 "dibem_elasticity! is 2D only"
     nt = dad.nt
-    pts = _all_points(dad)
+    pts = all_points(dad)
     qsi, w = gausslegendre(npg)
 
     F = zeros(nt, nt)
@@ -307,7 +298,7 @@ function solve_thermoelastic!(dad::BEMdata{<:Elasticity};
         M = dad.M
         q_dom = zeros(dim * nt)
         if abs(k̂) > 0 && θ_nonuniform
-            pts = _all_points(dad)
+            pts = all_points(dad)
             ops = rbf_gradient_ops(pts; rbf=rbf)
             gθ = stack_grad(ops.Fx, ops.Fy, θv)
             q_dom .-= M * (k̂ .* gθ)     # -q2  (termoelasticidade.jl)
@@ -336,7 +327,7 @@ function _eval_bodyforce(dad, bodyforce)
         length(bodyforce) == dim * nt || error("bodyforce length mismatch")
         return float.(bodyforce)
     end
-    pts = _all_points(dad)
+    pts = all_points(dad)
     @inbounds for i in 1:nt
         f = bodyforce(pts[i][1], pts[i][2])
         bn[dim*(i-1)+1] = f[1]
@@ -363,7 +354,7 @@ function stress_thermoelastic(dad::BEMdata{<:Elasticity},
     nt = dad.nt
     θv = θ === nothing ? (has_cache(dad, :θ) ? dad.θ : zeros(nt)) : eval_temperature(dad, θ)
     k̂ = thermal_modulus(dad.properties)
-    pts = _all_points(dad)
+    pts = all_points(dad)
     qsi, w = gausslegendre(npg)
 
     S = zeros(3nt, dim * n)

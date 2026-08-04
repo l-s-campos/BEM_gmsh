@@ -251,14 +251,4 @@ function test_da_square_exp_mxy(dad::BEMdata{<:Laplace}; m=1.0, npg=12,
     return (; flux_err_pct, err_u, dad, n_flux=n_s, qmax)
 end
 
-function _da_points(dad::BEMdata)
-    nt = dad.nt
-    pts = Vector{typeof(dad.Nodes[1])}(undef, nt)
-    @inbounds for i in 1:dad.n
-        pts[i] = dad.Nodes[i]
-    end
-    @inbounds for i in 1:dad.ni
-        pts[dad.n + i] = dad.internalNodes[i]
-    end
-    return pts
-end
+const _da_points = all_points

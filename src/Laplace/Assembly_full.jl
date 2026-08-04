@@ -69,7 +69,7 @@ function H_G_full_direct_2d!(dad::BEMdata{<:Scalar}; npg=20, threaded=true)
 end
 
 function _assemble_row_2d_scalar!(dad, H, G, i, elems, Xel)
-    pf = i <= dad.n ? dad.Nodes[i] : dad.internalNodes[i - dad.n]
+    pf = point(dad, i)
     @inbounds for (ej, elem_j) in enumerate(elems)
         xj = Xel[ej]
         r0 = euclidean(pf, xj[1])
@@ -122,7 +122,7 @@ function H_G_full_direct_3d!(dad::BEMdata{<:Scalar}; npg=12, threaded=true)
 end
 
 function _assemble_row_3d_scalar!(dad, H, G, i, elems, Xel, qsi, w)
-    pf = i <= dad.n ? dad.Nodes[i] : dad.internalNodes[i - dad.n]
+    pf = point(dad, i)
     @inbounds for (ej, elem_j) in enumerate(elems)
         xj = Xel[ej]
         r0 = euclidean(pf, xj[1])
@@ -180,7 +180,7 @@ end
 
 function _assemble_row_2d_vec!(dad, H, G, i, elems, Xel)
     dim = dad.dimension
-    pf = i <= dad.n ? dad.Nodes[i] : dad.internalNodes[i - dad.n]
+    pf = point(dad, i)
     ii = dim*(i-1)+1:dim*i
     @inbounds for (ej, elem_j) in enumerate(elems)
         xj = Xel[ej]
@@ -235,7 +235,7 @@ end
 
 function _assemble_row_3d_vec!(dad, H, G, i, elems, Xel, qsi, w)
     dim = dad.dimension
-    pf = i <= dad.n ? dad.Nodes[i] : dad.internalNodes[i - dad.n]
+    pf = point(dad, i)
     ii = dim*(i-1)+1:dim*i
     @inbounds for (ej, elem_j) in enumerate(elems)
         xj = Xel[ej]
