@@ -431,3 +431,4 @@ docs/build/
 LocalPreferences.toml
 # Generated Gmsh meshes (rebuild via data/*.jl)
 data/**/*.msh
+.github/workflows/
