@@ -55,7 +55,7 @@ end
     Md = DIBEM(dad; method=:dense)
     dad2 = _dad_square(8, 4; nome="dibem_f2")
     Mf = DIBEM(dad2; method=:fmm, eps=1e-5, f_method=:dense)
-    @test Mf isa DibemFMMOperator
+    @test Mf isa DibemFactoredOperator
     @test size(Mf) == size(Md)
     for trial in 1:3
         x = randn(size(Md, 1))

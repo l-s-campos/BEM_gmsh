@@ -1,18 +1,28 @@
 # =============================================================================
-# Fast DIBEM: hierarchical formats + FMM-backed M
+# Fast DIBEM — unified factored form (all compression backends)
 # =============================================================================
-# Classic dense path: Domain.jl → DIBEM_dense
-# Here:
-#   DIBEM_Hmat / DIBEM_HODLR / DIBEM_HSS / DIBEM_H2 — structured F and M
-#   DIBEM_FMM — FMM Laplace factor + matrix-free M
-#   DIBEM(...; method=:dense|:hmatrix|:hodlr|:hss|:hbs|:h2|:fmm)
+#
+# Discrete DIBEM (Domain.jl dense):
+#   F c = IF ,   M_ij = c_j u*(x_i,x_j)  (i≠j) ,   M_ii = ID_i − ∑_{j≠i} M_ij
+#
+# Equivalent **factored** matvec (used by every compressed backend):
+#   M x = D (c ∘ x) + diag ∘ x
+#   diag = ID − D c
+#
+# where D_ij = u*(x_i, x_j) (i≠j), D_ii = 0  — the same single-layer kernel as G,
+# without boundary quadrature weights.  G is rectangular (boundary cols × w_j);
+# D is square on all collocation poles.  Compression applies only to D (and F);
+# the vector c carries all DIBEM-specific information.
+#
+# Backends for D: :hmatrix | :hodlr | :hss | :hbs | :h2 | :fmm
+# F solve: dense or H-matrix GMRES
 # =============================================================================
 
 export DIBEM, DIBEM_Hmat, DIBEM_HODLR, DIBEM_HSS, DIBEM_HBS, DIBEM_H2
-export DIBEM_FMM, DibemFMMOperator, DibemStructuredOperator, dibem!
+export DIBEM_FMM, DibemFactoredOperator, DibemFMMOperator, dibem!
 
 # ---------------------------------------------------------------------------
-# Shared geometry / boundary integrals (IF, ID)
+# Geometry / IF, ID
 # ---------------------------------------------------------------------------
 
 function _dibem_collocation_points(dad::BEMdata)
@@ -20,11 +30,6 @@ function _dibem_collocation_points(dad::BEMdata)
            vcat(collect(dad.Nodes), collect(dad.internalNodes))
 end
 
-"""
-Boundary integrals for DIBEM:
-- `IF[i] = ∑_Γ int(rbf, x_i, X) (n·r/R²) dΓ`  (primitive of RBF)
-- `ID[i] = ∑_Γ G*_k n_k dΓ`  (Galerkin remainder for u*)
-"""
 function _dibem_IF_ID(dad::BEMdata{<:Laplace}, rbf)
     nt = dad.nt
     props = dad.properties
@@ -50,341 +55,97 @@ function _dibem_IF_ID(dad::BEMdata{<:Laplace}, rbf)
 end
 
 # ---------------------------------------------------------------------------
-# Kernel matrices for H-assembly
+# Kernels: F (RBF) and D (plain u* — same family as G)
 # ---------------------------------------------------------------------------
 
-"""RBF Gram matrix ``F[i,j] = φ(‖x_i - x_j‖²)``."""
+"""RBF Gram ``F[i,j] = φ(‖x_i−x_j‖²)``."""
 struct DibemFKernel{R,P} <: AbstractMatrix{Float64}
     rbf::R
     points::Vector{P}
 end
 Base.size(K::DibemFKernel) = (length(K.points), length(K.points))
-function Base.getindex(K::DibemFKernel, i::Int, j::Int)
-    return float(K.rbf(sqeuclidean(K.points[i], K.points[j])))
-end
+Base.getindex(K::DibemFKernel, i::Int, j::Int) =
+    float(K.rbf(sqeuclidean(K.points[i], K.points[j])))
 
 """
-Column-scaled fundamental kernel for DIBEM off-diagonal:
-``M[i,j] = c[j] · u*(x_i, x_j)`` with ``u*`` from [`fundamental`](@ref).
+Square single-layer kernel on all collocation points (DIBEM factor `D`):
+
+```
+D_ij = u*(x_i, x_j) = fundamental(props, x_j−x_i, ·).U   (i≠j),   D_ii = 0
+```
+
+Same `u*` as the BEM `G` matrix; `G` additionally multiplies boundary weights
+and keeps only boundary columns.
 """
-struct DibemMKernel{P,Prop} <: AbstractMatrix{Float64}
+struct DibemUStarKernel{P,Prop} <: AbstractMatrix{Float64}
     points::Vector{P}
-    c::Vector{Float64}
     props::Prop
-    n_dummy::P          # normal placeholder for fundamental(::, r, n)
+    n_dummy::P
 end
-Base.size(K::DibemMKernel) = (length(K.points), length(K.points))
-function Base.getindex(K::DibemMKernel, i::Int, j::Int)
+Base.size(K::DibemUStarKernel) = (length(K.points), length(K.points))
+function Base.getindex(K::DibemUStarKernel, i::Int, j::Int)
     i == j && return 0.0
     r = K.points[j] - K.points[i]
     norm(r) < 1e-15 && return 0.0
-    u = fundamental(K.props, r, K.n_dummy).U
-    return K.c[j] * u
+    return float(fundamental(K.props, r, K.n_dummy).U)
+end
+
+function _dibem_ustar_kernelmatrix(pts, props, n_dummy)
+    function ustar(x, y)::Float64
+        r = y - x
+        R = norm(r)
+        R < 1e-15 && return 0.0
+        return float(fundamental(props, r, n_dummy).U)
+    end
+    return KernelMatrix{typeof(ustar), typeof(pts), typeof(pts), Float64}(ustar, pts, pts)
 end
 
 # ---------------------------------------------------------------------------
-# H-matrix DIBEM
+# Factored operator  M x = D (c ∘ x) + diag ∘ x
 # ---------------------------------------------------------------------------
 
 """
-    DIBEM_Hmat(dad; rbf=PHS(), atol=1e-6, nmax=32, eta=3.0, threads=true)
+    DibemFactoredOperator
 
-Build the DIBEM operator `M` with **hierarchical matrices**:
-
-1. `F` (RBF) as H-matrix → solve `F c = IF` (GMRES)
-2. Assemble `M[i,j] = c[j] u*(x_i,x_j)` as H-matrix
-3. Diagonal regularization: `M_ii = -∑_{j≠i} M_ij + ID_i`
-
-Stores `dad.cache.M` (HMatrix) and returns it.
-"""
-function DIBEM_Hmat(
-    dad::BEMdata{<:Laplace};
-    rbf = PHS(),
-    atol = 1e-6,
-    rtol = 1e-6,
-    nmax = 32,
-    eta = 3.0,
-    threads = true,
-    gmres_itmax = 0,
-)
-    nt = dad.nt
-    props = dad.properties
-    IF, ID, pts = _dibem_IF_ID(dad, rbf)
-    n_dummy = pts[1] isa SVector{2} ? SVector(0.0, 1.0) : SVector(0.0, 0.0, 1.0)
-
-    splitter = PrincipalComponentSplitter(; nmax=nmax)
-    Xclt = ClusterTree(pts, splitter)
-    Yclt = ClusterTree(copy(pts), splitter)
-    adm = StrongAdmissibilityStd(; eta=eta)
-    comp = PartialACA(; atol=atol)
-
-    # --- F (RBF) ---
-    KF = DibemFKernel(rbf, pts)
-    @info "DIBEM_Hmat: assembling F (RBF)" nt
-    Fh = assemble_hmatrix(KF, Xclt, Yclt; adm=adm, comp=comp, threads=threads)
-
-    # ridge on dense diagonal blocks for stability
-    _hmat_add_diag_ridge!(Fh, 1e-12)
-
-    itmax = gmres_itmax > 0 ? gmres_itmax : max(4 * nt, 200)
-    c, stats = Krylov.gmres(Fh, IF; atol=rtol, rtol=rtol, itmax=itmax)
-    if !stats.solved
-        @warn "DIBEM_Hmat: GMRES on F did not fully converge" stats.niter stats.status
-    end
-
-    # --- M off-diagonal as H-matrix ---
-    KM = DibemMKernel(pts, c, props, n_dummy)
-    @info "DIBEM_Hmat: assembling M" nt
-    # fresh trees (same geometry)
-    Xclt2 = ClusterTree(pts, splitter)
-    Yclt2 = ClusterTree(copy(pts), splitter)
-    Mh = assemble_hmatrix(KM, Xclt2, Yclt2; adm=adm, comp=comp, threads=threads)
-
-    # Diagonal: M_ii = -∑_j M_ij + ID_i  (row sum of current M has M_ii=0)
-    rowsum = Mh * ones(nt)
-    _set_diagonal!(Mh) do i
-        -rowsum[i] + ID[i]
-    end
-
-    set_cache!(dad; M=Mh, dibem_c=c, dibem_ID=ID, dibem_rbf=rbf, dibem_method=:hmatrix)
-    return Mh
-end
-
-function _hmat_add_diag_ridge!(Hmat::HMatrices.HMatrix, ε::Float64)
-    piv = HMatrices.pivot(Hmat)
-    n = size(Hmat, 1)
-    # accumulate current diag via matvec is hard; add ε on dense diagonal blocks only
-    for block in HMatrices.nodes(Hmat)
-        HMatrices.hasdata(block) || continue
-        HMatrices.isadmissible(block) && continue
-        data = HMatrices.data(block)
-        data isa Matrix || continue
-        irange = HMatrices.rowrange(block) .- piv[1] .+ 1
-        jrange = HMatrices.colrange(block) .- piv[2] .+ 1
-        irangeg = HMatrices.rowperm(Hmat)[irange]
-        jrangeg = HMatrices.colperm(Hmat)[jrange]
-        for (iloc, ig) in enumerate(irangeg)
-            for (jloc, jg) in enumerate(jrangeg)
-                if ig == jg && iloc <= size(data, 1) && jloc <= size(data, 2)
-                    data[iloc, jloc] += ε * (tr(data) / max(size(data, 1), 1) + 1)
-                end
-            end
-        end
-    end
-    return nothing
-end
-
-# ---------------------------------------------------------------------------
-# FMM-backed matrix-free M
-# ---------------------------------------------------------------------------
-
-"""
-    DibemFMMOperator
-
-Matrix-free DIBEM `M` with FMM Laplace matvec:
+Unified matrix-free DIBEM `M` for **every** compressed backend:
 
 ```
-(M x)_i = [D (c ∘ x)]_i + diag_i x_i
+M x = D (c ∘ x) + diag ∘ x ,    diag = ID − D c
 ```
 
-where `D` is the fundamental-solution matrix (FMM), `c = F \\ IF`,
-and `diag` enforces the Galerkin/regularization diagonal.
+`D` is any matvec-capable compression of plain `u*` (H, HODLR, HSS, H², FMM).
+`c` is the only DIBEM-specific vector (`F c = IF`).
+
+Alias: [`DibemFMMOperator`](@ref) (historical name).
 """
-struct DibemFMMOperator{TD} <: AbstractMatrix{Float64}
+struct DibemFactoredOperator{TD} <: AbstractMatrix{Float64}
     n::Int
     c::Vector{Float64}
     diag::Vector{Float64}
-    D::TD                 # FMMKernelMatrix or similar with mul!
+    D::TD
+    method::Symbol
 end
 
-Base.size(A::DibemFMMOperator) = (A.n, A.n)
-Base.IndexStyle(::Type{<:DibemFMMOperator}) = IndexCartesian()
+const DibemFMMOperator = DibemFactoredOperator  # backward compatible
 
-function Base.getindex(A::DibemFMMOperator, i::Int, j::Int)
+Base.size(A::DibemFactoredOperator) = (A.n, A.n)
+Base.IndexStyle(::Type{<:DibemFactoredOperator}) = IndexCartesian()
+
+function Base.getindex(A::DibemFactoredOperator, i::Int, j::Int)
     i == j && return A.diag[i]
-    # entry of D scaled by c[j]
     return A.c[j] * A.D[i, j]
 end
 
-function LinearAlgebra.mul!(y::AbstractVector, A::DibemFMMOperator, x::AbstractVector)
+function LinearAlgebra.mul!(y::AbstractVector, A::DibemFactoredOperator, x::AbstractVector)
     length(x) == A.n && length(y) == A.n || throw(DimensionMismatch())
-    # y = D * (c .* x)
-    tmp = A.c .* x
-    mul!(y, A.D, tmp)
+    mul!(y, A.D, A.c .* x)
     @inbounds for i in 1:A.n
         y[i] += A.diag[i] * x[i]
     end
     return y
 end
 
-LinearAlgebra.mul!(y::AbstractVector, A::DibemFMMOperator, x::AbstractVector,
-    α::Number, β::Number) = begin
-    if iszero(β)
-        mul!(y, A, x)
-        α != 1 && rmul!(y, α)
-    else
-        t = similar(y)
-        mul!(t, A, x)
-        y .= β .* y .+ α .* t
-    end
-    return y
-end
-
-"""
-    DIBEM_FMM(dad; rbf=PHS(), eps=1e-6, nmax=50, f_method=:hmatrix)
-
-Build DIBEM `M` as a **matrix-free** [`DibemFMMOperator`](@ref):
-
-| Factor | Method |
-|--------|--------|
-| `F` (RBF) | H-matrix (`:hmatrix`) or dense (`:dense`) → `c = F \\ IF` |
-| `D` (Laplace FS) | FMM matvec (`FMM.fmm_laplace2d/3d_matrix`) |
-| diagonal | regularization with `ID` |
-
-Stores `dad.cache.M` and returns the operator.
-"""
-function DIBEM_FMM(
-    dad::BEMdata{<:Laplace};
-    rbf = PHS(),
-    eps = 1e-6,
-    rtol = 1e-6,
-    nmax = 50,
-    eta = 3.0,
-    f_method::Symbol = :hmatrix,
-    f_nmax = 32,
-    threads = true,
-)
-    nt = dad.nt
-    props = dad.properties
-    k = float(props.k)
-    dim = dad.dimension
-    IF, ID, pts = _dibem_IF_ID(dad, rbf)
-
-    # --- solve F c = IF ---
-    c = _dibem_solve_Fc!(dad, pts, IF, rbf; f_method=f_method, atol=eps,
-        rtol=rtol, nmax=f_nmax, eta=eta, threads=threads)
-
-    # --- FMM for D ~ fundamental.U (same scale as Fundamental.jl) ---
-    d = length(pts[1])
-    Pmat = Matrix{Float64}(undef, d, nt)
-    @inbounds for j in 1:nt, a in 1:d
-        Pmat[a, j] = pts[j][a]
-    end
-
-    D_fmm = if dim == 2
-        # rfmm2d pot ~ log(R); fundamental.U = -log(R)/(2π k)
-        raw = FMM.fmm_laplace2d_matrix(Pmat; eps=Float64(eps), nmax=nmax)
-        _ScaledFMM(raw, -1 / (2π * k))
-    else
-        # lfmm3d pot ~ 1/(4π R); fundamental.U = 1/(4π k R)
-        raw = FMM.fmm_laplace3d_matrix(Pmat; eps=Float64(eps), nmax=nmax)
-        _ScaledFMM(raw, 1 / k)
-    end
-
-    # off-diagonal row sums: (D c)_i = ∑_j D_ij c_j
-    rowsum_off = D_fmm * c
-    diag = -rowsum_off .+ ID
-
-    Mop = DibemFMMOperator(nt, c, diag, D_fmm)
-    set_cache!(dad; M=Mop, dibem_c=c, dibem_ID=ID, dibem_rbf=rbf, dibem_method=:fmm)
-    return Mop
-end
-
-"""Scale an FMM kernel matrix: `(αA)*x = α (A*x)`."""
-struct _ScaledFMM{TA}
-    A::TA
-    α::Float64
-end
-Base.size(S::_ScaledFMM, d) = size(S.A, d)
-Base.size(S::_ScaledFMM) = size(S.A)
-Base.getindex(S::_ScaledFMM, i::Int, j::Int) = S.α * S.A[i, j]
-function LinearAlgebra.mul!(y::AbstractVector, S::_ScaledFMM, x::AbstractVector)
-    mul!(y, S.A, x)
-    y .*= S.α
-    return y
-end
-Base.:*(S::_ScaledFMM, x::AbstractVector) = mul!(similar(x, Float64), S, x)
-Base.:*(A::DibemFMMOperator, x::AbstractVector) = mul!(similar(x, Float64), A, x)
-
-function _dibem_solve_Fc!(dad, pts, IF, rbf; f_method=:hmatrix, atol=1e-6,
-        rtol=1e-6, nmax=32, eta=3.0, threads=true)
-    nt = length(IF)
-    if f_method === :dense || nt <= 256
-        F = zeros(nt, nt)
-        @inbounds for j in 1:nt, i in 1:nt
-            F[i, j] = rbf(sqeuclidean(pts[i], pts[j]))
-        end
-        ε = 1e-12 * (tr(F) / nt + 1)
-        @inbounds for i in 1:nt
-            F[i, i] += ε
-        end
-        set_cache!(dad; dibem_F=F)
-        return F \ IF
-    elseif f_method === :hmatrix
-        splitter = PrincipalComponentSplitter(; nmax=nmax)
-        Xclt = ClusterTree(pts, splitter)
-        Yclt = ClusterTree(copy(pts), splitter)
-        adm = StrongAdmissibilityStd(; eta=eta)
-        comp = PartialACA(; atol=atol)
-        Fh = assemble_hmatrix(DibemFKernel(rbf, pts), Xclt, Yclt;
-            adm=adm, comp=comp, threads=threads)
-        _hmat_add_diag_ridge!(Fh, 1e-12)
-        c, stats = Krylov.gmres(Fh, IF; atol=rtol, rtol=rtol, itmax=max(4nt, 200))
-        if !stats.solved
-            @warn "DIBEM_FMM: GMRES(F) incomplete" stats.status
-        end
-        set_cache!(dad; dibem_F_h=Fh)
-        return c
-    else
-        throw(ArgumentError("f_method must be :dense or :hmatrix, got $f_method"))
-    end
-end
-
-# ---------------------------------------------------------------------------
-# Structured formats: HODLR / HSS / HBS / H² (+ generic wrapper)
-# ---------------------------------------------------------------------------
-
-"""
-    DibemStructuredOperator
-
-Matrix-free DIBEM `M` wrapping any structured off-diagonal factor `Moff`
-(HODLR / HSS / H² / …) plus an explicit diagonal:
-
-```
-M x = Moff x + diag ∘ x
-```
-
-Used when the format does not support cheap in-place diagonal writes
-(unlike classical H-matrix dense blocks).
-"""
-struct DibemStructuredOperator{TM} <: AbstractMatrix{Float64}
-    n::Int
-    Moff::TM
-    diag::Vector{Float64}
-    format::Symbol
-end
-
-Base.size(A::DibemStructuredOperator) = (A.n, A.n)
-Base.IndexStyle(::Type{<:DibemStructuredOperator}) = IndexCartesian()
-
-function Base.getindex(A::DibemStructuredOperator, i::Int, j::Int)
-    i == j && return A.diag[i]
-    # fallback: one-hot matvec (slow; for debugging only)
-    x = zeros(A.n); x[j] = 1.0
-    y = A.Moff * x
-    return y[i]
-end
-
-function LinearAlgebra.mul!(y::AbstractVector, A::DibemStructuredOperator, x::AbstractVector)
-    length(x) == A.n && length(y) == A.n || throw(DimensionMismatch())
-    mul!(y, A.Moff, x)
-    @inbounds for i in 1:A.n
-        y[i] += A.diag[i] * x[i]
-    end
-    return y
-end
-
-function LinearAlgebra.mul!(y::AbstractVector, A::DibemStructuredOperator, x::AbstractVector,
+function LinearAlgebra.mul!(y::AbstractVector, A::DibemFactoredOperator, x::AbstractVector,
         α::Number, β::Number)
     if iszero(β)
         mul!(y, A, x)
@@ -397,9 +158,87 @@ function LinearAlgebra.mul!(y::AbstractVector, A::DibemStructuredOperator, x::Ab
     return y
 end
 
-Base.:*(A::DibemStructuredOperator, x::AbstractVector) = mul!(similar(x, Float64), A, x)
+Base.:*(A::DibemFactoredOperator, x::AbstractVector) = mul!(similar(x, Float64), A, x)
 
-"""Map DIBEM method symbol → assemble_structured format."""
+"""Build factored M from compressed D, weights c, Galerkin ID."""
+function _dibem_factored_M(D, c::Vector{Float64}, ID::Vector{Float64}, method::Symbol)
+    n = length(c)
+    rowsum_off = D * c                    # (D c)_i = ∑_j D_ij c_j
+    diagv = .-rowsum_off .+ ID
+    return DibemFactoredOperator(n, c, diagv, D, method)
+end
+
+# ---------------------------------------------------------------------------
+# F solve: F c = IF
+# ---------------------------------------------------------------------------
+
+function _dibem_solve_Fc!(dad, pts, IF, rbf; f_method=:dense, atol=1e-6,
+        rtol=1e-6, nmax=32, eta=3.0, threads=true, rank=typemax(Int),
+        hss_method=:dense, alpha=1.0)
+    nt = length(IF)
+    if f_method === :dense || (f_method === :auto && nt <= 256)
+        F = zeros(nt, nt)
+        @inbounds for j in 1:nt, i in 1:nt
+            F[i, j] = rbf(sqeuclidean(pts[i], pts[j]))
+        end
+        ε = 1e-12 * (tr(F) / nt + 1)
+        @inbounds for i in 1:nt
+            F[i, i] += ε
+        end
+        set_cache!(dad; dibem_F=F)
+        return F \ IF
+    end
+
+    # structured F
+    splitter = PrincipalComponentSplitter(; nmax=nmax)
+    tree = ClusterTree(pts, splitter)
+    KF = DibemFKernel(rbf, pts)
+    fmt = _dibem_struct_format(f_method)
+    fmt === nothing && (fmt = :H)
+    if fmt === :H2
+        # RBF Gram + H² proxies is unreliable → dense
+        return _dibem_solve_Fc!(dad, pts, IF, rbf; f_method=:dense, atol=atol, rtol=rtol)
+    end
+    comp = PartialACA(; atol=atol, rtol=rtol, rank=rank)
+    adm = StrongAdmissibilityStd(; eta=eta)
+    Fst = assemble_structured(KF, tree; format=fmt, adm=adm, comp=comp,
+        threads=threads, rtol=rtol, rank=rank, alpha=alpha,
+        method=hss_method, global_index=true)
+    if fmt === :H && Fst isa HMatrices.HMatrix
+        _hmat_add_diag_ridge!(Fst, 1e-12)
+    end
+    c, stats = Krylov.gmres(Fst, IF; atol=rtol, rtol=rtol, itmax=max(4nt, 200))
+    if !stats.solved
+        @warn "DIBEM: GMRES(F) incomplete" f_method stats.status
+    end
+    set_cache!(dad; dibem_F_h=Fst)
+    return c
+end
+
+function _hmat_add_diag_ridge!(Hmat::HMatrices.HMatrix, ε::Float64)
+    piv = HMatrices.pivot(Hmat)
+    for block in HMatrices.nodes(Hmat)
+        HMatrices.hasdata(block) || continue
+        HMatrices.isadmissible(block) && continue
+        data = HMatrices.data(block)
+        data isa Matrix || continue
+        irange = HMatrices.rowrange(block) .- piv[1] .+ 1
+        jrange = HMatrices.colrange(block) .- piv[2] .+ 1
+        irangeg = HMatrices.rowperm(Hmat)[irange]
+        jrangeg = HMatrices.colperm(Hmat)[jrange]
+        for (iloc, ig) in enumerate(irangeg), (jloc, jg) in enumerate(jrangeg)
+            if ig == jg && iloc <= size(data, 1) && jloc <= size(data, 2)
+                data[iloc, jloc] += ε * (tr(data) / max(size(data, 1), 1) + 1)
+            end
+        end
+    end
+    return nothing
+end
+
+# ---------------------------------------------------------------------------
+# Compress plain D = u*
+# ---------------------------------------------------------------------------
+
 function _dibem_struct_format(method::Symbol)
     m = method
     m in (:hmatrix, :Hmat, :hmat, :H, :HMatrix) && return :H
@@ -408,188 +247,171 @@ function _dibem_struct_format(method::Symbol)
     m in (:hbs, :HBS, :HBSMatrix) && return :HBS
     m in (:h2, :H2, :H2Matrix) && return :H2
     m in (:blr, :BLR) && return :BLR
+    m in (:dense,) && return :dense
+    m in (:fmm, :FMM) && return :fmm
     return nothing
 end
 
 """
-    DIBEM_structured(dad; format=:HODLR, rbf=PHS(), kwargs...)
-
-Build DIBEM `M` with a rank-structured factor for both `F` and off-diagonal `M`:
-
-1. `F = assemble_structured(RBF; format)` then GMRES for `c` in `F*c = IF`
-2. `Moff = assemble_structured` of kernel `c_j * u*(x_i,x_j)` (zero diagonal)
-3. `diag = ID - Moff*1` → [`DibemStructuredOperator`](@ref)  (or in-place diag for `:H`)
-
-`format` is any of `:H`, `:HODLR`, `:HSS`, `:HBS`, `:H2`, `:BLR`
-(see [`assemble_structured`](@ref)).
+Assemble compressed single-layer `D` on all collocation points (same `u*` as G).
 """
-function DIBEM_structured(
+function _dibem_compress_D(dad, pts, method::Symbol; atol=1e-6, rtol=1e-6,
+        nmax=32, eta=3.0, threads=true, rank=typemax(Int), alpha=1.0,
+        hss_method=:dense, eps=1e-6)
+    props = dad.properties
+    k = float(props.k)
+    dim = dad.dimension
+    n_dummy = pts[1] isa SVector{2} ? SVector(0.0, 1.0) : SVector(0.0, 0.0, 1.0)
+    nt = length(pts)
+    fmt = _dibem_struct_format(method)
+
+    if fmt === :fmm
+        d = length(pts[1])
+        Pmat = Matrix{Float64}(undef, d, nt)
+        @inbounds for j in 1:nt, a in 1:d
+            Pmat[a, j] = pts[j][a]
+        end
+        if dim == 2
+            raw = FMM.fmm_laplace2d_matrix(Pmat; eps=Float64(eps), nmax=nmax)
+            return _ScaledFMM(raw, -1 / (2π * k))
+        else
+            raw = FMM.fmm_laplace3d_matrix(Pmat; eps=Float64(eps), nmax=nmax)
+            return _ScaledFMM(raw, 1 / k)
+        end
+    end
+
+    if fmt === :dense || fmt === nothing
+        D = zeros(nt, nt)
+        KD = DibemUStarKernel(pts, props, n_dummy)
+        @inbounds for j in 1:nt, i in 1:nt
+            D[i, j] = KD[i, j]
+        end
+        return D
+    end
+
+    splitter = PrincipalComponentSplitter(; nmax=nmax)
+    tree = ClusterTree(pts, splitter)
+    comp = PartialACA(; atol=atol, rtol=rtol, rank=rank)
+    adm = StrongAdmissibilityStd(; eta=eta)
+
+    if fmt === :H2
+        KD = _dibem_ustar_kernelmatrix(pts, props, n_dummy)
+        return assemble_h2(Float64, KD, tree; rtol=rtol, rank=rank, alpha=alpha,
+            global_index=true, symmetric=true)
+    end
+
+    KD = DibemUStarKernel(pts, props, n_dummy)
+    return assemble_structured(KD, tree; format=fmt, adm=adm, comp=comp,
+        threads=threads, rtol=rtol, rank=rank, alpha=alpha,
+        method=hss_method, global_index=true)
+end
+
+"""Scale FMM kernel: `(αA)x = α(Ax)`."""
+struct _ScaledFMM{TA}
+    A::TA
+    α::Float64
+end
+Base.size(S::_ScaledFMM) = size(S.A)
+Base.size(S::_ScaledFMM, d) = size(S.A, d)
+Base.getindex(S::_ScaledFMM, i::Int, j::Int) = S.α * S.A[i, j]
+function LinearAlgebra.mul!(y::AbstractVector, S::_ScaledFMM, x::AbstractVector)
+    mul!(y, S.A, x)
+    y .*= S.α
+    return y
+end
+Base.:*(S::_ScaledFMM, x::AbstractVector) = mul!(similar(x, Float64), S, x)
+
+# ---------------------------------------------------------------------------
+# Unified compressed DIBEM
+# ---------------------------------------------------------------------------
+
+"""
+    DIBEM_compressed(dad; method=:hmatrix, rbf=PHS(), f_method=:auto, kwargs...)
+
+Factored DIBEM for any compression of `D = u*`:
+
+1. `c` from `F c = IF` (`f_method` = `:dense` / `:hmatrix` / `:hodlr` / …)
+2. `D` = compressed single-layer on all poles (`method`)
+3. `M = DibemFactoredOperator(D, c, ID)`
+"""
+function DIBEM_compressed(
     dad::BEMdata{<:Laplace};
-    format::Symbol = :HODLR,
+    method::Symbol = :hmatrix,
     rbf = PHS(),
+    f_method::Symbol = :auto,
     atol = 1e-6,
     rtol = 1e-6,
     nmax = 32,
     eta = 3.0,
     threads = true,
     rank = typemax(Int),
-    alpha = 1.0,          # H² box admissibility
-    hss_method = :dense,  # :dense | :randomized for HSS/HBS
-    gmres_itmax = 0,
+    alpha = 1.0,
+    hss_method = :dense,
+    eps = 1e-6,
+    f_nmax = nothing,
 )
-    fmt = something(_dibem_struct_format(format), format)
-    nt = dad.nt
-    props = dad.properties
     IF, ID, pts = _dibem_IF_ID(dad, rbf)
-    n_dummy = pts[1] isa SVector{2} ? SVector(0.0, 1.0) : SVector(0.0, 0.0, 1.0)
+    nt = dad.nt
 
-    splitter = PrincipalComponentSplitter(; nmax=nmax)
-    tree = ClusterTree(pts, splitter)
-    comp = PartialACA(; atol=atol, rtol=rtol, rank=rank)
-    adm = StrongAdmissibilityStd(; eta=eta)
-    itmax = gmres_itmax > 0 ? gmres_itmax : max(4 * nt, 200)
-
-    @info "DIBEM_structured: F" format=fmt nt
-    treeM = ClusterTree(pts, splitter)
-
-    # --- solve F c = IF ---
-    # H² on the RBF Gram is unreliable → dense F for :H2; structured F otherwise.
-    if fmt === :H2
-        c = _dibem_solve_Fc!(dad, pts, IF, rbf; f_method=:dense, atol=atol, rtol=rtol)
-    else
-        KF = DibemFKernel(rbf, pts)
-        Fst = assemble_structured(KF, tree; format=fmt, adm=adm, comp=comp,
-            threads=threads, rtol=rtol, rank=rank, alpha=alpha,
-            method=hss_method, global_index=true)
-        if fmt === :H && Fst isa HMatrices.HMatrix
-            _hmat_add_diag_ridge!(Fst, 1e-12)
-        end
-        c, stats = Krylov.gmres(Fst, IF; atol=rtol, rtol=rtol, itmax=itmax)
-        if !stats.solved
-            @warn "DIBEM_structured: GMRES(F) incomplete" format=fmt stats.status
-        end
+    # default F backend: dense if small, else same structured family as D (not FMM/H2)
+    fm = f_method
+    if fm === :auto
+        fm = nt <= 256 ? :dense :
+             method in (:fmm, :FMM, :h2, :H2) ? :hmatrix : method
     end
 
-    @info "DIBEM_structured: M" format=fmt nt
+    @info "DIBEM_compressed" method f_method=fm nt
+    c = _dibem_solve_Fc!(dad, pts, IF, rbf; f_method=fm, atol=atol, rtol=rtol,
+        nmax = something(f_nmax, nmax), eta=eta, threads=threads, rank=rank,
+        hss_method=hss_method, alpha=alpha)
 
-    # --- off-diagonal / full M ---
-    #
-    # H²: proxies see geometry only. Writing K=c(y)u* as one kernel fails H²
-    # low-rank (product kernel). But c_j = c(y_j) still holds, so use the
-    # factorization identical to FMM:
-    #   (M x)_i = [D (c ∘ x)]_i + diag_i x_i
-    # with D ≈ u* compressed as H² (true Newtonian kernel).
-    if fmt === :H2
-        KD = _dibem_ustar_kernelmatrix(pts, props, n_dummy)
-        D_h2 = assemble_h2(Float64, KD, treeM; rtol=rtol, rank=rank, alpha=alpha,
-            global_index=true, symmetric=true)
-        rowsum_off = D_h2 * c
-        diagv = .-rowsum_off .+ ID
-        @assert all(isfinite, c) && all(isfinite, diagv)
-        Mop = DibemFMMOperator(nt, c, diagv, D_h2)
-        set_cache!(dad; M=Mop, dibem_c=c, dibem_ID=ID, dibem_rbf=rbf,
-            dibem_method=:h2, dibem_D=D_h2)
-        return Mop
-    end
+    D = _dibem_compress_D(dad, pts, method; atol=atol, rtol=rtol, nmax=nmax,
+        eta=eta, threads=threads, rank=rank, alpha=alpha, hss_method=hss_method,
+        eps=eps)
 
-    KM = DibemMKernel(pts, c, props, n_dummy)
-    Moff = assemble_structured(KM, treeM; format=fmt, adm=adm, comp=comp,
-        threads=threads, rtol=rtol, rank=rank, alpha=alpha,
-        method=hss_method, global_index=true)
-
-    rowsum = Moff * ones(nt)
-    diagv = -rowsum .+ ID
-
-    if fmt === :H && Moff isa HMatrices.HMatrix
-        _set_diagonal!(Moff) do i
-            diagv[i]
-        end
-        set_cache!(dad; M=Moff, dibem_c=c, dibem_ID=ID, dibem_rbf=rbf,
-            dibem_method=fmt)
-        return Moff
-    end
-
-    Mop = DibemStructuredOperator(nt, Moff, diagv, fmt)
-    set_cache!(dad; M=Mop, dibem_c=c, dibem_ID=ID, dibem_rbf=rbf,
-        dibem_method=fmt, dibem_Moff=Moff)
-    return Mop
+    M = _dibem_factored_M(D, c, ID, method)
+    set_cache!(dad; M=M, dibem_c=c, dibem_ID=ID, dibem_D=D, dibem_rbf=rbf,
+        dibem_method=method)
+    return M
 end
 
-DIBEM_HODLR(dad; kwargs...) = DIBEM_structured(dad; format=:HODLR, kwargs...)
-DIBEM_HSS(dad; kwargs...)   = DIBEM_structured(dad; format=:HSS, kwargs...)
-DIBEM_HBS(dad; kwargs...)   = DIBEM_structured(dad; format=:HBS, kwargs...)
-DIBEM_H2(dad; kwargs...)    = DIBEM_structured(dad; format=:H2, kwargs...)
-
-"""
-RBF interpolant of nodal weights `c` with `c_j = c(y_j)`.
-
-Useful if a format needs `c(y)` off-mesh (e.g. product-kernel experiments).
-H² DIBEM uses the **factored** form instead: `M x = D(c ∘ x)` with H² on plain `u*`.
-"""
-function _dibem_c_field(rbf, pts, c::AbstractVector)
-    n = length(pts)
-    length(c) == n || throw(DimensionMismatch("c vs points"))
-    F = zeros(n, n)
-    @inbounds for j in 1:n, i in 1:n
-        F[i, j] = rbf(sqeuclidean(pts[i], pts[j]))
-    end
-    ε = 1e-12 * (tr(F) / n + 1)
-    @inbounds for i in 1:n
-        F[i, i] += ε
-    end
-    α = F \ collect(Float64, c)
-    return function cfield(y)
-        s = 0.0
-        @inbounds for k in 1:n
-            s += α[k] * rbf(sqeuclidean(y, pts[k]))
-        end
-        return s
-    end
-end
-
-"""Plain `u*` as [`KernelMatrix`](@ref) via [`fundamental`](@ref) (for H² on `D`)."""
-function _dibem_ustar_kernelmatrix(pts, props, n_dummy)
-    function ustar(x, y)::Float64
-        r = y - x
-        R = norm(r)
-        R < 1e-15 && return 0.0
-        return float(fundamental(props, r, n_dummy).U)
-    end
-    return KernelMatrix{typeof(ustar), typeof(pts), typeof(pts), Float64}(ustar, pts, pts)
-end
-
-# Keep DIBEM_Hmat as the dedicated H path (two trees, same as before)
-# but also allow method=:H via structured.
+# Named entry points (all factored)
+DIBEM_Hmat(dad; kwargs...)  = DIBEM_compressed(dad; method=:hmatrix, kwargs...)
+DIBEM_HODLR(dad; kwargs...) = DIBEM_compressed(dad; method=:hodlr, kwargs...)
+DIBEM_HSS(dad; kwargs...)   = DIBEM_compressed(dad; method=:hss, kwargs...)
+DIBEM_HBS(dad; kwargs...)   = DIBEM_compressed(dad; method=:hbs, kwargs...)
+DIBEM_H2(dad; kwargs...)    = DIBEM_compressed(dad; method=:h2, f_method=:dense, kwargs...)
+DIBEM_FMM(dad; kwargs...)   = DIBEM_compressed(dad; method=:fmm, kwargs...)
 
 # ---------------------------------------------------------------------------
-# Unified entry
+# Unified DIBEM entry
 # ---------------------------------------------------------------------------
 
 """
     DIBEM(dad; method=:dense, rbf=PHS(), kwargs...)
 
-| `method` | Backend |
-|----------|---------|
-| `:dense` | [`DIBEM_dense`](@ref) |
-| `:hmatrix` / `:H` | [`DIBEM_Hmat`](@ref) |
-| `:hodlr` / `:HODLR` | [`DIBEM_HODLR`](@ref) |
-| `:hss` / `:HSS` | [`DIBEM_HSS`](@ref) |
-| `:hbs` / `:HBS` | [`DIBEM_HBS`](@ref) (alias of HSS) |
-| `:h2` / `:H2` | [`DIBEM_H2`](@ref) |
-| `:fmm` / `:FMM` | [`DIBEM_FMM`](@ref) |
+| `method` | `D = u*` compression | `M` type |
+|----------|----------------------|----------|
+| `:dense` | dense | dense `Matrix` (`Domain.jl`) |
+| `:hmatrix` | H-matrix | [`DibemFactoredOperator`](@ref) |
+| `:hodlr` | HODLR | factored |
+| `:hss` / `:hbs` | HSS | factored |
+| `:h2` | H² | factored |
+| `:fmm` | FMM | factored |
+
+All compressed methods share
+
+```
+M x = D (c ∘ x) + (ID − D c) ∘ x
+```
+
+with the same `D ∼ u*` kernel family as the BEM `G` matrix (square poles, no `w_j`).
 """
 function DIBEM(dad::BEMdata{<:Laplace}; method::Symbol=:dense, rbf=PHS(), kwargs...)
     if method === :dense
         return DIBEM_dense(dad; rbf=rbf)
-    elseif method in (:hmatrix, :Hmat, :hmat)
-        return DIBEM_Hmat(dad; rbf=rbf, kwargs...)
-    elseif method in (:fmm, :FMM)
-        return DIBEM_FMM(dad; rbf=rbf, kwargs...)
-    elseif _dibem_struct_format(method) !== nothing
-        fmt = _dibem_struct_format(method)
-        # classical H still prefers DIBEM_Hmat (row/col trees + diag write)
-        fmt === :H && return DIBEM_Hmat(dad; rbf=rbf, kwargs...)
-        return DIBEM_structured(dad; format=fmt, rbf=rbf, kwargs...)
+    elseif _dibem_struct_format(method) !== nothing || method in (:fmm, :FMM)
+        return DIBEM_compressed(dad; method=method, rbf=rbf, kwargs...)
     else
         throw(ArgumentError(
             "DIBEM method must be :dense, :hmatrix, :hodlr, :hss, :hbs, :h2, or :fmm; got $method"))
