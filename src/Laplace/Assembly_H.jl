@@ -281,7 +281,7 @@ function correct_nearfield!(
             for k in 1:nn
                 j = elem.index[k]
                 j > n && continue
-                # Pointwise far kernel×w (0 on diagonal — bare K has K_ii=0).
+                # Pointwise far kernel×w (bare K has K_ii=0).
                 # Do not index H.K/G.K (HMatrix disables getindex).
                 hp = 0.0
                 gp = 0.0
@@ -292,9 +292,17 @@ function correct_nearfield!(
                     hp = Tker * H.w[j]
                     gp = U * G.w[j]
                 end
-                # Full element integral (Dumont/sinh). On a *straight* self-element
-                # h_self≈0; on curved geometry h_self can be nonzero. Free term
-                # c is NOT in Dumont — it is added on H.d via free_term().
+                # Full element integral (Dumont/sinh).
+                # H diagonal: integral part → H.d (curved self ≠ 0); free term
+                # added later as H.d[i] += free_term(dad,i). G has no free term.
+                if i == j
+                    H.d[i] += hv[k]           # double-layer self integral
+                    dg = gv[k] - gp           # single-layer self → G.corr
+                    if abs(dg) > 0
+                        push!(Ig, i); push!(Jg, j); push!(Vg, dg)
+                    end
+                    continue
+                end
                 dh = hv[k] - hp
                 dg = gv[k] - gp
                 if abs(dh) > 0
@@ -375,15 +383,16 @@ function corrige_diagonais!(dad::BEMdata{<:Laplace}, H::ColWeightedOp, G::ColWei
     nt = dad.nt
     k = float(dad.properties.k)
 
-    # --- H diagonal (free term) ---
+    # --- H diagonal: integral part (may already sit in H.d from near-field) + free term ---
     if free_term === :explicit
-        # discontinuous collocation: c = 1/2 (boundary), c = 1 (domain)
+        # H.d[i] += -c  with c=1/2 (boundary) or 1 (domain)
         @inbounds for i in 1:nt
-            H.d[i] = BEM.free_term(dad, i)
+            H.d[i] += BEM.free_term(dad, i)
         end
     elseif free_term === :rowsum
+        # classical: wipe diagonal then enforce H*1 = 0
         fill!(H.d, 0.0)
-        hsum = H * ones(nt)   # off-diagonal + corr only
+        hsum = H * ones(nt)
         @inbounds for i in 1:nt
             H.d[i] = -hsum[i]
         end
@@ -417,7 +426,7 @@ function corrige_diagonais!(dad::BEMdata{<:Laplace}, Hmat::HMatrix, Gmat::HMatri
 
     if free_term === :explicit
         _set_diagonal!(Hmat) do i
-            BEM.free_term(dad, i)
+            BEM.free_term(dad, i)   # bare HMatrix: free term only on diagonal
         end
     elseif free_term === :rowsum
         # zero diagonal then row-sum (legacy H-matrix path)
