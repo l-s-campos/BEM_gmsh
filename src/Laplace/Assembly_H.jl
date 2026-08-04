@@ -232,11 +232,16 @@ min_k ‖x_source − x_node_k‖ < factor · Length(e)
 ΔG_ij = g_j^∫ − u*_j w_j
 ```
 
-where `(h^∫, g^∫) =` [`integrate_element`](@ref) and the second terms are the
-pointwise collocation contributions already in `H.K`/`G.K`×`w`.
-Diagonal free-term is applied afterwards by [`corrige_diagonais!`](@ref).
+where `(h^∫, g^∫) =` [`integrate_element`](@ref) (Dumont when singular).
 
-Pass `nearfield=false` to [`H_G_Hmat`](@ref) to skip (diagonal-only).
+- **G**: use integrated values for near/self columns (including ``G_ii`` from
+  the singular single-layer integral — there is no free term in G).
+- **H**: use integrated double-layer values (self-element is 0 only if the
+  element is straight; curved → nonzero). The jump/free term
+  c = 1/2 or 1 is **not** inside Dumont; it is added on the diagonal by
+  [`corrige_diagonais!`](@ref) / [`free_term`](@ref) as H_ii = -c.
+
+Pass `nearfield=false` to [`H_G_Hmat`](@ref) to skip.
 """
 function correct_nearfield!(
     dad::BEMdata{<:Laplace},
@@ -276,18 +281,20 @@ function correct_nearfield!(
             for k in 1:nn
                 j = elem.index[k]
                 j > n && continue
-                # pointwise collocation (same as far-field compressed kernel×w)
-                # — do not index H.K/G.K (HMatrix disables getindex)
-                # Free term (½ / 1) is applied on the diagonal separately — do not
-                # put singular self-contribution into corr (avoids double-counting).
-                if i == j
-                    continue
+                # Pointwise far kernel×w (0 on diagonal — bare K has K_ii=0).
+                # Do not index H.K/G.K (HMatrix disables getindex).
+                hp = 0.0
+                gp = 0.0
+                if i != j
+                    r_node = dad.Nodes[j] - pf
+                    n_node = dad.Normal[j]
+                    U, Tker = fundamental(dad, r_node, n_node)
+                    hp = Tker * H.w[j]
+                    gp = U * G.w[j]
                 end
-                r_node = dad.Nodes[j] - pf
-                n_node = dad.Normal[j]
-                U, Tker = fundamental(dad, r_node, n_node)
-                hp = Tker * H.w[j]
-                gp = U * G.w[j]
+                # Full element integral (Dumont/sinh). On a *straight* self-element
+                # h_self≈0; on curved geometry h_self can be nonzero. Free term
+                # c is NOT in Dumont — it is added on H.d via free_term().
                 dh = hv[k] - hp
                 dg = gv[k] - gp
                 if abs(dh) > 0
