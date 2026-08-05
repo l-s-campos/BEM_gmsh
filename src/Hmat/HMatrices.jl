@@ -11,7 +11,7 @@ end
 
 using StaticArrays
 using LinearAlgebra
-using Statistics: median, mean
+using Statistics
 using Printf
 using Distributed
 using Base.Threads
@@ -87,6 +87,9 @@ include("anchornet.jl")
 include("structured.jl")
 include("dhmatrix.jl")
 include("multiplication.jl")
+include("hlru.jl")
+include("hara.jl")
+include("h2_basis.jl")
 include("triangular.jl")
 include("lu.jl")
 include("cholesky.jl")
@@ -134,6 +137,16 @@ export ClusterTree,
     assemble_hss,
     assemble_hbs,
     assemble_h2,
+    h2_proxy_entry,
+    h2_proxy_block,
+    h2_orthog!,
+    h2_compress!,
+    hlru!,
+    hadd!,
+    AbstractMatvecSampler,
+    FunctionSampler,
+    KernelMatvecSampler,
+    hara,
     assemble_structured,
     anchor_net,
     anchor_net_sample,

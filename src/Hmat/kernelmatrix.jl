@@ -39,6 +39,39 @@ end
 Base.size(K::KernelMatrix) = length(K.X), length(K.Y)
 Base.getindex(K::KernelMatrix, i::Int, j::Int) = K.f(K.X[i], K.Y[j])
 
+function LinearAlgebra.mul!(Y::AbstractMatrix, K::KernelMatrix, X::AbstractMatrix)
+    m, n = size(K)
+    size(X, 1) == n || throw(DimensionMismatch())
+    size(Y, 1) == m || throw(DimensionMismatch())
+    fill!(Y, zero(eltype(Y)))
+    @inbounds for j in 1:n
+        for i in 1:m
+            kij = K[i, j]
+            @simd for p in 1:size(X, 2)
+                Y[i, p] += kij * X[j, p]
+            end
+        end
+    end
+    return Y
+end
+
+function LinearAlgebra.mul!(Y::AbstractMatrix, Kt::Adjoint{<:Any, <:KernelMatrix}, X::AbstractMatrix)
+    K = parent(Kt)
+    m, n = size(K)  # K is m×n, K' is n×m
+    size(X, 1) == m || throw(DimensionMismatch())
+    size(Y, 1) == n || throw(DimensionMismatch())
+    fill!(Y, zero(eltype(Y)))
+    @inbounds for j in 1:n
+        for i in 1:m
+            kji = K[i, j]  # (K')[j,i] = K[i,j]
+            @simd for p in 1:size(X, 2)
+                Y[j, p] += kji * X[i, p]
+            end
+        end
+    end
+    return Y
+end
+
 rowelements(K::KernelMatrix) = K.X
 colelements(K::KernelMatrix) = K.Y
 kernel(K::KernelMatrix) = K.f
