@@ -55,15 +55,29 @@ x, stats = gmres_h(H, b; Pl=F, rtol=1e-8)
 
 ## HARA (sampler build)
 
-Build a classic `HMatrix` from **matvecs only** (black-box operator):
+Build hierarchical matrices from **matvecs only** (black-box operator):
 
 ```julia
 S = KernelMatvecSampler(K)
+
+# classic H (blockwise low-rank leaves)
 Hh = hara(S, tree, tree; rtol=1e-3, batch=8)
+
+# nested H² (no proxies / no kernel entries)
+H2h = hara_h2(S, tree; rtol=1e-4, nsample=64, alpha=0.5)
+# or: hara(S, tree; format=:H2, rtol=1e-4)
 
 # product C ≈ A*B from hierarchical applies only (no dense A*B)
 Hc = hara_product(A, B, tree, tree; rtol=1e-3, batch=8)
+# nested H² of a product sampler:
+H2c = hara_h2(FunctionSampler((Y,X)->mul!(Y,A,B*X), n; f_adj! = ...), tree)
 ```
+
+| API | Output | Needs |
+|-----|--------|--------|
+| `hara(S, rowtree, coltree)` | `HMatrix` | matvecs |
+| `hara_h2(S, tree)` | `H2Matrix` | matvecs |
+| `assemble_h2(K, tree)` | `H2Matrix` | entries / proxies |
 
 Demos: `scripts/hara_product_demo.jl`, `scripts/hmat_gmres_precond_demo.jl`.
 
