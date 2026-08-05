@@ -42,6 +42,9 @@ mutable struct H2Node{R, T}
     F::Union{Nothing, Matrix{T}}
     sons::Matrix{H2Node{R, T}}
     pack::Any                 # H2Pack{R,T} (set after construct)
+    """If true, `S` is a full-block operator on `rowrange×colrange` (e.g. after rkupdate).
+    If false, `S` is a nested/skeleton coupling used with `pack.U` bases."""
+    s_full::Bool
 end
 
 """
@@ -129,16 +132,16 @@ end
 
 function _h2node_dense(ri::Int, ci::Int, F::Matrix{T}, pack::H2Pack{R, T}) where {R, T}
     Z = Matrix{H2Node{R, T}}(undef, 0, 0)
-    return H2Node{R, T}(ri, ci, H2DenseLeaf, nothing, F, Z, pack)
+    return H2Node{R, T}(ri, ci, H2DenseLeaf, nothing, F, Z, pack, false)
 end
 
-function _h2node_uniform(ri::Int, ci::Int, S, pack::H2Pack{R, T}) where {R, T}
+function _h2node_uniform(ri::Int, ci::Int, S, pack::H2Pack{R, T}; s_full::Bool = false) where {R, T}
     Z = Matrix{H2Node{R, T}}(undef, 0, 0)
-    return H2Node{R, T}(ri, ci, H2UniformLeaf, S, nothing, Z, pack)
+    return H2Node{R, T}(ri, ci, H2UniformLeaf, S, nothing, Z, pack, s_full)
 end
 
 function _h2node_split(ri::Int, ci::Int, sons::Matrix{H2Node{R, T}}, pack::H2Pack{R, T}) where {R, T}
-    return H2Node{R, T}(ri, ci, H2Split, nothing, nothing, sons, pack)
+    return H2Node{R, T}(ri, ci, H2Split, nothing, nothing, sons, pack, false)
 end
 
 # ---- repackage ----------------------------------------------------------------
@@ -272,21 +275,31 @@ function _h2_apply_uniform!(
     ) where {T}
     Ir = rowrange(N)
     Jr = colrange(N)
-    Vr = h2_basis_matrix(N.pack, N.row_id)
-    Vc = h2_basis_matrix(N.pack, N.col_id)
-    # handle depth-mismatch couplings stored against full index sets
     S = N.S
     xr = view(x, Jr)
     yr = view(y, Ir)
 
-    if S isa RkMatrix
-        # S = A*B' on skeleton spaces — still multiply as dense small op via Matrix
-        Sm = Matrix(S)
-    else
-        Sm = S
+    # Full-block operator (rkupdate recompression): yI += S * xJ  (no nested V)
+    if N.s_full
+        if S isa RkMatrix
+            mul!(yr, S, xr, true, true)
+        else
+            mul!(yr, S, xr, true, true)
+        end
+        return y
     end
 
-    # Cases from flat H²: same-depth skeletons, or mixed full/skeleton
+    Vr = h2_basis_matrix(N.pack, N.row_id)
+    Vc = h2_basis_matrix(N.pack, N.col_id)
+    # Nested/skeleton coupling (default from flat H²)
+    if S isa RkMatrix && size(S, 1) == size(Vr, 2) && size(S, 2) == size(Vc, 2)
+        tmp = Vc' * xr
+        mid = S * tmp
+        yr .+= Vr * mid
+        return y
+    end
+    Sm = S isa RkMatrix ? Matrix(S) : S
+
     if size(Sm, 1) == size(Vr, 2) && size(Sm, 2) == size(Vc, 2)
         yr .+= Vr * (Sm * (Vc' * xr))
     elseif size(Sm, 1) == size(Vr, 2) && size(Sm, 2) == length(Jr)
@@ -296,7 +309,6 @@ function _h2_apply_uniform!(
     elseif size(Sm, 1) == length(Ir) && size(Sm, 2) == length(Jr)
         yr .+= Sm * xr
     else
-        # last resort: densify via source
         Fd = _h2_extract_dense(N.pack, N.row_id, N.col_id)
         yr .+= Fd * xr
     end
