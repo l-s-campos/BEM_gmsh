@@ -117,16 +117,27 @@ solve_multibody_elasticity_contact!(prob; method=:nts, frame=:local,
 # dad.u_local, dad.traction_local available on each region
 ```
 
-### Multibody elasticity — Contato active-set / SSN
+### Multibody elasticity — Contato active-set / SSN / ALM
 
 Coupled multi-region system in local ``(n,t)`` (`aplica_contato_com_atrito_multicorpos`
-layout). Two inner solvers share the same unknowns
+layout). Inner solvers share the same unknowns
 ``(u_{\mathrm{mix}}, t_n^1,t_t^1,t_n^2,t_t^2)``:
 
-| `solver` | Residual | Notes |
-|----------|----------|-------|
+| `solver` | Method | Notes |
+|----------|--------|-------|
 | `:activeset` (default) | Contato verify → ``A,b`` → ``x=A\\b`` | frozen open/stick/±slip |
-| `:ssn` | Alart–Curnier NCF + traction equilibrium | semi-smooth Newton + line search |
+| `:ssn` | Alart–Curnier NCF + Newton | superlinear; same KKT as ALM |
+| `:alm` | Uzawa augmented Lagrangian | multiplier projection + BIE with fixed ``t`` |
+
+ALM update (open-positive gap ``g_n``, ``λ=-t``):
+
+```math
+λ_n ← Π_{ℝ_+}(λ_n - r_n g_n),\qquad
+λ_t ← Π_{|·|≤μ λ_n}(λ_t - r_t g_t),
+```
+
+then ``t^1=-λ``, ``t^2=-R\\t^1``, and each region solves
+``A x_{\mathrm{mix}} = b + G_c t``.
 
 **Prefer load stepping** for large approach:
 
@@ -136,15 +147,19 @@ solve_contact_friction_stepped!(prob; δ_end=0.035, nsteps=10, tol=1e-8)
 # semi-smooth Newton (Alart–Curnier); rn,rt default ∼ 10E/L
 solve_contact_friction_stepped!(prob; δ_end=0.035, nsteps=10,
                                  solver=:ssn, tol=1e-8)
+# Uzawa ALM (optional under-relaxation / r growth)
+solve_contact_friction_stepped!(prob; δ_end=0.035, nsteps=10,
+                                 solver=:alm, alm_omega=0.7, r_grow=1.2)
 # pair.state: 1=open, ±2=slip, 3=stick; pair.tn, pair.tt from solution
 # history: dad.contact_δ_hist, dad.contact_tn_hist
 
 # single shot (less robust for large δ)
 solve_contact_friction!(prob; δ=0.035)
 solve_contact_friction!(prob; δ=0.035, solver=:ssn)
+solve_contact_friction!(prob; δ=0.035, solver=:alm)
 ```
 
-Compare active-set, SSN, and penalty at the same ``δ_end`` / mesh for traction magnitudes.
+Compare active-set, SSN, ALM, and penalty at the same ``δ_end`` / mesh.
 
 ## Half-space operators with acceleration (`HalfSpaceBEM`)
 

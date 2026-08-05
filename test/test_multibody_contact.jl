@@ -234,6 +234,38 @@ end
     @test tnA / tnS > 0.2 && tnS / tnA > 0.2
 end
 
+@testset "ALM Uzawa vs Contato active-set" begin
+    E, ν = 100.0, 0.3
+    props = Elasticity(E, ν, 1.0; plane_strain=true)
+    gap0 = 0.02
+    δ_end = 0.035
+    kwargs = (W=1.0, H=0.4, gap=gap0, μ=0.25, ndiv_bot=4, ndiv_top=4, ndiv_y=3)
+
+    pA = load_two_blocks_contact(props; kwargs..., nome="mb_as_alm")
+    solve_contact_friction_stepped!(pA; δ_end=δ_end, nsteps=8, tol=1e-6,
+        maxiter=40, npg=8, method=:ntn, solver=:activeset)
+    tnA = mean(abs(cp.tn) for cp in pA.contacts if abs(cp.state) != 1)
+
+    pL = load_two_blocks_contact(props; kwargs..., nome="mb_alm")
+    solve_contact_friction_stepped!(pL; δ_end=δ_end, nsteps=8, tol=1e-6,
+        maxiter=120, npg=8, method=:ntn, solver=:alm, alm_omega=0.5, r_grow=1.0)
+    nL = count(cp -> abs(cp.state) != 1, pL.contacts)
+    @test nL >= 1
+    tnL_list = [cp.tn for cp in pL.contacts if abs(cp.state) != 1]
+    @test all(<(0), tnL_list)
+    tnL = mean(abs.(tnL_list))
+    @test all(isfinite, pL.regions[1].u)
+    @test all(isfinite, pL.regions[2].u)
+    @test tnA > 0 && tnL > 0
+    @test tnA / tnL > 0.2 && tnL / tnA > 0.2
+
+    # unit: ALM projection open / stick
+    λn, λt, reg = BEM._alm_project_multipliers(0.1, 0.0, 0.0, 0.0, 0.3, 1e3, 1e3)
+    @test reg === :open && λn ≈ 0 && λt ≈ 0
+    λn, λt, reg = BEM._alm_project_multipliers(0.0, 0.0, 2.0, 0.1, 0.3, 1e3, 1e3)
+    @test reg === :stick && λn ≈ 2.0 && λt ≈ 0.1
+end
+
 @testset "local vs global frame multibody" begin
     E, ν = 100.0, 0.3
     props = Elasticity(E, ν, 1.0; plane_strain=true)

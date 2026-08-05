@@ -624,14 +624,17 @@ States: `1=open`, `±2=slip`, `3=stick` (MATLAB codes).
 Solvers:
 - `:activeset` (default) — Contato verify → assemble → ``x=A\\b``
 - `:ssn` — semi-smooth Newton on Alart–Curnier residual (same unknowns)
+- `:alm` — Uzawa augmented Lagrangian (multiplier projection + BIE with fixed ``t``)
 
 For robustness under large approach/load prefer
 [`solve_contact_friction_stepped!`](@ref) (outer load loop + warm start).
 
 # Keywords
 - `δ` — rigid approach (``h = g₀ - δ``)
-- `solver` — `:activeset` | `:ssn`
-- `rn`, `rt` — AC augmentation (default: auto from ``E/L``); only `:ssn`
+- `solver` — `:activeset` | `:ssn` | `:alm`
+- `rn`, `rt` — augmentation / AC scales (default: auto from ``E/L``); `:ssn` and `:alm`
+- `alm_omega` — multiplier under-relaxation in `(0,1]` (default `0.5`); `:alm` only
+- `r_grow` — multiply ``(rn,rt)`` each outer ALM iter if still penetrating (default `1`)
 - `x0` — optional warm-start unknown vector
 - `reset_states` — if `true` (default), all pairs start open
 - `return_x` — also return the unknown vector for warm starts
@@ -642,6 +645,8 @@ function solve_contact_friction!(prob::MultiRegionProblem{<:Elasticity};
         solver::Symbol=:activeset,
         rn::Union{Nothing,Real}=nothing,
         rt::Union{Nothing,Real}=nothing,
+        alm_omega::Real=0.5,
+        r_grow::Real=1.0,
         x0::Union{Nothing,AbstractVector}=nothing,
         reset_states::Bool=true,
         return_x::Bool=false)
@@ -662,7 +667,8 @@ function solve_contact_friction!(prob::MultiRegionProblem{<:Elasticity};
         end
     end
     x, ok = _contact_inner_solve!(prep, pairs, h, x_init;
-        solver=solver, tol=tol, maxiter=maxiter, verbose=verbose, rn=rn, rt=rt)
+        solver=solver, tol=tol, maxiter=maxiter, verbose=verbose,
+        rn=rn, rt=rt, alm_omega=alm_omega, r_grow=r_grow)
     ok || @warn "solve_contact_friction! did not fully converge" δ=δ solver=solver
     _verify_contact_states!(pairs, prep, h, x; epsc=1e-7)
     _scatter_contact_solution!(prob, prep, pairs, x)
@@ -676,19 +682,20 @@ end
     solve_contact_friction_stepped!(prob; δ_end, nsteps=10, ...)
 
 **Load-stepped** frictional contact: outer loop on rigid approach ``δ``, inner
-solver (Contato active-set or semi-smooth Newton).
+solver (Contato active-set, SSN, or augmented Lagrangian).
 
 ```text
 for s = 1:nsteps
     δ_s = δ_end * s/nsteps
-    x ← inner_solve(δ_s; warm-start x)   # :activeset or :ssn
+    x ← inner_solve(δ_s; warm-start x)   # :activeset | :ssn | :alm
 end
 ```
 
 # Keywords
 - `δ_end` / `δ_start` / `nsteps` / `δ_path` — approach schedule
-- `solver` — `:activeset` (default) | `:ssn`
-- `rn`, `rt` — Alart–Curnier scales for `:ssn` (default auto)
+- `solver` — `:activeset` (default) | `:ssn` | `:alm`
+- `rn`, `rt` — augmentation scales for `:ssn` / `:alm` (default auto)
+- `alm_omega`, `r_grow` — Uzawa ALM options
 - `adaptive` — bisect a failed step once and retry
 - `tol`, `maxiter`, `method`, `verbose`, `npg`
 
@@ -707,7 +714,10 @@ function solve_contact_friction_stepped!(prob::MultiRegionProblem{<:Elasticity};
         method::Symbol=:ntn,
         solver::Symbol=:activeset,
         rn::Union{Nothing,Real}=nothing,
-        rt::Union{Nothing,Real}=nothing)
+        rt::Union{Nothing,Real}=nothing,
+        alm_omega::Real=0.5,
+        r_grow::Real=1.0,
+        max_bisect::Int=6)
     ctx = _contact_friction_setup(prob; method=method, npg=npg)
     ctx === nothing && return prob
     prep, pairs = ctx.prep, ctx.pairs
@@ -733,18 +743,21 @@ function solve_contact_friction_stepped!(prob::MultiRegionProblem{<:Elasticity};
     δ_hist = Float64[]
     tn_hist = Float64[]
     s = 1
+    n_bisect = 0
     δ_ref = δ_end === nothing ? (isempty(path) ? 1.0 : path[end]) : float(δ_end)
     while s <= length(path)
         δ = path[s]
         h = [cp.gap0 - δ for cp in pairs]
         x_try, ok = _contact_inner_solve!(prep, pairs, h, x;
-            solver=solver, tol=tol, maxiter=maxiter, verbose=verbose, rn=rn, rt=rt)
-        if !ok && adaptive
+            solver=solver, tol=tol, maxiter=maxiter, verbose=verbose,
+            rn=rn, rt=rt, alm_omega=alm_omega, r_grow=r_grow)
+        if !ok && adaptive && n_bisect < max_bisect
             δ_prev = s == 1 ? float(δ_start) : path[s - 1]
             δ_mid = 0.5 * (δ_prev + δ)
             if abs(δ_mid - δ_prev) > 1e-14 * max(abs(δ_ref), 1.0)
                 verbose && @info "contact step failed; bisecting" δ=δ δ_mid=δ_mid solver=solver
                 insert!(path, s, δ_mid)
+                n_bisect += 1
                 continue
             end
         end
@@ -822,18 +835,22 @@ function _contact_activeset!(prep, pairs, h, x_init;
     return x, ok
 end
 
-"""Dispatch inner contact solve: `:activeset` or `:ssn`."""
+"""Dispatch inner contact solve: `:activeset`, `:ssn`, or `:alm`."""
 function _contact_inner_solve!(prep, pairs, h, x_init;
         solver::Symbol=:activeset, tol=1e-8, maxiter=40, verbose=false,
-        rn=nothing, rt=nothing)
+        rn=nothing, rt=nothing, alm_omega::Real=0.5, r_grow::Real=1.0)
     if solver === :activeset
         return _contact_activeset!(prep, pairs, h, x_init; tol=tol, maxiter=maxiter,
             verbose=verbose)
     elseif solver === :ssn
         return _contact_ssn!(prep, pairs, h, x_init; tol=tol, maxiter=maxiter,
             verbose=verbose, rn=rn, rt=rt)
+    elseif solver === :alm || solver === :uzawa
+        return _contact_alm!(prep, pairs, h, x_init; tol=tol, maxiter=maxiter,
+            verbose=verbose, rn=rn, rt=rt, omega=alm_omega, r_grow=r_grow)
     else
-        throw(ArgumentError("unknown contact solver $(repr(solver)); use :activeset or :ssn"))
+        throw(ArgumentError(
+            "unknown contact solver $(repr(solver)); use :activeset, :ssn, or :alm"))
     end
 end
 
@@ -1112,6 +1129,220 @@ function _contact_ssn!(prep, pairs, h, x_init;
     nR = norm(R)
     ok = ok || nR < tol
     verbose && @info "contact SSN done" ok nR
+    return x, ok
+end
+
+# -----------------------------------------------------------------------------
+# Augmented Lagrangian (Uzawa) frictional contact
+# -----------------------------------------------------------------------------
+
+"""
+Write body-1 tractions from multipliers `λ=-t` and enforce traction equilibrium
+on body 2: `t1 + R*t2 = 0` ⇒ `t2 = -R\\t1`.
+"""
+function _contact_set_t_from_lambda!(prep, pairs, x, λn, λt)
+    nx = sum(p.ndof for p in prep)
+    for (k, cp) in enumerate(pairs)
+        pr1 = prep[cp.reg_a]
+        pr2 = prep[cp.reg_b]
+        na, nb = cp.node_a, cp.node_b
+        R1 = Matrix(node_rotation2d(pr1.dad.Normal[na]))
+        R2 = Matrix(node_rotation2d(pr2.dad.Normal[nb]))
+        R = R2 * R1'
+        tn1 = -λn[k]
+        tt1 = -λt[k]
+        t2 = -(R \ SVector(tn1, tt1))
+        ot = nx + 4(k - 1)
+        x[ot + 1] = tn1
+        x[ot + 2] = tt1
+        x[ot + 3] = t2[1]
+        x[ot + 4] = t2[2]
+        cp.tn = tn1
+        cp.tt = tt1
+    end
+    return x
+end
+
+"""
+Solve mixed BIE blocks with **fixed** contact tractions in `x`:
+`A_r * x_mix_r = b_r + G_c * t_c`.
+Uses cached LU factors of each region `A`.
+"""
+function _solve_bie_fixed_contact_t!(prep, pairs, x, Afac)
+    nx = sum(p.ndof for p in prep)
+    nreg = length(prep)
+    rhs = [copy(pr.b) for pr in prep]
+    for (k, cp) in enumerate(pairs)
+        pr1 = prep[cp.reg_a]
+        pr2 = prep[cp.reg_b]
+        na, nb = cp.node_a, cp.node_b
+        ot = nx + 4(k - 1)
+        t1 = SVector(x[ot + 1], x[ot + 2])
+        t2 = SVector(x[ot + 3], x[ot + 4])
+        if haskey(pr1.Gc_cols, na)
+            cols = pr1.Gc_cols[na]
+            rhs[cp.reg_a] .+= pr1.G_local[:, cols] * t1
+        end
+        if haskey(pr2.Gc_cols, nb)
+            cols = pr2.Gc_cols[nb]
+            rhs[cp.reg_b] .+= pr2.G_local[:, cols] * t2
+        end
+    end
+    for r in 1:nreg
+        pr = prep[r]
+        xr = Afac[r] \ rhs[r]
+        x[pr.off+1:pr.off+pr.ndof] .= xr
+    end
+    return x
+end
+
+"""
+Alart–Curnier / ALM multiplier projection (open-positive gap `g_n`).
+
+`λn ← max(0, λn - rn*gn)`, `λt ← proj_{|s|≤μ λn}(λt - rt*gt)`.
+"""
+function _alm_project_multipliers(gn, gt, λn, λt, μ, rn, rt)
+    λn_new = max(0.0, λn - rn * gn)
+    τt = λt - rt * gt
+    bound = μ * λn_new
+    if abs(τt) <= bound + 1e-15
+        λt_new = τt
+        regime = λn_new <= 1e-15 ? :open : :stick
+    else
+        s = τt == 0.0 ? 1.0 : sign(τt)
+        λt_new = s * bound
+        regime = λn_new <= 1e-15 ? :open : :slip
+    end
+    if λn_new <= 1e-15
+        λt_new = 0.0
+        regime = :open
+    end
+    return λn_new, λt_new, regime
+end
+
+"""
+Uzawa **augmented Lagrangian** frictional contact on Contato unknowns.
+
+Outer loop (multipliers `λn=-tn`, `λt=-tt`):
+
+1. Set contact tractions from `λ` + equilibrium on body 2.
+2. Solve each region BIE with fixed contact Neumann data.
+3. Evaluate gaps `(gn, gt)`; project multipliers (ALM / AC update).
+4. Under-relaxation `ω` (default 0.5) and optional mild growth of `(rn, rt)`.
+
+Defaults use a softer augmentation than SSN (`r ∼ E/L`) to avoid Uzawa
+overshoot; `r_grow>1` increases `r` only when penetration stagnates.
+"""
+function _contact_alm!(prep, pairs, h, x_init;
+        tol=1e-8, maxiter=120, verbose=false,
+        rn::Union{Nothing,Real}=nothing,
+        rt::Union{Nothing,Real}=nothing,
+        omega::Real=0.5,
+        r_grow::Real=1.0)
+    x = collect(Float64, x_init)
+    nx = sum(p.ndof for p in prep)
+    np = length(pairs)
+    # Softer default than SSN: Uzawa is first-order and overshoots if r large
+    rn0, rt0 = _default_contact_r(prep)
+    rn_ = rn === nothing ? 0.1 * rn0 : float(rn)
+    rt_ = rt === nothing ? 0.1 * rt0 : float(rt)
+    r_cap = 50.0 * rn0
+    ω = clamp(float(omega), 1e-3, 1.0)
+    grow = max(float(r_grow), 1.0)
+
+    λn = zeros(np)
+    λt = zeros(np)
+    for (k, cp) in enumerate(pairs)
+        ot = nx + 4(k - 1)
+        λn[k] = max(0.0, -x[ot + 1])
+        λt[k] = -x[ot + 2]
+        # keep friction inside Coulomb disk of current λn
+        bound0 = cp.μ * λn[k]
+        if abs(λt[k]) > bound0
+            λt[k] = bound0 == 0 ? 0.0 : bound0 * sign(λt[k])
+        end
+    end
+
+    Afac = [lu(Matrix(pr.A)) for pr in prep]
+    ok = false
+    pen_max = Inf
+    dλ = Inf
+    nR = Inf
+    pen_prev = Inf
+    λ_scale = 1.0
+    for it in 1:maxiter
+        _contact_set_t_from_lambda!(prep, pairs, x, λn, λt)
+        _solve_bie_fixed_contact_t!(prep, pairs, x, Afac)
+
+        dλ2 = 0.0
+        pen_max = 0.0
+        gap_comp = 0.0   # max |min(gn, λn)| complementarity
+        n_closed = 0
+        for (k, cp) in enumerate(pairs)
+            kin = _contact_pair_kinematics(prep, cp, h[k], x, k, nx)
+            pen_max = max(pen_max, max(0.0, -kin.gn))
+            λn_p, λt_p, regime = _alm_project_multipliers(
+                kin.gn, kin.gt, λn[k], λt[k], cp.μ, rn_, rt_)
+            λn_new = (1 - ω) * λn[k] + ω * λn_p
+            λt_new = (1 - ω) * λt[k] + ω * λt_p
+            dλ2 += (λn_new - λn[k])^2 + (λt_new - λt[k])^2
+            λn[k] = λn_new
+            λt[k] = λt_new
+            gap_comp = max(gap_comp, abs(min(kin.gn, λn[k])))
+            if regime === :open || λn[k] <= 1e-14
+                cp.state = 1
+            elseif regime === :stick
+                cp.state = 3
+                n_closed += 1
+            else
+                s = λt[k] == 0.0 ? 1.0 : sign(λt[k])
+                cp.state = Int(s * 2)
+                n_closed += 1
+            end
+            cp.tn = -λn[k]
+            cp.tt = -λt[k]
+        end
+        dλ = sqrt(dλ2)
+        λ_scale = max(1.0, maximum(λn; init=0.0), maximum(abs, λt; init=0.0))
+        _contact_set_t_from_lambda!(prep, pairs, x, λn, λt)
+
+        # consistency residual at current r (same NCF as SSN)
+        nR = norm(_assemble_contact_R(prep, pairs, h, x; rn=rn_, rt=rt_))
+        verbose && @info "contact ALM" it dλ pen_max nR rn=rn_ n_closed=n_closed ω=ω
+
+        tol_λ = tol * λ_scale
+        tol_g = tol * max(1.0, maximum(abs, h; init=1.0))
+        if (dλ <= tol_λ && pen_max <= tol_g) || nR <= tol * max(1.0, λ_scale)
+            ok = true
+            break
+        end
+
+        # mild r growth only if penetration not improving
+        if grow > 1.0 + 1e-15 && pen_max > tol_g && pen_max >= 0.5 * pen_prev && it % 5 == 0
+            rn_ = min(r_cap, rn_ * grow)
+            rt_ = min(r_cap, rt_ * grow)
+        end
+        # shrink r if multiplier steps explode (oscillation)
+        if dλ > 10 * λ_scale && it > 3
+            rn_ *= 0.5
+            rt_ *= 0.5
+            ω = max(0.2, 0.8 * ω)
+        end
+        pen_prev = pen_max
+    end
+    # final consistent fields
+    _contact_set_t_from_lambda!(prep, pairs, x, λn, λt)
+    _solve_bie_fixed_contact_t!(prep, pairs, x, Afac)
+    _contact_set_t_from_lambda!(prep, pairs, x, λn, λt)
+    for (k, cp) in enumerate(pairs)
+        cp.tn = -λn[k]
+        cp.tt = -λt[k]
+    end
+    nR = norm(_assemble_contact_R(prep, pairs, h, x; rn=rn_, rt=rt_))
+    tol_λ = tol * max(1.0, maximum(λn; init=0.0))
+    tol_g = tol * max(1.0, maximum(abs, h; init=1.0))
+    ok = ok || nR <= tol * max(1.0, λ_scale) || (dλ <= tol_λ && pen_max <= tol_g)
+    verbose && @info "contact ALM done" ok nR dλ pen_max rn=rn_
     return x, ok
 end
 
