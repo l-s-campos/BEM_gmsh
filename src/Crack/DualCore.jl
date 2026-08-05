@@ -65,7 +65,7 @@ function _νeff(m::DualMesh)
     m.plane_strain && return m.ν
     return m.ν / (1 + m.ν)          # plane-stress → plane-strain map used in Kelvin
 end
-_μ(m::DualMesh) = m.E / (2(1 + m.ν))
+_μ(m::DualMesh) = m.E / (2(1 + m.ν))  # same as Elasticity.mu for isotropic
 function _κ(m::DualMesh)
     ν = m.ν
     m.plane_strain && return 3 - 4ν

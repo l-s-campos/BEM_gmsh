@@ -9,16 +9,52 @@ export axisym_fundamental
 
 Axisymmetric linear elasticity in the ``(r,z)`` meridional plane.
 Unknowns: ``(u_r, u_z)``. Tractions: ``(t_r, t_z)``.
+
+Lamé ``λ, μ`` are cached at construction (same formulas as 3D / plane strain).
 """
-@kwdef mutable struct AxisymmetricElasticity{T} <: Vectorial
-    E::T = 1.0
-    ν::T = 0.3
+mutable struct AxisymmetricElasticity{T} <: Vectorial
+    E::T
+    ν::T
+    lambda::T
+    mu::T
 end
 
-shear_modulus(e::AxisymmetricElasticity) = e.E / (2(1 + e.ν))
+function AxisymmetricElasticity{T}(; E=one(T), ν=T(0.3)) where {T}
+    λ, μ = lame_constants(E, ν, true)  # axisym uses 3D/plane-strain Lamé
+    return AxisymmetricElasticity{T}(T(E), T(ν), T(λ), T(μ))
+end
+
+function AxisymmetricElasticity(; E=1.0, ν=0.3)
+    T = float(promote_type(typeof(E), typeof(ν)))
+    return AxisymmetricElasticity{T}(; E=T(E), ν=T(ν))
+end
+
+function AxisymmetricElasticity(E::Real, ν::Real)
+    return AxisymmetricElasticity(; E, ν)
+end
+
+function Base.setproperty!(e::AxisymmetricElasticity{T}, name::Symbol, v) where {T}
+    if name === :lambda || name === :mu
+        throw(ArgumentError("set E or ν instead of `$name`"))
+    end
+    if name === :E || name === :ν || name === :nu
+        fname = name === :nu ? :ν : name
+        setfield!(e, fname, convert(T, v))
+        λ, μ = lame_constants(e.E, e.ν, true)
+        setfield!(e, :lambda, T(λ))
+        setfield!(e, :mu, T(μ))
+        return v
+    end
+    return setfield!(e, name, v)
+end
+
+shear_modulus(e::AxisymmetricElasticity) = e.mu
+lame_μ(e::AxisymmetricElasticity) = e.mu
+lame_λ(e::AxisymmetricElasticity) = e.lambda
 
 """
     axisym_fundamental(rp, zp, rq, zq, nr, nz, E, ν) -> (U, T)
+    axisym_fundamental(rp, zp, rq, zq, nr, nz, props::AxisymmetricElasticity)
 
 Displacement (`U`) and traction (`T`) kernels 2×2 at source ``(r_p,z_p)``,
 field ``(r_q,z_q)``, normal ``(n_r,n_z)`` at the field point.
@@ -26,8 +62,16 @@ field ``(r_q,z_q)``, normal ``(n_r,n_z)`` at the field point.
 Ported from `calc_solfund.m` (Bakri / Bakri–elliptic form).
 Uses `SpecialFunctions.ellipk` / `ellipe`.
 """
+function axisym_fundamental(rp, zp, rq, zq, nr, nz, props::AxisymmetricElasticity)
+    return axisym_fundamental(rp, zp, rq, zq, nr, nz, props.E, props.ν, props.mu)
+end
+
 function axisym_fundamental(rp, zp, rq, zq, nr, nz, E, ν)
     μ = E / (2(1 + ν))
+    return axisym_fundamental(rp, zp, rq, zq, nr, nz, E, ν, μ)
+end
+
+function axisym_fundamental(rp, zp, rq, zq, nr, nz, E, ν, μ)
     XA = 1 / (16 * π^2 * μ * (1 - ν))
     ZZ = (zp - zq)^2
     XC = sqrt((rp + rq)^2 + ZZ)

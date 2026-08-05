@@ -152,6 +152,20 @@ ti = time()
 
         # Kelvin 2D — symmetry of U, finite T
         el = Elasticity(1.0, 0.3, 1.0)
+        # Lamé cached at construction (plane strain default)
+        λ0, μ0 = lame_constants(1.0, 0.3, true)
+        @test el.mu ≈ μ0
+        @test el.lambda ≈ λ0
+        @test shear_modulus(el) === el.mu
+        @test lame_λ(el) === el.lambda
+        @test el.plane_strain && !plane_stress(el)
+        el_ps = Elasticity(1.0, 0.3, 1.0; plane_stress=true)
+        @test plane_stress(el_ps) && !el_ps.plane_strain
+        @test el_ps.mu ≈ el.mu          # μ from material ν
+        @test el_ps.lambda != el.lambda # λ uses effective ν
+        @test effective_nu(el_ps) ≈ 0.3 / 1.3
+        el.E = 2.0
+        @test el.mu ≈ 2.0 / (2 * 1.3)
         kpe = fundamental(el, r, n)
         @test kpe.U isa AbstractMatrix
         @test kpe.U ≈ kpe.U' atol=1e-14

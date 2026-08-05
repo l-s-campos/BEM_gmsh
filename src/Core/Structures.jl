@@ -3,7 +3,8 @@ export Point2D, Point3D, Point, BEMdata, Element, Problem, Scalar, Vectorial
 export Laplace, Helmholtz, Elasticity, AnisotropicElasticity, LekhnitskiiParams
 export OrthotropicLaplace, AxisymmetricElasticity
 export BEMCache, has_cache, set_cache!
-export shear_modulus, lame_λ, plane_strain_κ
+export shear_modulus, lame_λ, lame_mu, lame_constants, plane_strain_κ, effective_nu,
+       plane_stress, refresh_lame!, thermal_modulus
 export point, all_points, all_points!, set_internal_nodes!
 
 """
@@ -53,35 +54,135 @@ wavenumber(h::Helmholtz) = h.ω / h.c
 """
 Isotropic linear elasticity (Kelvin fundamental solution).
 
-- `E`  — Young modulus
-- `nu` — Poisson ratio
-- `rho`— density (transient / inertia)
-- `plane_strain::Bool` — if `true` (default) use plane-strain Kelvin form;
-  if `false`, map to plane stress via ``ν̃ = ν/(1+ν)``.
+# Fields
+- `E`, `nu`, `rho` — Young modulus, Poisson ratio, density
+- `plane_strain` — `true` → plane strain; `false` → plane stress (2D Kelvin)
+- `α` — linear thermal expansion
+- `lambda`, `mu` — Lamé parameters **cached at construction** (and whenever
+  `E` / `nu` / `plane_strain` are set via `setproperty!`)
+
+# 2D options
+```julia
+Elasticity(E, ν, ρ; plane_strain=true)   # default
+Elasticity(E, ν, ρ; plane_stress=true)   # sets plane_strain=false
+```
+
+Lamé constants use the **effective** Poisson ratio of the 2D model:
+- plane strain: ``ν̃ = ν``
+- plane stress: ``ν̃ = ν/(1+ν)`` (same map as Kelvin kernels)
+
+```text
+μ = E / (2(1+ν))                 # material shear modulus
+λ = E ν̃ / ((1+ν̃)(1-2ν̃))       # first Lamé (effective 2D/3D form)
+```
 """
-@kwdef mutable struct Elasticity{T} <: Vectorial
-    E::T = 1.0
-    nu::T = 0.3
-    rho::T = 1.0
-    plane_strain::Bool = true
-    α::T = zero(T)          # linear thermal expansion coefficient
+mutable struct Elasticity{T} <: Vectorial
+    E::T
+    nu::T
+    rho::T
+    plane_strain::Bool
+    α::T
+    lambda::T   # λ (Lamé first parameter, effective model)
+    mu::T       # μ (shear modulus)
 end
 
-# backward-compatible positional constructor (E, ν, ρ)
-function Elasticity(E::Real, nu::Real, rho::Real; plane_strain::Bool=true, α=0.0)
+"""Compute ``(λ, μ)`` from ``E, ν`` and 2D plane mode."""
+function lame_constants(E::Real, nu::Real, plane_strain::Bool)
+    T = float(promote_type(typeof(E), typeof(nu)))
+    E, nu = T(E), T(nu)
+    μ = E / (2 * (1 + nu))
+    νe = plane_strain ? nu : nu / (1 + nu)   # plane stress → effective ν
+    den = (1 + νe) * (1 - 2 * νe)
+    λ = abs(den) < eps(T) ? T(Inf) : E * νe / den
+    return λ, μ
+end
+
+function _elasticity_new(
+        ::Type{T}, E, nu, rho, plane_strain::Bool, α,
+    ) where {T}
+    λ, μ = lame_constants(E, nu, plane_strain)
+    return Elasticity{T}(T(E), T(nu), T(rho), plane_strain, T(α), T(λ), T(μ))
+end
+
+"""
+    Elasticity(E, nu, rho; plane_strain=true, plane_stress=false, α=0)
+
+Positional constructor. Pass `plane_stress=true` to select plane stress
+(overrides `plane_strain`).
+"""
+function Elasticity(
+        E::Real, nu::Real, rho::Real;
+        plane_strain::Bool = true,
+        plane_stress::Bool = false,
+        α = 0.0,
+    )
+    ps = plane_stress ? false : plane_strain
     T = float(promote_type(typeof(E), typeof(nu), typeof(rho), typeof(α)))
-    return Elasticity{T}(T(E), T(nu), T(rho), plane_strain, T(α))
+    return _elasticity_new(T, E, nu, rho, ps, α)
 end
 
-shear_modulus(e::Elasticity) = e.E / (2(1 + e.nu))
-lame_λ(e::Elasticity) = e.E * e.nu / ((1 + e.nu) * (1 - 2e.nu))
+"""Keyword constructor (defaults match historical `@kwdef`)."""
+function Elasticity(; E=1.0, nu=0.3, rho=1.0, plane_strain=true, plane_stress=false, α=0.0)
+    return Elasticity(E, nu, rho; plane_strain, plane_stress, α)
+end
+
+function Elasticity{T}(; E=one(T), nu=T(0.3), rho=one(T),
+        plane_strain=true, plane_stress=false, α=zero(T)) where {T}
+    ps = plane_stress ? false : plane_strain
+    return _elasticity_new(T, E, nu, rho, ps, α)
+end
+
+"""Recompute cached Lamé fields from current `E`, `nu`, `plane_strain`."""
+function refresh_lame!(e::Elasticity{T}) where {T}
+    λ, μ = lame_constants(e.E, e.nu, e.plane_strain)
+    setfield!(e, :lambda, T(λ))
+    setfield!(e, :mu, T(μ))
+    return e
+end
+
+function Base.setproperty!(e::Elasticity{T}, name::Symbol, v) where {T}
+    if name === :lambda || name === :mu
+        throw(ArgumentError(
+            "do not set `$name` directly; set E, nu, or plane_strain (or plane_stress)"))
+    end
+    if name === :plane_stress
+        setfield!(e, :plane_strain, !Bool(v))
+        return refresh_lame!(e)
+    end
+    if name === :E || name === :nu || name === :α
+        setfield!(e, name, convert(T, v))
+        name === :α || refresh_lame!(e)
+        return v
+    elseif name === :plane_strain
+        setfield!(e, :plane_strain, Bool(v))
+        return refresh_lame!(e)
+    elseif name === :rho
+        return setfield!(e, :rho, convert(T, v))
+    else
+        return setfield!(e, name, v)
+    end
+end
+
+# Accessors (prefer structure fields; keep function API stable)
+shear_modulus(e::Elasticity) = e.mu
+lame_mu(e::Elasticity) = e.mu
+lame_λ(e::Elasticity) = e.lambda
+plane_stress(e::Elasticity) = !e.plane_strain
+
+"""Kolosov constant ``κ``: plane strain ``3-4ν``, plane stress ``(3-ν)/(1+ν)``."""
+function plane_strain_κ(e::Elasticity)
+    ν = e.nu
+    return e.plane_strain ? (3 - 4ν) : (3 - ν) / (1 + ν)
+end
+plane_strain_κ(E, ν, plane_strain::Bool) =
+    plane_strain ? (3 - 4ν) : (3 - ν) / (1 + ν)
 
 """
-Thermal stress modulus ``k̂ = E α / (1-2ν)`` (plane strain) used in the
-Somigliana thermal load ``t^{th} = k̂ θ n`` and ``σ^{th} = -k̂ θ I``.
+Thermal stress modulus ``k̂ = E α / (1-2ν̃)`` with effective Poisson ``ν̃``
+(same map as Kelvin).
 """
 function thermal_modulus(e::Elasticity)
-    ν = e.plane_strain ? e.nu : e.nu / (1 + e.nu)
+    ν = effective_nu(e)
     return e.E * e.α / (1 - 2ν)
 end
 

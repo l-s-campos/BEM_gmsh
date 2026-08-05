@@ -228,7 +228,7 @@ function _log_NJ_integral(poly, nodes, s::ComplexF64; pJ::Int=8)
     Vj = [qJ[i]^(k - 1) for i in eachindex(qJ), k in 1:(pJ + 1)]
     Jsamp = Float64[_jac_real(poly, nodes, qJ[i]) for i in eachindex(qJ)]
     W = Diagonal(sqrt.(wJ))
-    cJ = (W * Vj) \ (W * Jsamp)
+    cJ = W * Vj \ W * Jsamp
     qmax = (n - 1) + pJ
     Ipow = [_power_log_integral(q, s) for q in 0:qmax]
     Ian = zeros(ComplexF64, n)
@@ -459,7 +459,7 @@ function integraelem_dumont!(h::AbstractMatrix, g::AbstractMatrix,
 
     props = dad.properties
     ν = effective_nu(props)
-    μ = shear_modulus(props)
+    μ = props.mu
     poly = dad.element_type
 
     ξ0 = _seed_1d(poly, nodes, pf)

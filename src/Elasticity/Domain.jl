@@ -133,7 +133,7 @@ With
 """
 function _galerkin_Ustar(props::Elasticity, R::Real, e::SVector{2})
     ν = effective_nu(props)
-    μ = shear_modulus(props)
+    μ = props.mu
     base = 8 * π * μ * (1 - ν)
     R2 = R * R
     logR = log(R)

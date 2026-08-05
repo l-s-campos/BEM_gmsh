@@ -128,7 +128,7 @@ function _dibem_elast_compress_D(dad, pts, method::Symbol; atol=1e-6, rtol=1e-6,
             Pmat[2, j] = pts[j][2]
         end
         return FMM.fmm_kelvin2d_matrix(Pmat;
-            μ=shear_modulus(props), ν=effective_nu(props),
+            μ=props.mu, ν=effective_nu(props),
             eps=Float64(eps), nmax=nmax, η=Float64(eta))
     end
 
@@ -145,7 +145,7 @@ function _dibem_elast_compress_D(dad, pts, method::Symbol; atol=1e-6, rtol=1e-6,
             Pmat[2, j] = pts[j][2]
         end
         KF = FMM.fmm_kelvin2d_matrix(Pmat;
-            μ=shear_modulus(props), ν=effective_nu(props),
+            μ=props.mu, ν=effective_nu(props),
             eps=Float64(eps), nmax=nmax, η=Float64(eta))
         return assemble_hss_fmm_kernel(KF, pts;
             rtol=rtol, rank=rank == typemax(Int) ? 48 : rank,
@@ -173,7 +173,7 @@ function _dibem_elast_compress_D(dad, pts, method::Symbol; atol=1e-6, rtol=1e-6,
                 Pmat_h2[2, j] = pts[j][2]
             end
             KF = FMM.fmm_kelvin2d_matrix(Pmat_h2;
-                μ=shear_modulus(props), ν=effective_nu(props),
+                μ=props.mu, ν=effective_nu(props),
                 eps=Float64(eps), nmax=nmax, η=Float64(eta))
             rH2 = rank == typemax(Int) ? 48 : Int(rank)
             return FMM.assemble_h2_fmm(KF, etree; rtol=rtol, rank=rH2, alpha=alpha,

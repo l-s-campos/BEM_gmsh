@@ -15,7 +15,7 @@ tensors. Legacy: `calsolfund` for `elastico`.
 """
 function fundamental(props::Elasticity, r::SVector{2}, n::SVector{2})
     ν = effective_nu(props)
-    μ = shear_modulus(props)
+    μ = props.mu
     R = _R(r)
     dr = _to_vec(r) / R
     n̂ = _to_vec(n)
@@ -51,7 +51,7 @@ end
 """
 function fundamental(props::Elasticity, r::SVector{3}, n::SVector{3})
     ν = props.nu
-    μ = shear_modulus(props)
+    μ = props.mu
     R = _R(r)
     dr = _to_vec(r) / R
     n̂ = _to_vec(n)
@@ -98,7 +98,7 @@ Third-order Kelvin tensors `D` and `S` for 2D plane strain (legacy `caldsolfund`
 """
 function fundamental_stress(props::Elasticity, r::SVector{2}, n::SVector{2})
     ν = effective_nu(props)
-    μ = shear_modulus(props)
+    μ = props.mu
     R = _R(r)
     dr = _to_vec(r) / R
     n̂ = _to_vec(n)
@@ -148,7 +148,7 @@ Each entry is a `Mat{2,2}`.
 """
 function fundamental_grad(props::Elasticity, r::SVector{2}, n::SVector{2})
     ν = effective_nu(props)
-    μ = shear_modulus(props)
+    μ = props.mu
     r1, r2 = r[1], r[2]
     R = _R(r)
     nx, ny = n[1], n[2]
