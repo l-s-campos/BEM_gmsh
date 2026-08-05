@@ -201,8 +201,11 @@ function lrdecomp_h2node!(X::H2Node; rtol = 1e-6)
                 h2_rdiv_right!(X.sons[j, i], X.sons[i, i]; unit_diag = false)
             end
             for j in (i + 1):rs, k in (i + 1):rs
-                # Xⱼₖ ← Xⱼₖ − Xⱼᵢ Xᵢₖ
-                h2_addmul!(X.sons[j, k], X.sons[j, i], X.sons[i, k], -1; rtol = rtol)
+                # Xⱼₖ ← Xⱼₖ − Xⱼᵢ Xᵢₖ  (stable low-rank Schur via :block rkupdate)
+                h2_addmul!(
+                    X.sons[j, k], X.sons[j, i], X.sons[i, k], -1;
+                    rtol = rtol, schur_rk = true,
+                )
             end
         end
         return X
@@ -259,6 +262,20 @@ function h2_ldiv_left!(L::H2Node{R, T}, B::H2Node{R, T}; unit_diag::Bool = true)
         return B
     end
 
+    # Dense L, low-rank B = X Y' → (L\X) Y' stays low-rank (stable Schur path)
+    if isdense_h2(L) && isuniform(B) && B.s_full && B.S isa RkMatrix
+        Rk = B.S
+        Xf = copy(Rk.A)
+        if unit_diag
+            ldiv!(UnitLowerTriangular(L.F), Xf)
+        else
+            ldiv!(LowerTriangular(L.F), Xf)
+        end
+        B.S = RkMatrix(Xf, copy(Rk.B))
+        B.s_full = true
+        return B
+    end
+
     if issplit(L) && issplit(B) && size(L.sons, 1) == size(B.sons, 1) &&
             size(L.sons, 2) == size(L.sons, 1)
         r = size(L.sons, 1)
@@ -267,11 +284,22 @@ function h2_ldiv_left!(L::H2Node{R, T}, B::H2Node{R, T}; unit_diag::Bool = true)
             for i in 1:r
                 h2_ldiv_left!(L.sons[i, i], B.sons[i, col]; unit_diag = unit_diag)
                 for j in (i + 1):r
-                    h2_addmul!(B.sons[j, col], L.sons[j, i], B.sons[i, col], -one(T); rtol = 0.0)
+                    h2_addmul!(
+                        B.sons[j, col], L.sons[j, i], B.sons[i, col], -one(T);
+                        rtol = 1e-8, schur_rk = true,
+                    )
                 end
             end
         end
         return B
+    end
+
+    # Low-rank B (any): factor, apply L\ on left factor, rkupdate rewrite
+    if isuniform(B) || (!isdense_h2(B) && !issplit(B))
+        try
+            return _h2_ldiv_left_rk!(L, B; unit_diag)
+        catch
+        end
     end
 
     # densify fallback
@@ -283,6 +311,31 @@ function h2_ldiv_left!(L::H2Node{R, T}, B::H2Node{R, T}; unit_diag::Bool = true)
         ldiv!(LowerTriangular(Ld), Bd)
     end
     return h2_replace_dense!(B, Bd)
+end
+
+function _h2_ldiv_left_rk!(L::H2Node{R, T}, B::H2Node{R, T}; unit_diag::Bool) where {R, T}
+    # B ≈ Lf Rf' on its block; L\B ≈ (L_block \ Lf) Rf'
+    Lf, Rf = h2_node_lr_factors(B; rtol = 1e-14)
+    size(Lf, 2) == 0 && return h2_replace_dense!(B, zeros(T, size(B)...))
+    Ld = isdense_h2(L) ? L.F : h2_block_matrix(L)
+    Xf = copy(Lf)
+    if unit_diag
+        ldiv!(UnitLowerTriangular(Ld), Xf)
+    else
+        ldiv!(LowerTriangular(Ld), Xf)
+    end
+    # Write as full-block Rk on B
+    m, n = size(B)
+    Rk = RkMatrix(Xf, Rf)
+    if size(Rk.A, 2) * (m + n) < m * n
+        B.kind = H2UniformLeaf
+        B.S = Rk
+        B.F = nothing
+        B.sons = Matrix{H2Node{R, T}}(undef, 0, 0)
+        B.s_full = true
+        return B
+    end
+    return h2_replace_dense!(B, Matrix(Rk))
 end
 
 # ---- right solve B / U (B overwritten) ----------------------------------------
@@ -306,6 +359,20 @@ function h2_rdiv_right!(B::H2Node{R, T}, U::H2Node{R, T}; unit_diag::Bool = fals
         return B
     end
 
+    # B = X Y' low-rank, U dense upper → B/U = X (Y'/U) = X (U'\Y)'
+    if isdense_h2(U) && isuniform(B) && B.s_full && B.S isa RkMatrix
+        Rk = B.S
+        Yf = copy(Rk.B)
+        if unit_diag
+            ldiv!(UnitLowerTriangular(adjoint(U.F)), Yf)  # Y_new = U'\ Y
+        else
+            ldiv!(LowerTriangular(adjoint(U.F)), Yf)
+        end
+        B.S = RkMatrix(copy(Rk.A), Yf)
+        B.s_full = true
+        return B
+    end
+
     if issplit(B) && issplit(U) && size(U.sons, 1) == size(U.sons, 2) &&
             size(B.sons, 2) == size(U.sons, 1)
         r = size(U.sons, 1)
@@ -314,11 +381,19 @@ function h2_rdiv_right!(B::H2Node{R, T}, U::H2Node{R, T}; unit_diag::Bool = fals
             for i in 1:r
                 h2_rdiv_right!(B.sons[row, i], U.sons[i, i]; unit_diag = unit_diag)
                 for j in (i + 1):r
-                    h2_addmul!(B.sons[row, j], B.sons[row, i], U.sons[i, j], -one(T); rtol = 0.0)
+                    h2_addmul!(
+                        B.sons[row, j], B.sons[row, i], U.sons[i, j], -one(T);
+                        rtol = 1e-8, schur_rk = true,
+                    )
                 end
             end
         end
         return B
+    end
+
+    try
+        return _h2_rdiv_right_rk!(B, U; unit_diag)
+    catch
     end
 
     Bd = h2_block_matrix(B)
@@ -329,6 +404,29 @@ function h2_rdiv_right!(B::H2Node{R, T}, U::H2Node{R, T}; unit_diag::Bool = fals
         rdiv!(Bd, UpperTriangular(Ud))
     end
     return h2_replace_dense!(B, Bd)
+end
+
+function _h2_rdiv_right_rk!(B::H2Node{R, T}, U::H2Node{R, T}; unit_diag::Bool) where {R, T}
+    Lf, Rf = h2_node_lr_factors(B; rtol = 1e-14)  # B ≈ Lf Rf'
+    size(Lf, 2) == 0 && return h2_replace_dense!(B, zeros(T, size(B)...))
+    Ud = isdense_h2(U) ? U.F : h2_block_matrix(U)
+    Yf = copy(Rf)
+    if unit_diag
+        ldiv!(UnitLowerTriangular(adjoint(Ud)), Yf)
+    else
+        ldiv!(LowerTriangular(adjoint(Ud)), Yf)
+    end
+    m, n = size(B)
+    Rk = RkMatrix(Lf, Yf)
+    if size(Rk.A, 2) * (m + n) < m * n
+        B.kind = H2UniformLeaf
+        B.S = Rk
+        B.F = nothing
+        B.sons = Matrix{H2Node{R, T}}(undef, 0, 0)
+        B.s_full = true
+        return B
+    end
+    return h2_replace_dense!(B, Matrix(Rk))
 end
 
 # ---- rkupdate: G ← G + X Y'  (H2Lib rkupdate_h2matrix MVP / Slice R1) ---------
@@ -590,6 +688,7 @@ function h2_addmul!(
         α::Number = one(T);
         rtol = 1e-6,
         rank = typemax(Int),
+        schur_rk::Bool = true,
     ) where {R, T}
     size(A, 2) == size(B, 1) || throw(DimensionMismatch("h2_addmul! inner"))
     size(C, 1) == size(A, 1) && size(C, 2) == size(B, 2) ||
@@ -609,22 +708,28 @@ function h2_addmul!(
         mid = size(A.sons, 2)
         for i in 1:rC, k in 1:cC
             for j in 1:mid
-                h2_addmul!(C.sons[i, k], A.sons[i, j], B.sons[j, k], α; rtol = rtol, rank = rank)
+                h2_addmul!(
+                    C.sons[i, k], A.sons[i, j], B.sons[j, k], α;
+                    rtol = rtol, rank = rank, schur_rk = schur_rk,
+                )
             end
         end
         return C
     end
 
-    # Low-rank-preserving path (H2Lib cases 1–5, 8)
-    if isuniform(A) || isuniform(B) || isdense_h2(A) || isdense_h2(B) || isuniform(C)
+    # Stable low-rank Schur path (default): always form X Y' ≈ αAB then rkupdate
+    # with method=:block (leaf densify/TSVD). Avoids densifying whole C when the
+    # product is compressible — this is what nested LR uses for Schur updates.
+    if schur_rk
         try
-            X, Y = h2_product_to_global_rk(A, B, α; rtol = max(float(rtol), 1e-14), rank = rank)
+            X, Y = h2_product_to_global_rk(
+                A, B, α; rtol = max(float(rtol), 1e-14), rank = rank,
+            )
             if size(X, 2) > 0
-                # Use stable block rkupdate inside LR Schur (nested is opt-in)
                 return h2_rkupdate!(C, X, Y; rtol = rtol, rank = rank, method = :block)
             end
         catch
-            # fall through to densify
+            # fall through
         end
     end
 
@@ -632,9 +737,7 @@ function h2_addmul!(
     Ad = h2_block_matrix(A)
     Bd = h2_block_matrix(B)
     mul!(Cd, Ad, Bd, α, true)
-    # If C was (or should stay) compressible, try rkwrite of the residual update only
-    if float(rtol) > 0 && (isuniform(C) || !isdense_h2(C))
-        # write full result via replace + optional compress as uniform
+    if float(rtol) > 0
         m, nblk = size(Cd)
         comp = TSVD(; rtol = float(rtol), rank = rank)
         Rk = compress!(copy(Cd), comp)

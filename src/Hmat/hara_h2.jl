@@ -126,7 +126,7 @@ function hara_h2(
 
     H2 = H2Matrix{R, T}(
         tidx, U, skeleton, near, far, Ddiag, Dnear, Bfar,
-        copy(rp), copy(rp), minlvl, α, n,
+        copy(rp), copy(rp), minlvl, α, n, nothing,
     )
     orthog && h2_orthog!(H2)
     compress && h2_compress!(H2; rtol=float(rtol), rank=rmax)

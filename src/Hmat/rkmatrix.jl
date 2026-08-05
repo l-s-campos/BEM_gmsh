@@ -144,3 +144,85 @@ end
 
 # scalar multiplication
 Base.:*(a::Number, R::RkMatrix) = (A = a * R.A; B = copy(R.B); RkMatrix(A, B))
+
+# RkMatrix × vector / matrix (used by H² far blocks) — avoid getindex fallback.
+# Small task-local scratch avoids allocating B'*X on every far interaction.
+const _RK_TMP = [Matrix{Float64}(undef, 0, 0) for _ in 1:Threads.nthreads()]
+
+function _rk_tmp!(::Type{T}, r::Int, s::Int) where {T}
+    tid = Threads.threadid()
+    # grow pool if threads increased after load
+    while length(_RK_TMP) < tid
+        push!(_RK_TMP, Matrix{Float64}(undef, 0, 0))
+    end
+    buf = _RK_TMP[tid]
+    if eltype(buf) != T || size(buf, 1) < r || size(buf, 2) < s
+        buf = Matrix{T}(undef, max(r, size(buf, 1)), max(s, size(buf, 2)))
+        _RK_TMP[tid] = buf
+    end
+    return view(buf, 1:r, 1:s)
+end
+
+function LinearAlgebra.mul!(
+        C::AbstractVector,
+        R::RkMatrix{T},
+        x::AbstractVector,
+        α::Number = true,
+        β::Number = false,
+    ) where {T <: Number}
+    r = size(R.A, 2)
+    tmp = _rk_tmp!(T, r, 1)
+    tv = view(tmp, :, 1)
+    mul!(tv, adjoint(R.B), x)
+    return mul!(C, R.A, tv, α, β)
+end
+function LinearAlgebra.mul!(
+        C::AbstractMatrix,
+        R::RkMatrix{T},
+        X::AbstractMatrix,
+        α::Number = true,
+        β::Number = false,
+    ) where {T <: Number}
+    r = size(R.A, 2)
+    s = size(X, 2)
+    tmp = _rk_tmp!(T, r, s)
+    mul!(tmp, adjoint(R.B), X)
+    return mul!(C, R.A, tmp, α, β)
+end
+function LinearAlgebra.mul!(
+        C::AbstractVector,
+        Rt::Adjoint{T, <:RkMatrix{T}},
+        x::AbstractVector,
+        α::Number = true,
+        β::Number = false,
+    ) where {T <: Number}
+    R = parent(Rt)
+    r = size(R.A, 2)
+    tmp = _rk_tmp!(T, r, 1)
+    tv = view(tmp, :, 1)
+    mul!(tv, adjoint(R.A), x)
+    return mul!(C, R.B, tv, α, β)
+end
+function LinearAlgebra.mul!(
+        C::AbstractMatrix,
+        Rt::Adjoint{T, <:RkMatrix{T}},
+        X::AbstractMatrix,
+        α::Number = true,
+        β::Number = false,
+    ) where {T <: Number}
+    R = parent(Rt)
+    r = size(R.A, 2)
+    s = size(X, 2)
+    tmp = _rk_tmp!(T, r, s)
+    mul!(tmp, adjoint(R.A), X)
+    return mul!(C, R.B, tmp, α, β)
+end
+
+Base.:*(R::RkMatrix{<:Number}, x::AbstractVector) =
+    mul!(similar(x, eltype(R), size(R, 1)), R, x)
+Base.:*(R::RkMatrix{<:Number}, X::AbstractMatrix) =
+    mul!(similar(X, eltype(R), size(R, 1), size(X, 2)), R, X)
+Base.:*(Rt::Adjoint{<:Number, <:RkMatrix{<:Number}}, x::AbstractVector) =
+    mul!(similar(x, eltype(Rt), size(Rt, 1)), Rt, x)
+Base.:*(Rt::Adjoint{<:Number, <:RkMatrix{<:Number}}, X::AbstractMatrix) =
+    mul!(similar(X, eltype(Rt), size(Rt, 1), size(X, 2)), Rt, X)

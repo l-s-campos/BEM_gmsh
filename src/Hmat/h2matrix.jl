@@ -253,6 +253,20 @@ mutable struct H2Matrix{R, T} <: AbstractStructuredMatrix{T}
     minlvl::Int          # 1-based level index (into tidx.levels)
     alpha::Float64
     n::Int
+    """Reusable matvec buffers (set on first apply)."""
+    workspace::Any
+end
+
+"""Preallocated buffers for H² level-sweep matvec (avoids per-call allocs)."""
+mutable struct H2MatvecWorkspace{T}
+    yproj::Vector{Matrix{T}}   # upward projections per node
+    inter::Vector{Matrix{T}}   # intermediate far coeffs per node
+    u::Matrix{T}               # output accumulator (n × s)
+    stack::Matrix{T}           # child-stack scratch
+    tmp::Matrix{T}             # far-block product scratch
+    xtmp::Matrix{T}            # permuted / scaled X
+    ytmp::Matrix{T}            # permuted Y
+    s::Int                     # current RHS count
 end
 
 Base.size(H::H2Matrix) = (H.n, H.n)
@@ -427,7 +441,7 @@ function assemble_h2(
     end
     return H2Matrix{R, T}(
         tidx, U, skeleton, near, far, Ddiag, Dnear, Bfar,
-        copy(rp), copy(rp), minlvl, α, n,
+        copy(rp), copy(rp), minlvl, α, n, nothing,
     )
 end
 
@@ -631,22 +645,50 @@ end
 
 function LinearAlgebra.mul!(
         y::AbstractVector,
-        H::H2Matrix,
+        H::H2Matrix{R, T},
         x::AbstractVector,
         a::Number = 1,
         b::Number = 0;
         global_index = use_global_index(),
-    )
+    ) where {R, T}
+    n = H.n
+    length(y) == n && length(x) == n || throw(DimensionMismatch())
+    ws = _h2_workspace!(H, 1)
+    # pack X into ws.xtmp (tree-local)
+    xw = view(ws.xtmp, :, 1)
     if global_index
-        x = x[H.colperm]
-        y = permute!(y, H.rowperm)
-        rmul!(x, a)
-    elseif a != 1
-        x = a * x
+        @inbounds for i in 1:n
+            xw[i] = T(a) * x[H.colperm[i]]
+        end
+    elseif a == 1
+        copyto!(xw, x)
+    else
+        @inbounds @simd for i in 1:n
+            xw[i] = T(a) * x[i]
+        end
     end
-    iszero(b) ? fill!(y, zero(eltype(y))) : rmul!(y, b)
-    y .+= _h2_matvec(H, collect(x))
-    global_index && invpermute!(y, H.rowperm)
+    # y work
+    yw = view(ws.ytmp, :, 1)
+    if iszero(b)
+        fill!(yw, zero(T))
+    elseif global_index
+        @inbounds for i in 1:n
+            yw[i] = T(b) * y[H.rowperm[i]]
+        end
+    else
+        @inbounds @simd for i in 1:n
+            yw[i] = T(b) * y[i]
+        end
+    end
+    _h2_matvec_multi!(ws, H, ws.xtmp)
+    yw .+= view(ws.u, :, 1)
+    if global_index
+        @inbounds for i in 1:n
+            y[H.rowperm[i]] = yw[i]
+        end
+    else
+        copyto!(y, yw)
+    end
     return y
 end
 
@@ -656,126 +698,239 @@ function LinearAlgebra.mul!(
         global_index = use_global_index(),
     ) where {R, T}
     size(Y, 2) == size(X, 2) || throw(DimensionMismatch())
-    size(X, 2) == 1 && return mul!(view(Y, :, 1), H, view(X, :, 1), a, b; global_index)
+    size(X, 1) == H.n && size(Y, 1) == H.n || throw(DimensionMismatch())
+    s = size(X, 2)
+    s == 1 && return mul!(view(Y, :, 1), H, view(X, :, 1), a, b; global_index)
 
-    # Blocked multi-RHS: reuse level sweeps with Matrix projections
+    ws = _h2_workspace!(H, s)
+    n = H.n
+    Xp = ws.xtmp
+    Yp = ws.ytmp
     if global_index
-        Xp = Matrix{T}(X[H.colperm, :])
-        rmul!(Xp, a)
-        Yp = iszero(b) ? zeros(T, size(Y, 1), size(Y, 2)) :
-             Matrix{T}(b .* Y[H.rowperm, :])
+        @inbounds for j in 1:s, i in 1:n
+            Xp[i, j] = T(a) * X[H.colperm[i], j]
+        end
+        if iszero(b)
+            fill!(Yp, zero(T))
+        else
+            @inbounds for j in 1:s, i in 1:n
+                Yp[i, j] = T(b) * Y[H.rowperm[i], j]
+            end
+        end
     else
-        Xp = a == 1 ? Matrix{T}(X) : Matrix{T}(a .* X)
-        Yp = iszero(b) ? zeros(T, size(Y, 1), size(Y, 2)) : Matrix{T}(b .* Y)
+        if a == 1
+            copyto!(Xp, X)
+        else
+            @inbounds @simd for i in eachindex(Xp)
+                Xp[i] = T(a) * X[i]
+            end
+        end
+        if iszero(b)
+            fill!(Yp, zero(T))
+        else
+            @inbounds @simd for i in eachindex(Yp)
+                Yp[i] = T(b) * Y[i]
+            end
+        end
     end
-    Yp .+= _h2_matvec_multi(H, Xp)
+    _h2_matvec_multi!(ws, H, Xp)
+    Yp .+= ws.u
     if global_index
-        Y[:, :] .= Yp[invperm(H.rowperm), :]
+        @inbounds for j in 1:s, i in 1:n
+            Y[H.rowperm[i], j] = Yp[i, j]
+        end
     else
-        Y[:, :] .= Yp
+        copyto!(Y, Yp)
     end
     return Y
 end
 
-function _h2_matvec(H::H2Matrix{R, T}, x::Vector{T}) where {R, T}
-    U = _h2_matvec_multi(H, reshape(x, :, 1))
-    return vec(U)
+# ---- workspace --------------------------------------------------------------
+
+function _h2_workspace!(H::H2Matrix{R, T}, s::Int) where {R, T}
+    ws = H.workspace
+    if ws isa H2MatvecWorkspace{T} && ws.s == s && size(ws.u, 1) == H.n
+        fill!(ws.u, zero(T))
+        for M in ws.inter
+            fill!(M, zero(T))
+        end
+        return ws
+    end
+    tidx = H.tidx
+    nnode = length(tidx.nodes)
+    n = H.n
+    yproj = Vector{Matrix{T}}(undef, nnode)
+    inter = Vector{Matrix{T}}(undef, nnode)
+    maxr = 0
+    maxstack = 0
+    for i in 1:nnode
+        ri = size(H.U[i], 2)
+        maxr = max(maxr, ri)
+        yproj[i] = zeros(T, ri, s)
+        inter[i] = zeros(T, ri, s)
+        ch = tidx.children[i]
+        if !isempty(ch)
+            maxstack = max(maxstack, sum(size(H.U[c], 2) for c in ch; init = 0))
+        end
+    end
+    # far blocks may need tmp of size max(rank)×s or leaf size×s
+    tmpr = max(maxr, 64)
+    ws = H2MatvecWorkspace{T}(
+        yproj, inter,
+        zeros(T, n, s),
+        zeros(T, max(maxstack, 1), s),
+        zeros(T, max(tmpr, 1), s),
+        zeros(T, n, s),
+        zeros(T, n, s),
+        s,
+    )
+    H.workspace = ws
+    return ws
 end
 
-"""H² apply for one or many RHS (`X` is `n×s`). Level sweeps use Matrix blocks."""
-function _h2_matvec_multi(H::H2Matrix{R, T}, X::AbstractMatrix{T}) where {R, T}
+"""In-place H² level sweep: `ws.u .+= H * X` with `X` tree-local `n×s`."""
+function _h2_matvec_multi!(ws::H2MatvecWorkspace{T}, H::H2Matrix{R, T}, X::AbstractMatrix{T}) where {R, T}
     tidx = H.tidx
     nnode = length(tidx.nodes)
     n, s = size(X)
-    u = zeros(T, n, s)
-    empty0 = zeros(T, 0, s)
-    yproj = Vector{Matrix{T}}(undef, nnode)
+    u = ws.u
+    yproj = ws.yproj
+    inter = ws.inter
+    # clear projections (inter/u already zeroed in _h2_workspace!)
     for i in 1:nnode
-        yproj[i] = empty0
+        fill!(yproj[i], zero(T))
     end
+
     nlevel = length(tidx.levels)
     minlvl = H.minlvl
+
+    # upward pass
     for lvl in nlevel:-1:minlvl
         for node in tidx.levels[lvl]
             Un = H.U[node]
-            size(Un, 2) == 0 && continue
+            rn = size(Un, 2)
+            rn == 0 && continue
             ch = tidx.children[node]
+            yp = yproj[node]
             if isempty(ch)
                 ir = index_range(tidx.nodes[node])
-                yproj[node] = Un' * view(X, ir, :)
+                mul!(yp, adjoint(Un), view(X, ir, :))
             else
-                stack = reduce(vcat, (yproj[c] for c in ch if size(yproj[c], 1) > 0); init = empty0)
-                size(stack, 1) == size(Un, 1) || continue
-                yproj[node] = Un' * stack
+                # pack children into stack
+                need = size(Un, 1)
+                stack = _h2_stack_view!(ws, need, s)
+                off = 0
+                ok = true
+                for c in ch
+                    rc = size(yproj[c], 1)
+                    rc == 0 && continue
+                    if off + rc > need
+                        ok = false
+                        break
+                    end
+                    copyto!(view(stack, (off + 1):(off + rc), :), yproj[c])
+                    off += rc
+                end
+                ok && off == need || continue
+                mul!(yp, adjoint(Un), view(stack, 1:need, :))
             end
         end
     end
-    inter = [zeros(T, size(H.U[i], 2), s) for i in 1:nnode]
+
+    # far interactions
     for (c1, c2) in H.far
         B = H.Bfar[(c1, c2)]
         d1, d2 = tidx.depth_of[c1], tidx.depth_of[c2]
         if d1 == d2
-            if size(yproj[c2], 1) == size(B, 2)
-                inter[c1] = inter[c1] + B * yproj[c2]
+            if size(yproj[c2], 1) == size(B, 2) && size(inter[c1], 1) == size(B, 1)
+                mul!(inter[c1], B, yproj[c2], true, true)
             end
-            if size(yproj[c1], 1) == size(B, 1)
-                inter[c2] = inter[c2] + B' * yproj[c1]
+            if size(yproj[c1], 1) == size(B, 1) && size(inter[c2], 1) == size(B, 2)
+                mul!(inter[c2], adjoint(B), yproj[c1], true, true)
             end
         elseif d1 > d2
             jr = index_range(tidx.nodes[c2])
-            if size(B, 2) == length(jr)
-                inter[c1] = inter[c1] + B * view(X, jr, :)
+            if size(B, 2) == length(jr) && size(inter[c1], 1) == size(B, 1)
+                mul!(inter[c1], B, view(X, jr, :), true, true)
             end
-            if size(yproj[c1], 1) == size(B, 1)
-                view(u, jr, :) .+= B' * yproj[c1]
+            if size(yproj[c1], 1) == size(B, 1) && size(B, 2) == length(jr)
+                mul!(view(u, jr, :), adjoint(B), yproj[c1], true, true)
             end
         else
             ir = index_range(tidx.nodes[c1])
             if size(B, 1) == length(ir) && size(yproj[c2], 1) == size(B, 2)
-                view(u, ir, :) .+= B * yproj[c2]
+                mul!(view(u, ir, :), B, yproj[c2], true, true)
             end
-            if size(B, 1) == length(ir)
-                inter[c2] = inter[c2] + B' * view(X, ir, :)
+            if size(B, 1) == length(ir) && size(inter[c2], 1) == size(B, 2)
+                mul!(inter[c2], adjoint(B), view(X, ir, :), true, true)
             end
         end
     end
+
+    # downward pass
     for lvl in minlvl:nlevel
         for node in tidx.levels[lvl]
-            size(inter[node], 1) == 0 && continue
-            size(H.U[node], 2) == size(inter[node], 1) || continue
-            contrib = H.U[node] * inter[node]
+            rn = size(inter[node], 1)
+            rn == 0 && continue
+            size(H.U[node], 2) == rn || continue
+            Un = H.U[node]
             ch = tidx.children[node]
             if isempty(ch)
                 ir = index_range(tidx.nodes[node])
-                length(ir) == size(contrib, 1) && (view(u, ir, :) .+= contrib)
+                length(ir) == size(Un, 1) || continue
+                mul!(view(u, ir, :), Un, inter[node], true, true)
             else
-                off = 1
+                need = size(Un, 1)
+                stack = _h2_stack_view!(ws, need, s)
+                mul!(view(stack, 1:need, :), Un, inter[node])
+                off = 0
                 for c in ch
                     rc = size(H.U[c], 2)
                     rc == 0 && continue
-                    chunk = contrib[off:(off + rc - 1), :]
-                    off += rc
                     if size(inter[c], 1) == rc
-                        inter[c] = inter[c] + chunk
-                    elseif size(inter[c], 1) == 0
-                        inter[c] = chunk
+                        view(inter[c], :, :) .+= view(stack, (off + 1):(off + rc), :)
                     end
+                    off += rc
                 end
             end
         end
     end
+
+    # nearfield
     for (i, D) in H.Ddiag
         ir = index_range(tidx.nodes[i])
-        view(u, ir, :) .+= D * view(X, ir, :)
+        mul!(view(u, ir, :), D, view(X, ir, :), true, true)
     end
     for (i, j) in H.near
         D = H.Dnear[(i, j)]
         ir = index_range(tidx.nodes[i])
         jr = index_range(tidx.nodes[j])
-        view(u, ir, :) .+= D * view(X, jr, :)
-        view(u, jr, :) .+= D' * view(X, ir, :)
+        mul!(view(u, ir, :), D, view(X, jr, :), true, true)
+        mul!(view(u, jr, :), adjoint(D), view(X, ir, :), true, true)
     end
     return u
+end
+
+function _h2_stack_view!(ws::H2MatvecWorkspace{T}, rows::Int, s::Int) where {T}
+    if size(ws.stack, 1) < rows || size(ws.stack, 2) < s
+        ws.stack = zeros(T, max(rows, size(ws.stack, 1)), max(s, size(ws.stack, 2)))
+    end
+    return view(ws.stack, 1:rows, 1:s)
+end
+
+# compatibility wrapper (allocates result)
+function _h2_matvec_multi(H::H2Matrix{R, T}, X::AbstractMatrix{T}) where {R, T}
+    ws = _h2_workspace!(H, size(X, 2))
+    copyto!(ws.xtmp, X)
+    _h2_matvec_multi!(ws, H, ws.xtmp)
+    return copy(ws.u)
+end
+
+function _h2_matvec(H::H2Matrix{R, T}, x::AbstractVector{T}) where {R, T}
+    ws = _h2_workspace!(H, 1)
+    copyto!(view(ws.xtmp, :, 1), x)
+    _h2_matvec_multi!(ws, H, ws.xtmp)
+    return vec(copy(ws.u))
 end
 
 function Base.Matrix(H::H2Matrix{R, T}; global_index = true) where {R, T}
@@ -806,6 +961,7 @@ function Base.deepcopy_internal(H::H2Matrix{R, T}, sd::IdDict) where {R, T}
         H.minlvl,
         H.alpha,
         H.n,
+        nothing,  # fresh workspace
     )
     sd[H] = H2
     return H2
