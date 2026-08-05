@@ -25,10 +25,16 @@ function solve(dad::BEMdata{<:Union{Laplace,OrthotropicLaplace}})
     return dad.T
 end
 
-function solve_Hmat(dad::BEMdata{<:Laplace})
+function solve_Hmat(dad::BEMdata{<:Laplace}; Pl=nothing, atol=1e-10, rtol=1e-8, itmax=0)
     A = dad.A
     b = dad.b
-    x, stats = Krylov.gmres(A, b; atol=1e-10, rtol=1e-8, itmax=max(4 * size(A, 1), 200))
+    itm = itmax > 0 ? Int(itmax) : max(4 * size(A, 1), 200)
+    # Prefer hierarchical precond path when available (`gmres_h`); plain GMRES otherwise.
+    if Pl !== nothing || isdefined(HMatrices, :gmres_h)
+        x, stats = HMatrices.gmres_h(A, b; Pl=Pl, atol=atol, rtol=rtol, itmax=itm)
+    else
+        x, stats = Krylov.gmres(A, b; atol=atol, rtol=rtol, itmax=itm)
+    end
     Tfull = zeros(dad.nt)
     qfull = zeros(dad.n)
     Tfull[1:length(x)] .= x

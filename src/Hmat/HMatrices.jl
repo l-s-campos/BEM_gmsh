@@ -16,6 +16,7 @@ using Printf
 using Distributed
 using Base.Threads
 using SparseArrays
+using Krylov
 using GLMakie
 export plot_hmatrix
 
@@ -93,6 +94,7 @@ include("h2_basis.jl")
 include("triangular.jl")
 include("lu.jl")
 include("cholesky.jl")
+include("precond.jl")
 
 export ClusterTree,
     CardinalitySplitter,
@@ -147,6 +149,9 @@ export ClusterTree,
     FunctionSampler,
     KernelMatvecSampler,
     hara,
+    hara_product,
+    add_diag_ridge!,
+    gmres_h,
     assemble_structured,
     anchor_net,
     anchor_net_sample,

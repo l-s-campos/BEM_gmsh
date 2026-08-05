@@ -19,14 +19,18 @@
 | 2026-08-05 | **A6 multi-RHS H/H²** | Blocked leaf GEMM + H² `_h2_matvec_multi` level sweeps |
 | 2026-08-05 | **A4/B factors** | `test/test_hmat_factor.jl` — H LU residual vs dense |
 | 2026-08-05 | **C4 HARA product** | `scripts/hara_product_demo.jl` + test `A(Bv)` |
+| 2026-08-05 | **B4/B5 precond** | `cholesky(H; ridge=)`, `gmres_h`, `hara_product`, `solve_Hmat(; Pl=)` |
+| 2026-08-05 | **HARA via H apply** | `hara_product(A,B,trees)` — no dense `A*B` (large-n path) |
 
-**Still open:** A2 unified compress API, B1 hmul policy docs, B5 GMRES+H precond in main BEM solver, C3 nested-H² HARA, Phase D–F (GPU/MPI).
+**Still open:** A2 unified compress API, B1 hmul policy docs, C3 nested-H² HARA, Phase D BEM wiring polish, Phase E–F (GPU/MPI).
 
 **Verify:**
 ```bash
-julia --project=. -e 'using Test; include("test/test_hmat_algebra.jl"); include("test/test_hmat_factor.jl")'
+julia --project=. -e 'using Test; include("test/test_hmat_algebra.jl"); include("test/test_hmat_factor.jl"); include("test/test_hmat_precond.jl")'
 julia --project=. scripts/hara_product_demo.jl
+julia --project=. scripts/hmat_gmres_precond_demo.jl
 ```
+Demo (n=100): unprecond GMRES ~14 iters → LU/Chol precond **1 iter**.
 
 ---
 
@@ -107,8 +111,8 @@ Make hierarchical matrices a **reliable BEM backend** (assemble → matvec → p
 | B1. Stable `hmul!` recompression | Default compressor policy docs | open |
 | B2. `hadd!(C, A, B, α, β)` | Structured add + TSVD | **yes** |
 | B3. Low-rank update on H | `hlru!(H, X, Y; rtol)` | **yes** |
-| B4. Factor robustness | H LU residual test (SPD kernel) | **partial** |
-| B5. BEM precond path | GMRES + H factor in Solver.jl | open |
+| B4. Factor robustness | LU + Chol + ridge tests | **yes** |
+| B5. BEM precond path | `gmres_h` + `solve_Hmat(; Pl=)` | **yes** |
 | B6. Buffer reuse | alloc audit | open |
 
 **Exit criteria:** Laplace H-mat GMRES with H-LU or H-Chol precond beats unpreconditioned baseline on medium mesh; `hlru!` error test passes. *(`hlru!` test passes; precond path open)*
@@ -301,12 +305,18 @@ Skip until needed: GPU, MPI, full TLR, distributed.
 7. HARA product demo `scripts/hara_product_demo.jl`  
 8. Multi-RHS H / H² matvec (blocked)  
 
-### Slice 4 (next)
+### Slice 4 — **done 2026-08-05**
 
-9. Laplace GMRES + `lu(H)` precond wired in BEM `Solver.jl` / script  
-10. Chol test + ridge option  
-11. Nested-H² HARA only if needed  
-12. Profile / reduce allocs in HARA sampling  
+9. `gmres_h` + `solve_Hmat(; Pl=)` + `scripts/hmat_gmres_precond_demo.jl`  
+10. `cholesky(H; ridge=)` + `add_diag_ridge!` + tests  
+11. `hara_product(A,B,trees)` — HARA from hierarchical applies  
+
+### Slice 5 (next)
+
+12. Nested-H² HARA (only if classic H product ranks blow up)  
+13. Profile / reduce allocs in HARA sampling buffers  
+14. Wire recommended precond into a Laplace H assembly end-to-end example  
+15. Phase E light profiling of multi-RHS H gemv  
 
 ---
 

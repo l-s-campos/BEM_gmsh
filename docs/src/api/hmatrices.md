@@ -45,7 +45,13 @@ hadd!(C, A, B, 1, 1; rtol=1e-6)
 # factors
 F = lu(H; rtol=1e-6)
 x = F \ b
+Fc = cholesky(H; ridge=1e-10, rtol=1e-6)
+
+# GMRES (+ optional hierarchical left precond)
+x, stats = gmres_h(H, b; Pl=F, rtol=1e-8)
 ```
+
+`solve_Hmat(dad; Pl=F)` accepts the same optional `Pl` for Laplace H-systems.
 
 ## HARA (sampler build)
 
@@ -55,14 +61,11 @@ Build a classic `HMatrix` from **matvecs only** (black-box operator):
 S = KernelMatvecSampler(K)
 Hh = hara(S, tree, tree; rtol=1e-3, batch=8)
 
-# product C ≈ A*B without forming C
-Sprod = FunctionSampler(
-    (Y, X) -> mul!(Y, Matrix(A), Matrix(B) * X), n;
-    f_adj! = (Y, X) -> mul!(Y, Matrix(B)', Matrix(A)' * X))
-Hc = hara(Sprod, tree, tree; rtol=1e-3)
+# product C ≈ A*B from hierarchical applies only (no dense A*B)
+Hc = hara_product(A, B, tree, tree; rtol=1e-3, batch=8)
 ```
 
-Demo: `scripts/hara_product_demo.jl`.
+Demos: `scripts/hara_product_demo.jl`, `scripts/hmat_gmres_precond_demo.jl`.
 
 ## H² basis maintenance
 

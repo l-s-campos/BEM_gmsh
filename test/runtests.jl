@@ -395,6 +395,10 @@ ti = time()
         include(joinpath(@__DIR__, "test_hmat_factor.jl"))
     end
 
+    @testset "H-matrix precond / Chol / hara_product" begin
+        include(joinpath(@__DIR__, "test_hmat_precond.jl"))
+    end
+
     @testset "MMM modal smoke" begin
         include(joinpath(@__DIR__, "test_mmm.jl"))
     end
