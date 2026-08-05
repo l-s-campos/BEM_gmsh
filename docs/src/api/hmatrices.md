@@ -22,7 +22,7 @@ kernels). See also the research plan
 pts = # Vector{SVector}
 K = KernelMatrix((x,y) -> ..., pts, pts)
 tree = ClusterTree(pts, PrincipalComponentSplitter(; nmax=32))
-H  = assemble_hmatrix(K, tree, tree; adm=StrongAdmissibilityStd(2),
+H  = assemble_hmatrix(K, tree, tree; adm=StrongAdmissibilityStd(; eta=2),
                       comp=PartialACA(; rtol=1e-6))
 H2 = assemble_h2(K, tree; rtol=1e-6, far_method=:aca, alpha=0.5)
 ```
@@ -31,7 +31,7 @@ H2 = assemble_h2(K, tree; rtol=1e-6, far_method=:aca, alpha=0.5)
 
 ```julia
 y = H * x
-Y = H * X   # multi-RHS
+Y = H * X   # multi-RHS (blocked leaf GEMM / H² level sweeps)
 
 # structured product (classic H)
 hmul!(C, A, B, 1, 0, PartialACA(; rtol=1e-6))
@@ -43,8 +43,8 @@ hlru!(H, X, Y; rtol=1e-6)
 hadd!(C, A, B, 1, 1; rtol=1e-6)
 
 # factors
-F = lu(H, PartialACA(; rtol=1e-6))
-ldiv!(F, b)
+F = lu(H; rtol=1e-6)
+x = F \ b
 ```
 
 ## HARA (sampler build)
@@ -52,11 +52,17 @@ ldiv!(F, b)
 Build a classic `HMatrix` from **matvecs only** (black-box operator):
 
 ```julia
-S = KernelMatvecSampler(K)   # or FunctionSampler(f!, n; f_adj!)
+S = KernelMatvecSampler(K)
 Hh = hara(S, tree, tree; rtol=1e-3, batch=8)
+
+# product C ≈ A*B without forming C
+Sprod = FunctionSampler(
+    (Y, X) -> mul!(Y, Matrix(A), Matrix(B) * X), n;
+    f_adj! = (Y, X) -> mul!(Y, Matrix(B)', Matrix(A)' * X))
+Hc = hara(Sprod, tree, tree; rtol=1e-3)
 ```
 
-Useful for products `v ↦ A(B*v)` without forming `C = A*B`.
+Demo: `scripts/hara_product_demo.jl`.
 
 ## H² basis maintenance
 

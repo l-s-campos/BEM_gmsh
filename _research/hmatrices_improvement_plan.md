@@ -16,10 +16,17 @@
 | 2026-08-05 | **C3 HARA MVP** | `AbstractMatvecSampler`, `FunctionSampler`, `KernelMatvecSampler`, `hara` → classic H (`hara.jl`) |
 | 2026-08-05 | **Docs** | `docs/src/api/hmatrices.md` |
 | 2026-08-05 | **Kernel `mul!`** | Multi-RHS for `KernelMatrix` (HARA speed) |
+| 2026-08-05 | **A6 multi-RHS H/H²** | Blocked leaf GEMM + H² `_h2_matvec_multi` level sweeps |
+| 2026-08-05 | **A4/B factors** | `test/test_hmat_factor.jl` — H LU residual vs dense |
+| 2026-08-05 | **C4 HARA product** | `scripts/hara_product_demo.jl` + test `A(Bv)` |
 
-**Still open:** A1 full inventory polish, A2 unified compress on all leaves, A6 true BLAS-3 multi-RHS H gemv (still column loop), B1/B4/B5 precond path, C2 levelized H² multi-RHS, C3 nested-H² HARA, C4 product demo script, Phase D–F.
+**Still open:** A2 unified compress API, B1 hmul policy docs, B5 GMRES+H precond in main BEM solver, C3 nested-H² HARA, Phase D–F (GPU/MPI).
 
-**Verify:** `julia --project=. -e 'using Test; include("test/test_hmat_algebra.jl")'` — all pass.
+**Verify:**
+```bash
+julia --project=. -e 'using Test; include("test/test_hmat_algebra.jl"); include("test/test_hmat_factor.jl")'
+julia --project=. scripts/hara_product_demo.jl
+```
 
 ---
 
@@ -85,7 +92,7 @@ Make hierarchical matrices a **reliable BEM backend** (assemble → matvec → p
 | A3. Matvec correctness suite | Dense vs H, multi-RHS | `test/test_hmat_algebra.jl` | **yes** |
 | A4. Algebra smoke tests | hlru / hadd / hara / h2 | same | **yes** (hmul/LU still thin) |
 | A5. Diagnostics | `compression_ratio`, `maxrank` | existing | partial |
-| A6. Multi-RHS `mul!` | BLAS-3 path for H | `multiplication.jl` | open (column loop remains) |
+| A6. Multi-RHS `mul!` | Blocked leaf GEMM H + H² multi | `multiplication.jl`, `h2matrix.jl` | **yes** |
 
 **Exit criteria:** CI tests green; known relative matvec error e.g. `< 10× rtol` on fixtures. *(matvec tests green)*
 
@@ -100,8 +107,8 @@ Make hierarchical matrices a **reliable BEM backend** (assemble → matvec → p
 | B1. Stable `hmul!` recompression | Default compressor policy docs | open |
 | B2. `hadd!(C, A, B, α, β)` | Structured add + TSVD | **yes** |
 | B3. Low-rank update on H | `hlru!(H, X, Y; rtol)` | **yes** |
-| B4. Factor robustness | Ridge / SPD Chol tests | open |
-| B5. BEM precond path | GMRES + H factor | open |
+| B4. Factor robustness | H LU residual test (SPD kernel) | **partial** |
+| B5. BEM precond path | GMRES + H factor in Solver.jl | open |
 | B6. Buffer reuse | alloc audit | open |
 
 **Exit criteria:** Laplace H-mat GMRES with H-LU or H-Chol precond beats unpreconditioned baseline on medium mesh; `hlru!` error test passes. *(`hlru!` test passes; precond path open)*
@@ -123,9 +130,9 @@ h2_compress!(H2; rtol, atol, rank)  # recompress far blocks
 
 Implemented in `src/Hmat/h2_basis.jl`. Compress MVP focuses on far blocks (safe nesting).
 
-#### C2. Levelized H² matvec — **open**
+#### C2. Levelized H² matvec — **done (multi-RHS)**
 
-Explicit multi-RHS upsweep/downsweep (still column-loop `mul!` today).
+`_h2_matvec_multi` shares upsweep / far / downsweep / near for `n×s` RHS.
 
 #### C3. Sampler interface + HARA (MVP) — **done (classic H, not nested H²)**
 
@@ -137,22 +144,23 @@ hara(S, rowtree, coltree; rtol, batch, ...) -> HMatrix
 
 File: `src/Hmat/hara.jl`. Randomized range finder per admissible leaf; dense leaves via identity sampling. **Next:** nested-H² HARA if needed.
 
-#### C4. Product without `hmul` on H² — **open**
+#### C4. Product without `hmul` — **done (demo)**
 
 ```julia
 sampler = FunctionSampler((Y,X) -> mul!(Y, A, B*X), n; f_adj! = ...)
 H = hara(sampler, tree, tree; rtol=…)
 ```
 
-Pattern supported; dedicated demo script still open.
+Script: `scripts/hara_product_demo.jl`.
 
-#### C5. Tests — **partial**
+#### C5. Tests — **done for MVP**
 
 - HARA vs dense matvec — yes  
 - h2_orthog preserves matvec — yes  
-- Product `A*B` via HARA — open  
+- Product `A*B` via HARA — yes  
+- H LU + multi-RHS — yes  
 
-**Exit criteria:** HARA matvec error controlled by `rtol` *(classic H: yes)*; product demo open.
+**Exit criteria:** HARA matvec error controlled by `rtol` *(classic H: yes)*; product demo green.
 
 **BEM payoff:** black-box recompression path ready; wire into FMM/product next.
 
@@ -287,13 +295,18 @@ Skip until needed: GPU, MPI, full TLR, distributed.
 4. `h2_orthog!` / `h2_compress!` in `h2_basis.jl`  
 5. `AbstractMatvecSampler` + `hara` MVP (classic H) in `hara.jl`  
 
-### Slice 3 (next)
+### Slice 3 — **done 2026-08-05**
 
-6. `test_hmat_factor.jl` — LU/Chol residual  
-7. Laplace GMRES + `lu(H)` precond script  
-8. HARA product demo `v ↦ A(Bv)`  
-9. Improve multi-RHS H/`H2` matvec (optional BLAS-3)  
-10. Nested-H² HARA only if classic HARA insufficient  
+6. `test_hmat_factor.jl` — LU residual + multi-RHS + HARA product  
+7. HARA product demo `scripts/hara_product_demo.jl`  
+8. Multi-RHS H / H² matvec (blocked)  
+
+### Slice 4 (next)
+
+9. Laplace GMRES + `lu(H)` precond wired in BEM `Solver.jl` / script  
+10. Chol test + ridge option  
+11. Nested-H² HARA only if needed  
+12. Profile / reduce allocs in HARA sampling  
 
 ---
 

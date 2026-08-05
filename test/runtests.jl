@@ -391,6 +391,10 @@ ti = time()
         include(joinpath(@__DIR__, "test_hmat_algebra.jl"))
     end
 
+    @testset "H-matrix factor / multi-RHS / HARA product" begin
+        include(joinpath(@__DIR__, "test_hmat_factor.jl"))
+    end
+
     @testset "MMM modal smoke" begin
         include(joinpath(@__DIR__, "test_mmm.jl"))
     end

@@ -17,6 +17,17 @@ function (adm::H2BoxAdmissibility)(a::ClusterTree, b::ClusterTree)
     return _boxes_admissible(container(a), container(b), adm.alpha)
 end
 
+# Expanded (block-DOF) trees: admissibility is purely geometric
+function (adm::H2BoxAdmissibility)(a::ExpandedClusterTree, b::ExpandedClusterTree)
+    return _boxes_admissible(container(a), container(b), adm.alpha)
+end
+function (adm::H2BoxAdmissibility)(a::ExpandedClusterTree, b::ClusterTree)
+    return _boxes_admissible(container(a), container(b), adm.alpha)
+end
+function (adm::H2BoxAdmissibility)(a::ClusterTree, b::ExpandedClusterTree)
+    return _boxes_admissible(container(a), container(b), adm.alpha)
+end
+
 function _boxes_admissible(box1::HyperRectangle{N}, box2::HyperRectangle{N}, α::Float64) where {N}
     # Port of H2Pack isadmissible_box (L∞ separation with scale α)
     c1 = low_corner(box1)
@@ -126,6 +137,9 @@ end
 Proxy surface point sets for each tree depth (index `d` = depth from root,
 depth 0 unused). Same geometry at a given level for all boxes of equal size.
 """
+proxy_points_per_level(tree::ExpandedClusterTree, alpha::Float64; nsample::Int=200) =
+    proxy_points_per_level(tree.tree, alpha; nsample=nsample)
+
 function proxy_points_per_level(
         tree::ClusterTree{N, T},
         alpha::Float64;
@@ -218,7 +232,9 @@ end
   `(∑ r_child)×r` at non-leaves)
 - `skeleton[i]`: skeleton index set (absolute local ordering)
 - `B[(i,j)]`: far-field coupling (skeleton–skeleton)
-- `Ddiag` / `Dnear`: dense near-field blocks
+- `Ddiag` / `Dnear`: **always dense** near-field blocks
+- `Bfar`: far couplings — dense `Matrix` or low-rank [`RkMatrix`](@ref)
+  when assembled with `far_method=:aca`
 
 Build with [`assemble_h2`](@ref). Matvec uses the classical up / intermediate /
 down sweeps of H2Pack.
@@ -231,7 +247,7 @@ mutable struct H2Matrix{R, T} <: AbstractStructuredMatrix{T}
     far::Vector{Tuple{Int, Int}}
     Ddiag::Dict{Int, Matrix{T}}
     Dnear::Dict{Tuple{Int, Int}, Matrix{T}}
-    Bfar::Dict{Tuple{Int, Int}, Matrix{T}}
+    Bfar::Dict{Tuple{Int, Int}, Any}   # Matrix{T} or RkMatrix{T}
     rowperm::Vector{Int}
     colperm::Vector{Int}
     minlvl::Int          # 1-based level index (into tidx.levels)
@@ -270,10 +286,20 @@ end
 # Assembly
 # =============================================================================
 
+"""Block size encoded by the cluster tree (`1` for points, `p` for `expand_tree`)."""
+h2_blocksize(::ClusterTree) = 1
+h2_blocksize(t::ExpandedClusterTree) = t.p
+
 """
     assemble_h2([T,], K, tree; kwargs...)
 
 Assemble a square [`H2Matrix`](@ref) with the proxy-point ID method.
+
+Supports:
+- scalar `KernelMatrix` on a plain [`ClusterTree`](@ref)
+- block / vectorial kernels via [`ScalarizedMatrix`](@ref) on
+  [`expand_tree`](@ref)`(tree, p)` (e.g. 2D Kelvin): each proxy contributes
+  `p` sample columns (unit loads in each Cartesian direction)
 
 # Keywords
 - `alpha=1.0`: box-admissibility parameter (H2Pack)
@@ -282,6 +308,11 @@ Assemble a square [`H2Matrix`](@ref) with the proxy-point ID method.
 - `adm=H2BoxAdmissibility(alpha)`: admissibility predicate on cluster pairs
 - `global_index=true`: permute `K` into the tree ordering
 - `symmetric=true`: store only upper far/near pairs and apply transpose in matvec
+- `far_method=:dense | :aca`: how to store **far** coupling blocks `B`.
+  Near-field (`Ddiag`, `Dnear`) is **always dense**.
+  `:aca` runs **partial ACA on the fly** (entry samples only — never builds the
+  full dense far block) and stores an [`RkMatrix`](@ref).
+- `comp=PartialACA(;rtol)`: compressor for `far_method=:aca`
 """
 function assemble_h2(
         ::Type{T},
@@ -294,6 +325,8 @@ function assemble_h2(
         adm = nothing,
         global_index = use_global_index(),
         symmetric = true,
+        far_method::Symbol = :dense,
+        comp = nothing,
     ) where {T, R}
     α = Float64(alpha)
     adm_fun = isnothing(adm) ? H2BoxAdmissibility(α) : adm
@@ -302,13 +335,14 @@ function assemble_h2(
     tidx = H2TreeIndex(tree)
     nnode = length(tidx.nodes)
     n = length(tree)
+    pblk = h2_blocksize(tree)
     U = [zeros(T, 0, 0) for _ in 1:nnode]
     skeleton = [Int[] for _ in 1:nnode]
     # initial leaf skeletons = full cluster index ranges
     for i in tidx.leafnodes
         skeleton[i] = collect(index_range(tidx.nodes[i]))
     end
-    # proxy points per depth
+    # proxy points per depth (geometry from underlying point tree if expanded)
     Yp_level = proxy_points_per_level(tree, α; nsample)
     # bottom-up ID compression
     nlevel = length(tidx.levels)
@@ -325,14 +359,20 @@ function assemble_h2(
             ctr = center(box)
             d = tidx.depth_of[node]
             Yrel = Yp_level[min(d + 1, length(Yp_level))]
-            # sample block: K(cluster_pts, proxy_abs)
             pts = root_elements(tree)
-            A_sam = Matrix{T}(undef, length(cand), length(Yrel))
-            for (jj, yr) in enumerate(Yrel)
-                yp = ctr .+ yr   # yr already scaled; centered form: ctr + offset
-                # Yp_level stores offsets from origin-scaled cube; use as offset from ctr
-                for (ii, gi) in enumerate(cand)
-                    A_sam[ii, jj] = _kernel_eval(K, gi, yp, pts)
+            # Each proxy × each of pblk load directions → sample columns
+            ncol = length(Yrel) * pblk
+            A_sam = Matrix{T}(undef, length(cand), max(ncol, 0))
+            if ncol > 0
+                jj = 0
+                for yr in Yrel
+                    yp = ctr .+ yr
+                    for b in 1:pblk
+                        jj += 1
+                        @inbounds for (ii, gi) in enumerate(cand)
+                            A_sam[ii, jj] = h2_proxy_entry(K, gi, yp, b, pts, pblk)
+                        end
+                    end
                 end
             end
             # if Yrel empty (root), skip compression
@@ -350,10 +390,14 @@ function assemble_h2(
     near, far = _h2_block_partition(tidx, adm_fun; symmetric)
     minlvl = isempty(far) ? nlevel :
              minimum(min(tidx.depth_of[i], tidx.depth_of[j]) for (i, j) in far) + 1
-    # dense near-field + far couplings
+    far_method in (:dense, :aca) || throw(ArgumentError(
+        "far_method must be :dense or :aca; got $far_method"))
+    aca = far_method === :aca ? something(comp, PartialACA(; rtol=float(rtol), rank=rank)) : nothing
+
+    # Near-field: always dense (leaf self + inadmissible pairs)
     Ddiag = Dict{Int, Matrix{T}}()
     Dnear = Dict{Tuple{Int, Int}, Matrix{T}}()
-    Bfar = Dict{Tuple{Int, Int}, Matrix{T}}()
+    Bfar = Dict{Tuple{Int, Int}, Any}()
     for i in tidx.leafnodes
         ir = index_range(tidx.nodes[i])
         D = Matrix{T}(undef, length(ir), length(ir))
@@ -367,25 +411,19 @@ function assemble_h2(
         getblock!(D, K, ir, jr)
         Dnear[(i, j)] = D
     end
+    # Far couplings: dense fill OR on-the-fly ACA (no full dense intermediate)
     for (i, j) in far
         di, dj = tidx.depth_of[i], tidx.depth_of[j]
         if di == dj
             Ii, Ij = skeleton[i], skeleton[j]
-            B = Matrix{T}(undef, length(Ii), length(Ij))
-            _getblock_idx!(B, K, Ii, Ij)
         elseif di > dj
-            # j is coarser leaf-side: compress only i
             Ii = skeleton[i]
-            jr = collect(index_range(tidx.nodes[j]))
-            B = Matrix{T}(undef, length(Ii), length(jr))
-            _getblock_idx!(B, K, Ii, jr)
+            Ij = collect(index_range(tidx.nodes[j]))
         else
-            ir = collect(index_range(tidx.nodes[i]))
+            Ii = collect(index_range(tidx.nodes[i]))
             Ij = skeleton[j]
-            B = Matrix{T}(undef, length(ir), length(Ij))
-            _getblock_idx!(B, K, ir, Ij)
         end
-        Bfar[(i, j)] = B
+        Bfar[(i, j)] = _h2_far_block(K, Ii, Ij, T, aca)
     end
     return H2Matrix{R, T}(
         tidx, U, skeleton, near, far, Ddiag, Dnear, Bfar,
@@ -393,33 +431,134 @@ function assemble_h2(
     )
 end
 
+# ---------------------------------------------------------------------------
+# Far-block assembly: dense entry fill OR partial ACA (entry samples only)
+# ---------------------------------------------------------------------------
+
+"""
+View of `parent[I[i], J[j]]` as an `m×n` matrix without copying.
+Used so [`PartialACA`](@ref) can pivot through arbitrary (non-contiguous)
+skeleton index lists without assembling the full block first.
+"""
+struct _IndexMapMatrix{T, PK} <: AbstractMatrix{T}
+    parent::PK
+    I::Vector{Int}
+    J::Vector{Int}
+end
+_IndexMapMatrix(parent, I::Vector{Int}, J::Vector{Int}) =
+    _IndexMapMatrix{eltype(parent), typeof(parent)}(parent, I, J)
+
+Base.size(M::_IndexMapMatrix) = (length(M.I), length(M.J))
+Base.IndexStyle(::Type{<:_IndexMapMatrix}) = IndexCartesian()
+@inline Base.getindex(M::_IndexMapMatrix, i::Int, j::Int) = M.parent[M.I[i], M.J[j]]
+
+function getblock!(out, M::_IndexMapMatrix, irange_, jrange_)
+    irange = irange_ isa Colon ? axes(M, 1) : irange_
+    jrange = jrange_ isa Colon ? axes(M, 2) : jrange_
+    @inbounds for (jloc, j) in enumerate(jrange), (iloc, i) in enumerate(irange)
+        out[iloc, jloc] = M.parent[M.I[i], M.J[j]]
+    end
+    return out
+end
+
+function getblock!(out, Madj::Adjoint{<:Any,<:_IndexMapMatrix}, irange_, j::Int)
+    M = parent(Madj)
+    # column j of M' = row j of M → parent[I[j], J[irange]]
+    irange = irange_ isa Colon ? axes(Madj, 1) : irange_
+    @inbounds for (iloc, i) in enumerate(irange)
+        out[iloc] = conj(M.parent[M.I[j], M.J[i]])
+    end
+    return out
+end
+
+"""
+Build far block `K[I,J]`.
+- `aca === nothing`: dense entry loop (still no preallocated full-matrix path beyond the block itself).
+- `aca::PartialACA`: **on-the-fly** partial ACA via [`_IndexMapMatrix`](@ref) — only pivots/crosses are evaluated.
+"""
+function _h2_far_block(K, I, J, ::Type{T}, aca) where {T}
+    I = I isa Vector{Int} ? I : collect(Int, I)
+    J = J isa Vector{Int} ? J : collect(Int, J)
+    m, n = length(I), length(J)
+    (m == 0 || n == 0) && return zeros(T, m, n)
+
+    if aca === nothing
+        B = Matrix{T}(undef, m, n)
+        _getblock_idx!(B, K, I, J)
+        return B
+    end
+
+    # Partial ACA samples K[I[·], J[·]] only at pivot rows/cols — never fills m×n first
+    W = _IndexMapMatrix(K, I, J)
+    return aca(W, 1:m, 1:n)
+end
+
 function assemble_h2(K::AbstractMatrix, tree; kwargs...)
     return assemble_h2(eltype(K), K, tree; kwargs...)
 end
 
 """
-Evaluate kernel between tree-local point `pts[i]` and proxy point `yp`.
-`pts` are `root_elements(tree)` in the cluster local ordering.
+    h2_proxy_entry(K, i, yp, b, pts, p) -> Number
+
+Free-space sample for H² nested-basis construction.
+
+- `i`: row index in **K's current ordering** (tree-local after `PermutedMatrix`)
+- `yp`: proxy source location (geometry)
+- `b`: load direction `1:p` (always `1` for scalar kernels)
+- `pts`: `root_elements(tree)` — geometric points in underlying local order
+- `p`: block size (`h2_blocksize(tree)`)
+
+Scalar `KernelMatrix` uses `f(pts[i], yp)`. Block kernels
+([`ScalarizedMatrix`](@ref) of `SMatrix{p,p}`) use
+[`h2_proxy_block`](@ref) on the parent block matrix.
 """
-function _kernel_eval(K::PermutedMatrix{<:KernelMatrix}, i::Int, yp, pts)
-    return K.data.f(pts[i], yp)
+function h2_proxy_entry end
+
+# ---- scalar KernelMatrix (geometry via pts; local index i) ----
+function h2_proxy_entry(K::KernelMatrix, i::Int, yp, b::Int, pts, p::Int)
+    p == 1 && b == 1 || throw(ArgumentError("scalar KernelMatrix expects p=b=1"))
+    return float(K.f(pts[i], yp))
 end
 
-function _kernel_eval(K::KernelMatrix, i::Int, yp, pts)
-    return K.f(pts[i], yp)
+function h2_proxy_entry(K::PermutedMatrix{<:KernelMatrix}, i::Int, yp, b::Int, pts, p::Int)
+    # geometric: pts already in tree-local order; f ignores global index
+    return h2_proxy_entry(K.data, i, yp, b, pts, p)
 end
 
-function _kernel_eval(K::PermutedMatrix, i::Int, yp, pts)
-    # generic permuted matrix: evaluate underlying if it is a KernelMatrix
-    return _kernel_eval(K.data, i, yp, pts)
+# ---- block / ScalarizedMatrix (DOF index → point + component) ----
+function h2_proxy_entry(S::ScalarizedMatrix{<:Any,T,p0,q0}, i_dof::Int, yp, b::Int, pts, p::Int) where {T,p0,q0}
+    p == p0 || throw(DimensionMismatch("tree blocksize p=$p ≠ matrix p=$p0"))
+    1 <= b <= p0 || throw(BoundsError(1:p0, b))
+    ib, a = block_index(i_dof, p0)
+    return float(h2_proxy_block(parent(S), ib, a, yp, b))
 end
 
-function _kernel_eval(K, i::Int, yp, pts)
+function h2_proxy_entry(K::PermutedMatrix{<:ScalarizedMatrix}, i::Int, yp, b::Int, pts, p::Int)
+    # map tree-local DOF → original DOF index into ScalarizedMatrix
+    return h2_proxy_entry(K.data, K.rowperm[i], yp, b, pts, p)
+end
+
+function h2_proxy_entry(K::PermutedMatrix, i::Int, yp, b::Int, pts, p::Int)
+    return h2_proxy_entry(K.data, K.rowperm[i], yp, b, pts, p)
+end
+
+"""
+    h2_proxy_block(Kblock, i_point, a, yp, b) -> Number
+
+Entry `U[a,b](x_i, yp)` of a point-indexed block kernel at field point index
+`i_point` and proxy source `yp`, for use in H² sampling.
+
+Define this for custom block kernels (e.g. Kelvin `SMatrix{2,2}`).
+"""
+function h2_proxy_block(Kblock, i_point::Int, a::Int, yp, b::Int)
     throw(ArgumentError(
-        "H2 proxy assembly requires a KernelMatrix (got $(typeof(K))); " *
-        "use KernelMatrix(f, X, Y) so proxies can be evaluated directly",
+        "H2 block proxy eval not defined for $(typeof(Kblock)); " *
+        "implement h2_proxy_block(K, i_point, a, yp, b) or use a KernelMatrix",
     ))
 end
+
+# backward-compatible aliases
+_kernel_eval(K, i::Int, yp, pts) = h2_proxy_entry(K, i, yp, 1, pts, 1)
 
 function _getblock_idx!(B::Matrix{T}, K, I::Vector{Int}, J::Vector{Int}) where {T}
     @inbounds for jj in eachindex(J), ii in eachindex(I)
@@ -512,24 +651,47 @@ function LinearAlgebra.mul!(
 end
 
 function LinearAlgebra.mul!(
-        Y::AbstractMatrix, H::H2Matrix, X::AbstractMatrix,
-        a::Number = 1, b::Number = 0; kwargs...,
-    )
+        Y::AbstractMatrix, H::H2Matrix{R, T}, X::AbstractMatrix,
+        a::Number = 1, b::Number = 0;
+        global_index = use_global_index(),
+    ) where {R, T}
     size(Y, 2) == size(X, 2) || throw(DimensionMismatch())
-    @inbounds for k in 1:size(Y, 2)
-        mul!(view(Y, :, k), H, view(X, :, k), a, b; kwargs...)
+    size(X, 2) == 1 && return mul!(view(Y, :, 1), H, view(X, :, 1), a, b; global_index)
+
+    # Blocked multi-RHS: reuse level sweeps with Matrix projections
+    if global_index
+        Xp = Matrix{T}(X[H.colperm, :])
+        rmul!(Xp, a)
+        Yp = iszero(b) ? zeros(T, size(Y, 1), size(Y, 2)) :
+             Matrix{T}(b .* Y[H.rowperm, :])
+    else
+        Xp = a == 1 ? Matrix{T}(X) : Matrix{T}(a .* X)
+        Yp = iszero(b) ? zeros(T, size(Y, 1), size(Y, 2)) : Matrix{T}(b .* Y)
+    end
+    Yp .+= _h2_matvec_multi(H, Xp)
+    if global_index
+        Y[:, :] .= Yp[invperm(H.rowperm), :]
+    else
+        Y[:, :] .= Yp
     end
     return Y
 end
 
 function _h2_matvec(H::H2Matrix{R, T}, x::Vector{T}) where {R, T}
+    U = _h2_matvec_multi(H, reshape(x, :, 1))
+    return vec(U)
+end
+
+"""H² apply for one or many RHS (`X` is `n×s`). Level sweeps use Matrix blocks."""
+function _h2_matvec_multi(H::H2Matrix{R, T}, X::AbstractMatrix{T}) where {R, T}
     tidx = H.tidx
     nnode = length(tidx.nodes)
-    u = zeros(T, length(x))
-    # --- upward: y_i = U_i' * (x or child y) ---
+    n, s = size(X)
+    u = zeros(T, n, s)
+    empty0 = zeros(T, 0, s)
     yproj = Vector{Matrix{T}}(undef, nnode)
     for i in 1:nnode
-        yproj[i] = zeros(T, 0, 1)
+        yproj[i] = empty0
     end
     nlevel = length(tidx.levels)
     minlvl = H.minlvl
@@ -540,16 +702,15 @@ function _h2_matvec(H::H2Matrix{R, T}, x::Vector{T}) where {R, T}
             ch = tidx.children[node]
             if isempty(ch)
                 ir = index_range(tidx.nodes[node])
-                yproj[node] = Un' * reshape(view(x, ir), :, 1)
+                yproj[node] = Un' * view(X, ir, :)
             else
-                stack = reduce(vcat, (yproj[c] for c in ch if size(yproj[c], 1) > 0); init = zeros(T, 0, 1))
+                stack = reduce(vcat, (yproj[c] for c in ch if size(yproj[c], 1) > 0); init = empty0)
                 size(stack, 1) == size(Un, 1) || continue
                 yproj[node] = Un' * stack
             end
         end
     end
-    # --- intermediate far field ---
-    inter = [zeros(T, size(H.U[i], 2), 1) for i in 1:nnode]
+    inter = [zeros(T, size(H.U[i], 2), s) for i in 1:nnode]
     for (c1, c2) in H.far
         B = H.Bfar[(c1, c2)]
         d1, d2 = tidx.depth_of[c1], tidx.depth_of[c2]
@@ -561,25 +722,23 @@ function _h2_matvec(H::H2Matrix{R, T}, x::Vector{T}) where {R, T}
                 inter[c2] = inter[c2] + B' * yproj[c1]
             end
         elseif d1 > d2
-            # compress only c1; c2 full leaf vector
             jr = index_range(tidx.nodes[c2])
             if size(B, 2) == length(jr)
-                inter[c1] = inter[c1] + B * reshape(view(x, jr), :, 1)
+                inter[c1] = inter[c1] + B * view(X, jr, :)
             end
             if size(yproj[c1], 1) == size(B, 1)
-                view(u, jr) .+= vec(B' * yproj[c1])
+                view(u, jr, :) .+= B' * yproj[c1]
             end
         else
             ir = index_range(tidx.nodes[c1])
             if size(B, 1) == length(ir) && size(yproj[c2], 1) == size(B, 2)
-                view(u, ir) .+= vec(B * yproj[c2])
+                view(u, ir, :) .+= B * yproj[c2]
             end
             if size(B, 1) == length(ir)
-                inter[c2] = inter[c2] + B' * reshape(view(x, ir), :, 1)
+                inter[c2] = inter[c2] + B' * view(X, ir, :)
             end
         end
     end
-    # --- downward: U * inter ---
     for lvl in minlvl:nlevel
         for node in tidx.levels[lvl]
             size(inter[node], 1) == 0 && continue
@@ -588,9 +747,8 @@ function _h2_matvec(H::H2Matrix{R, T}, x::Vector{T}) where {R, T}
             ch = tidx.children[node]
             if isempty(ch)
                 ir = index_range(tidx.nodes[node])
-                length(ir) == size(contrib, 1) && (view(u, ir) .+= vec(contrib))
+                length(ir) == size(contrib, 1) && (view(u, ir, :) .+= contrib)
             else
-                # split among children by their U ranks
                 off = 1
                 for c in ch
                     rc = size(H.U[c], 2)
@@ -606,17 +764,16 @@ function _h2_matvec(H::H2Matrix{R, T}, x::Vector{T}) where {R, T}
             end
         end
     end
-    # --- dense near field ---
     for (i, D) in H.Ddiag
         ir = index_range(tidx.nodes[i])
-        view(u, ir) .+= D * view(x, ir)
+        view(u, ir, :) .+= D * view(X, ir, :)
     end
     for (i, j) in H.near
         D = H.Dnear[(i, j)]
         ir = index_range(tidx.nodes[i])
         jr = index_range(tidx.nodes[j])
-        view(u, ir) .+= D * view(x, jr)
-        view(u, jr) .+= D' * view(x, ir)
+        view(u, ir, :) .+= D * view(X, jr, :)
+        view(u, jr, :) .+= D' * view(X, ir, :)
     end
     return u
 end

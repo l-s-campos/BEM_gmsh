@@ -452,20 +452,52 @@ function LinearAlgebra.mul!(
     return y
 end
 
-# FIXME: for matrix multiplication, we slice into columns and call the gemv
-# routine. This is a somewhat inneficient way of doing things, but it is simple
-# enough.
+"""
+    mul!(Y, H, X, a, b; global_index, threads)
+
+Multi-RHS apply: `Y ← a*H*X + b*Y` with `X,Y` matrices (blocked leaf GEMM).
+"""
 function LinearAlgebra.mul!(
         Y::AbstractMatrix,
-        A::HTypes,
+        A::Union{HTypes, HTriangular},
         X::AbstractMatrix,
         a::Number = 1,
         b::Number = 0;
-        kwargs...,
+        global_index = use_global_index(),
+        threads = use_threads(),
     )
-    size(Y, 2) == size(X, 2) || Throw(DimensionMismatch("size(Y,2) != size(X,2)"))
-    for k in 1:size(Y, 2)
-        mul!(view(Y, :, k), A, view(X, :, k), a, b; kwargs...)
+    size(Y, 2) == size(X, 2) || throw(DimensionMismatch("size(Y,2) != size(X,2)"))
+    size(Y, 1) == size(A, 1) || throw(DimensionMismatch("size(Y,1) != size(A,1)"))
+    size(X, 1) == size(A, 2) || throw(DimensionMismatch("size(X,1) != size(A,2)"))
+
+    # single RHS → specialized vector path
+    if size(X, 2) == 1
+        mul!(view(Y, :, 1), A, view(X, :, 1), a, b; global_index=global_index, threads=threads)
+        return Y
+    end
+
+    if global_index
+        Xp = Matrix(X[colperm(A), :])
+        rmul!(Xp, a)
+        Yp = Matrix(Y[rowperm(A), :])
+        iszero(b) ? fill!(Yp, zero(eltype(Yp))) : rmul!(Yp, b)
+    else
+        Xp = a == 1 ? X : a * X
+        Yp = Y
+        iszero(b) ? fill!(Yp, zero(eltype(Yp))) : rmul!(Yp, b)
+    end
+
+    offset = pivot(A) .- 1
+    # multi-RHS: recursive blocked GEMM (thread path optional)
+    if threads && size(Xp, 2) == 1 && Yp isa AbstractVector
+        _hgemv_threads!(Yp, Xp, leaves(A), offset)
+    else
+        _hgemv_recursive!(Yp, A, Xp, offset)
+    end
+
+    if global_index
+        invp = invperm(rowperm(A))
+        Y[:, :] .= Yp[invp, :]
     end
     return Y
 end
@@ -474,17 +506,20 @@ end
     _hgemv_recursive!(C,A,B,offset)
 
 Internal function used to compute `C[I] <-- C[I] + A*B[J]` where `I =
-rowrange(A) - offset[1]` and `J = rowrange(B) - offset[2]`.
+rowrange(A) - offset[1]` and `J = colrange(A) - offset[2]`.
 
-The `offset` argument is used on the caller side to signal if the original
-hierarchical matrix had a `pivot` other than `(1,1)`.
+Works for `B` / `C` vectors **or** multi-RHS matrices (blocked GEMM at leaves).
 """
-function _hgemv_recursive!(C::AbstractVector, A::HTypes, B::AbstractVector, offset)
+function _hgemv_recursive!(C::AbstractVecOrMat, A::HTypes, B::AbstractVecOrMat, offset)
     if isleaf(A)
         irange = rowrange(A) .- offset[1]
         jrange = colrange(A) .- offset[2]
         d = data(A)
-        mul!(view(C, irange), d, view(B, jrange), 1, 1)
+        if C isa AbstractVector
+            mul!(view(C, irange), d, view(B, jrange), 1, 1)
+        else
+            mul!(view(C, irange, :), d, view(B, jrange, :), 1, 1)
+        end
     else
         for block in children(A)
             _hgemv_recursive!(C, block, B, offset)
@@ -493,25 +528,34 @@ function _hgemv_recursive!(C::AbstractVector, A::HTypes, B::AbstractVector, offs
     return C
 end
 
-function _hgemv_threads!(C::AbstractVector, B::AbstractVector, leaves, offset)
+function _hgemv_threads!(C::AbstractVecOrMat, B::AbstractVecOrMat, leaves_, offset)
     acc = Threads.Atomic{Int}(1)
     lck = ReentrantLock()
-    # spawn np workers to assemble the leaves in parallel
     np = Threads.nthreads()
-    nl = length(leaves)
+    nl = length(leaves_)
+    multi = C isa AbstractMatrix
     @sync for _ in 1:np
         Threads.@spawn begin
-            buf = zero(C)
+            buf = multi ? zeros(eltype(C), size(C, 1), size(C, 2)) : zero(C)
             while true
                 i = Threads.atomic_add!(acc, 1)
                 i > nl && break
-                leaf = leaves[i]
+                leaf = leaves_[i]
                 irange = rowrange(leaf) .- offset[1]
                 jrange = colrange(leaf) .- offset[2]
-                mul!(view(buf, irange), data(leaf), view(B, jrange), 1, 1)
+                if multi
+                    mul!(view(buf, irange, :), data(leaf), view(B, jrange, :), 1, 1)
+                else
+                    mul!(view(buf, irange), data(leaf), view(B, jrange), 1, 1)
+                end
             end
-            # add the local buffer to the global buffer
-            @lock lck axpy!(true, buf, C)
+            @lock lck begin
+                if multi
+                    C .+= buf
+                else
+                    axpy!(true, buf, C)
+                end
+            end
         end
     end
     return C
