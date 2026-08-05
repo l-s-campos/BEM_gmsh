@@ -57,6 +57,40 @@ end
     @test size(V, 2) == size(H2.U[lid], 2)
 end
 
+@testset "nested lrdecomp_h2node (H2Lib)" begin
+    pts = _pts(8)
+    K = KernelMatrix(pts, pts) do x, y
+        d2 = sum(abs2, x - y)
+        return exp(-6 * d2) + (d2 < 1e-30 ? 3.0 : 0.0)
+    end
+    tree = ClusterTree(pts, PrincipalComponentSplitter(; nmax=12))
+    H2 = assemble_h2(K, tree; rtol=1e-5, far_method=:aca,
+        comp=PartialACA(; rtol=1e-5), alpha=0.5, symmetric=true)
+    n = length(pts)
+    b = randn(n)
+
+    root = h2_repackage(H2)
+    F = lrdecomp_h2node(root)
+    @test F isa H2NodeLU
+    x = F \ copy(b)
+    r = norm(H2 * x - b) / (norm(b) + 1e-14)
+    @test r < 5e-3
+
+    # flat API method=:nested
+    out = lrdecomp_h2matrix(H2; method=:nested)
+    @test out.F isa H2NodeLU
+    x2 = lrsolve_h2matrix(out, b)
+    @test norm(H2 * x2 - b) / (norm(b) + 1e-14) < 5e-3
+
+    F3 = lu(H2; method=:nested)
+    @test F3 isa H2NodeLU
+    x3 = F3 \ copy(b)
+    @test norm(H2 * x3 - b) / (norm(b) + 1e-14) < 5e-3
+
+    xd = Matrix(K) \ b
+    @test norm(x - xd) / (norm(xd) + 1e-14) < 5e-2
+end
+
 @testset "h2_repackage sons layout" begin
     pts = _pts(6)
     K = KernelMatrix(pts, pts) do x, y

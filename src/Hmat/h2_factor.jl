@@ -181,12 +181,18 @@ function lrdecomp_h2matrix(
         lu_rank = nothing,
         adm = nothing,
     )
+    # True nested LR on recursive H2Node (H2Lib lrdecomp_h2matrix)
+    if method === :nested
+        return lrdecomp_h2matrix_nested(H2; rtol = rtol)
+    end
+    # Practical path: H² → H → hierarchical LU
+    conv = method === :hara ? :hara : :block
     H = h2_to_hmatrix(
         H2;
         rtol = rtol,
         atol = atol,
         rank = rank,
-        method = method,
+        method = conv,
         batch = batch,
         threads = threads,
         adm = adm,
@@ -195,7 +201,7 @@ function lrdecomp_h2matrix(
     fatol = something(lu_atol, atol)
     frank = something(lu_rank, rank)
     F = lu!(H; rtol = frtol, atol = fatol, rank = frank, threads = threads)
-    return (; L = F.L, U = F.U, F = F, H = H)
+    return (; L = F.L, U = F.U, F = F, H = H, method = conv)
 end
 
 """
@@ -205,8 +211,7 @@ Solve `A x ≈ b` given `F` from [`lrdecomp_h2matrix`](@ref) or [`lu`](@ref) on 
 """
 function lrsolve_h2matrix(F::NamedTuple, b::AbstractVector; global_index = true)
     x = copy(b)
-    ldiv!(F.F, x; global_index = global_index)
-    return x
+    return lrsolve_h2matrix(F.F, x; global_index = global_index)
 end
 
 function lrsolve_h2matrix(F::H2LU, b::AbstractVector; global_index = true)
@@ -227,8 +232,11 @@ end
 Approximate LU of an H² matrix (H2Lib `lrdecomp_h2matrix` practical port).
 Keywords forwarded to [`lrdecomp_h2matrix`](@ref).
 """
-function LinearAlgebra.lu(H2::H2Matrix; kwargs...)
-    out = lrdecomp_h2matrix(H2; kwargs...)
+function LinearAlgebra.lu(H2::H2Matrix; method::Symbol = :block, kwargs...)
+    out = lrdecomp_h2matrix(H2; method = method, kwargs...)
+    if out.F isa H2NodeLU
+        return out.F
+    end
     return H2LU(out.F, out.H)
 end
 

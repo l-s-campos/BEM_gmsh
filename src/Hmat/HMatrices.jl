@@ -97,6 +97,7 @@ include("h2_factor.jl")
 include("triangular.jl")
 include("lu.jl")
 include("cholesky.jl")
+include("h2_lr.jl")
 include("precond.jl")
 
 export ClusterTree,
@@ -167,6 +168,15 @@ export ClusterTree,
     lrsolve_h2matrix,
     choldecomp_h2matrix,
     H2LU,
+    H2NodeLU,
+    h2_clone,
+    h2_block_matrix,
+    h2_densify!,
+    lrdecomp_h2node!,
+    lrdecomp_h2node,
+    h2_ldiv_left!,
+    h2_rdiv_right!,
+    h2_addmul!,
     hlru!,
     hadd!,
     AbstractMatvecSampler,
