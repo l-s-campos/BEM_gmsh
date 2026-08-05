@@ -25,6 +25,10 @@ tree = ClusterTree(pts, PrincipalComponentSplitter(; nmax=32))
 H  = assemble_hmatrix(K, tree, tree; adm=StrongAdmissibilityStd(; eta=2),
                       comp=PartialACA(; rtol=1e-6))
 H2 = assemble_h2(K, tree; rtol=1e-6, far_method=:aca, alpha=0.5)
+
+# recursive H2Lib-style block tree (sons / uniform / dense)
+root = h2_repackage(H2)   # -> H2Node with pack.U nested bases
+y2 = root * x             # same matvec as flat H2 (verification)
 ```
 
 ## Algebra

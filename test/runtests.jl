@@ -387,6 +387,10 @@ ti = time()
         include(joinpath(@__DIR__, "test_h2_aca_far.jl"))
     end
 
+    @testset "H2 recursive node repackage" begin
+        include(joinpath(@__DIR__, "test_h2_node.jl"))
+    end
+
     @testset "H-matrix algebra (hlru/hara/h2)" begin
         include(joinpath(@__DIR__, "test_hmat_algebra.jl"))
     end

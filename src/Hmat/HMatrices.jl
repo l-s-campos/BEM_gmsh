@@ -84,6 +84,7 @@ include("blr.jl")
 include("hodlr.jl")
 include("hss.jl")
 include("h2matrix.jl")
+include("h2_node.jl")
 include("anchornet.jl")
 include("structured.jl")
 include("dhmatrix.jl")
@@ -119,7 +120,23 @@ export ClusterTree,
     HBSBasisID,
     HBSScatteringNode,
     H2Matrix,
+    H2Node,
+    H2Pack,
+    H2BlockKind,
+    H2DenseLeaf,
+    H2UniformLeaf,
+    H2Split,
     H2BoxAdmissibility,
+    h2_repackage,
+    h2_basis_matrix,
+    h2_nnodes,
+    h2_nleaves,
+    h2_leaves,
+    h2_foreach,
+    isuniform,
+    isdense_h2,
+    isleaf_h2,
+    issplit,
     AnchorNetCompressor,
     DataDrivenLR,
     ScalarizedMatrix,
