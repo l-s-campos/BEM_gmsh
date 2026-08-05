@@ -375,10 +375,33 @@ ti = time()
         include(joinpath(@__DIR__, "test_dibem_fast.jl"))
     end
 
+    @testset "DIBEM elasticity" begin
+        include(joinpath(@__DIR__, "test_dibem_elasticity.jl"))
+    end
+
+    @testset "HSS-FMM H/G" begin
+        include(joinpath(@__DIR__, "test_hss_fmm_hg.jl"))
+    end
+
+    @testset "H2 far ACA" begin
+        include(joinpath(@__DIR__, "test_h2_aca_far.jl"))
+    end
+
     @testset "MMM modal smoke" begin
         include(joinpath(@__DIR__, "test_mmm.jl"))
     end
 
+    @testset "Cattaneo–Mindlin" begin
+        include(joinpath(@__DIR__, "test_cattaneo_mindlin.jl"))
+    end
+
+    @testset "Multibody elasticity NTN/NTS" begin
+        include(joinpath(@__DIR__, "test_multibody_contact.jl"))
+    end
+
+    @testset "Elasticity local (n,t) frame §4.7" begin
+        include(joinpath(@__DIR__, "test_local_frame_elasticity.jl"))
+    end
 
 end
 

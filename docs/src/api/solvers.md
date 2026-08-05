@@ -4,7 +4,8 @@ _See source docstrings in `src/` (HTML `@docs` disabled in lightweight build)._
 
 | Function | Equation | Notes |
 |----------|----------|-------|
-| `solve` | ``A x = b`` | dense LU or H-mat GMRES |
+| `solve` | ``A x = b`` | dense LU or H-mat GMRES; elasticity `frame=:global\|:local` |
+| `solve_local` | ``\hat H \hat u = \hat G \hat t + p`` | elasticity in nodal (n,t) frame |
 | `solve_Houbolt` | 2nd-order wave Houbolt | needs `DIBEM` |
 | `solve_transient` | ``M\dot T = \ldots`` | DiffEq / Tsit5 |
 | `solve_transient_o2` | ``M\ddot u + A u = b`` | `SecondOrderODEProblem` |
@@ -12,6 +13,42 @@ _See source docstrings in `src/` (HTML `@docs` disabled in lightweight build)._
 | `solve_mmc!` | same, left = ``\Phi^+`` | classical modal, non-symmetric |
 
 Always call `DIBEM(dad)` before the transient solvers.
+
+## Elasticity — local (n, t) frame (Leonardo 2026 §4.7)
+
+Instead of applying BCs in global ``(x_1,x_2)``, rotate each node to its outward
+normal / tangent basis:
+
+```math
+\begin{Bmatrix}u_1\\u_2\end{Bmatrix}
+=
+\begin{bmatrix}n_1 & -n_2\\ n_2 & n_1\end{bmatrix}
+\begin{Bmatrix}u_n\\u_t\end{Bmatrix}
+= R\,\hat u,
+\qquad
+\hat H = H R_{\mathrm{block}},\quad
+\hat G = G R_{\mathrm{block}}.
+```
+
+Boundary conditions then refer to ``(u_n,u_t,t_n,t_t)`` — ideal for rollers,
+symmetry planes, and frictional contact.
+
+```julia
+H_G_full_direct(dad)
+# dad.BC / dad.BV: dof 2i-1 = normal, dof 2i = tangent
+# e.g. roller: u_n=0 (Dirichlet), t_t=0 (Neumann)
+solve(dad; frame=:local)   # or solve_local(dad)
+# dad.u, dad.traction          — global
+# dad.u_local, dad.traction_local — (n,t)
+```
+
+Helpers: `node_rotation2d`, `transform_HG_local`, `bc_global_to_local!`,
+`global_to_local_field`, `local_to_global_field`.
+
+Rigid-body diagonal terms of ``H`` are built in the global frame during assembly
+(before the local map), as required in §4.7–4.8.
+
+Test: `test/test_local_frame_elasticity.jl`.
 
 ## Método Modal Modificado (MMM)
 
