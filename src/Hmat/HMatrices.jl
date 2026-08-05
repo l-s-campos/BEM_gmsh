@@ -98,6 +98,7 @@ include("triangular.jl")
 include("lu.jl")
 include("cholesky.jl")
 include("h2_lr.jl")
+include("h2_rkupdate.jl")
 include("precond.jl")
 
 export ClusterTree,
@@ -178,6 +179,9 @@ export ClusterTree,
     h2_rdiv_right!,
     h2_addmul!,
     h2_rkupdate!,
+    h2_rkupdate_nested!,
+    H2ClusterOperator,
+    prepare_h2_weights,
     h2_product_to_global_rk,
     h2_node_lr_factors,
     hlru!,

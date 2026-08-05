@@ -334,24 +334,17 @@ end
 # ---- rkupdate: G ← G + X Y'  (H2Lib rkupdate_h2matrix MVP / Slice R1) ---------
 
 """
-    h2_rkupdate!(G::H2Node, X, Y; rtol=1e-6, atol=0, rank=typemax(Int))
+    h2_rkupdate!(G::H2Node, X, Y; rtol=1e-6, method=:nested, ...)
 
-Low-rank update ``G ← G + X Y'`` staying in the recursive H² tree (H2Lib
-`rkupdate_h2matrix` MVP).
+Low-rank update ``G ← G + X Y'`` on a recursive H² tree (H2Lib `rkupdate_h2matrix`).
 
 # Arguments
-- `X`: `pack.n × k` in **tree-local** ordering (same as `global_index=false` matvec)
-- `Y`: `pack.n × k` likewise
+- `X`,`Y`: `pack.n × k` in **tree-local** ordering (`global_index=false`)
 
-# Leaf behaviour (R1)
-- **dense**: `F += X[I,:] Y[J,:]'`
-- **uniform**: form block dense sum, recompress with [`TSVD`](@ref); keep as
-  full-block [`RkMatrix`](@ref) in `S` when cheaper than dense, else densify
-- **split**: recurse on sons with the same global `X`,`Y`
-
-Weighted nested-basis expansion (full Börm–Reimer) is Slice R2–R3; this MVP
-already avoids always densifying the whole of `G` and preserves low-rank far
-leaves when the update is compressible.
+# Methods
+- `:block` (default) — leaf-wise densify + TSVD (R1); safe inside nested LR Schur
+- `:nested` — expand nested `pack.U`, rewrite couplings, optional weighted
+  recompress ([`h2_rkupdate_nested!`](@ref), Börm–Reimer R2–R3)
 """
 function h2_rkupdate!(
         G::H2Node{R, T},
@@ -360,6 +353,7 @@ function h2_rkupdate!(
         rtol = 1e-6,
         atol = 0.0,
         rank = typemax(Int),
+        method::Symbol = :block,
     ) where {R, T}
     size(X, 2) == size(Y, 2) || throw(DimensionMismatch("h2_rkupdate!: X,Y ranks"))
     n = G.pack.n
@@ -367,6 +361,16 @@ function h2_rkupdate!(
         "h2_rkupdate!: X,Y must be pack.n×k (got $(size(X)), $(size(Y)), n=$n)"))
     k = size(X, 2)
     k == 0 && return G
+
+    if method === :nested
+        try
+            return h2_rkupdate_nested!(G, X, Y; rtol, atol, rank)
+        catch
+            # fall back to block path
+            method = :block
+        end
+    end
+    method === :block || throw(ArgumentError("h2_rkupdate! method must be :nested or :block"))
 
     if isdense_h2(G)
         Ir, Jr = rowrange(G), colrange(G)
@@ -376,7 +380,7 @@ function h2_rkupdate!(
         return _h2_rkupdate_uniform!(G, X, Y; rtol, atol, rank)
     else
         for s in G.sons
-            h2_rkupdate!(s, X, Y; rtol, atol, rank)
+            h2_rkupdate!(s, X, Y; rtol, atol, rank, method = :block)
         end
         return G
     end
@@ -616,7 +620,8 @@ function h2_addmul!(
         try
             X, Y = h2_product_to_global_rk(A, B, α; rtol = max(float(rtol), 1e-14), rank = rank)
             if size(X, 2) > 0
-                return h2_rkupdate!(C, X, Y; rtol = rtol, rank = rank)
+                # Use stable block rkupdate inside LR Schur (nested is opt-in)
+                return h2_rkupdate!(C, X, Y; rtol = rtol, rank = rank, method = :block)
             end
         catch
             # fall through to densify

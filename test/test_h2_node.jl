@@ -66,35 +66,46 @@ end
     tree = ClusterTree(pts, PrincipalComponentSplitter(; nmax=12))
     H2 = assemble_h2(K, tree; rtol=1e-5, far_method=:aca,
         comp=PartialACA(; rtol=1e-5), alpha=0.5, symmetric=true)
-    root = h2_clone(h2_repackage(H2))
     n = length(pts)
-    # rank-3 update in tree-local coords
     Xl = randn(n, 3)
     Yl = randn(n, 3)
-    # reference: dense + XY'
-    Md = Matrix(root; global_index=false)
-    Md .+= Xl * Yl'
-    h2_rkupdate!(root, Xl, Yl; rtol=1e-8)
     x = randn(n)
-    y = zeros(n)
-    mul!(y, root, x; global_index=false)
-    yref = Md * x
-    @test norm(y - yref) / (norm(yref) + 1e-14) < 1e-4
 
-    # addmul vs dense product on a small cloned tree
-    G0 = h2_clone(h2_repackage(H2))
-    # pick two off-diagonal sons if split
-    if issplit(G0) && size(G0.sons, 1) >= 2
-        A = h2_clone(G0.sons[2, 1])
-        B = h2_clone(G0.sons[1, 2])
-        # only if dimensions match for A*B into some C — use A*A' style on square diag son
-    end
-    # Schur-style: C += A*B with A,B dense leaves if available
+    # R1 block path
+    root_b = h2_clone(h2_repackage(H2))
+    Md = Matrix(root_b; global_index=false)
+    Md .+= Xl * Yl'
+    h2_rkupdate!(root_b, Xl, Yl; rtol=1e-8, method=:block)
+    yb = zeros(n)
+    mul!(yb, root_b, x; global_index=false)
+    @test norm(yb - Md * x) / (norm(Md * x) + 1e-14) < 1e-4
+
+    # R2–R3 nested path (exact expand + project; light recompress)
+    root_n = h2_clone(h2_repackage(H2))
+    Mn = Matrix(root_n; global_index=false)
+    mul!(Mn, Xl, adjoint(Yl), true, true)
+    h2_rkupdate_nested!(root_n, Xl, Yl; rtol=1e-8, recompress=false)
+    yn = zeros(n)
+    mul!(yn, root_n, x; global_index=false)
+    rel_n = norm(yn - Mn * x) / (norm(Mn * x) + 1e-14)
+    @test rel_n < 5e-2
+    # with recompress still reasonable
+    root_r = h2_clone(h2_repackage(H2))
+    h2_rkupdate!(root_r, Xl, Yl; rtol=1e-4, method=:nested)
+    yr = zeros(n)
+    mul!(yr, root_r, x; global_index=false)
+    @test norm(yr - Mn * x) / (norm(Mn * x) + 1e-14) < 0.15
+
+    # weights constructible
+    w = prepare_h2_weights(root_n.pack; side=:row)
+    @test w isa H2ClusterOperator
+    @test length(w.C) == length(root_n.pack.U)
+
+    # addmul dense Schur-style
     leaves = h2_leaves(h2_repackage(H2))
     dens = filter(isdense_h2, leaves)
     if length(dens) >= 1
         D = h2_clone(dens[1])
-        # D += D * I factors via addmul with two copies when square
         if size(D, 1) == size(D, 2) && size(D, 1) <= 32
             C = h2_clone(D)
             A = h2_clone(D)

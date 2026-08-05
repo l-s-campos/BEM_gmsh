@@ -29,6 +29,8 @@ H2 = assemble_h2(K, tree; rtol=1e-6, far_method=:aca, alpha=0.5)
 # recursive H2Lib-style block tree (sons / uniform / dense)
 root = h2_repackage(H2)   # -> H2Node with pack.U nested bases
 y2 = root * x             # same matvec as flat H2 (verification)
+# low-rank update G ← G + X*Y' (H2Lib rkupdate MVP)
+h2_rkupdate!(root, X, Y; rtol=1e-6)   # X,Y are n×k in tree-local order
 ```
 
 ## Algebra
