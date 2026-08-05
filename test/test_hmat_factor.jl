@@ -67,6 +67,32 @@ end
     @test norm(Y - Yref) / (norm(Yref) + 1e-14) < 1e-9
 end
 
+@testset "H2 lrdecomp_h2matrix (H2Lib port)" begin
+    pts = _gauss_pts(8)
+    K = _spd_kernel(pts; σ=6.0, diag=3.0)
+    tree = ClusterTree(pts, PrincipalComponentSplitter(; nmax=12))
+    H2 = assemble_h2(K, tree; rtol=1e-5, far_method=:aca,
+        comp=PartialACA(; rtol=1e-5), alpha=0.5, symmetric=true)
+    n = length(pts)
+    b = randn(n)
+    # H2Lib-named path
+    out = lrdecomp_h2matrix(H2; rtol=1e-4, method=:block, threads=false)
+    x = lrsolve_h2matrix(out, b)
+    r = norm(H2 * x - b) / (norm(b) + 1e-14)
+    @test r < 5e-3
+    # LinearAlgebra.lu wrapper
+    F = lu(deepcopy(H2); rtol=1e-4, threads=false)
+    x2 = F \ copy(b)
+    @test norm(H2 * x2 - b) / (norm(b) + 1e-14) < 5e-3
+    # vs dense
+    xd = Matrix(K) \ b
+    @test norm(x - xd) / (norm(xd) + 1e-14) < 5e-2
+    # conversion sanity
+    Hh = h2_to_hmatrix(H2; rtol=1e-4, method=:block)
+    v = randn(n)
+    @test norm(Hh * v - H2 * v) / (norm(H2 * v) + 1e-14) < 5e-3
+end
+
 @testset "HARA product sampler A(Bv)" begin
     pts = _gauss_pts(8)
     Ka = _spd_kernel(pts; σ=6.0, diag=1.5)

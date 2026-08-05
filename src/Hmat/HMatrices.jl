@@ -92,6 +92,7 @@ include("hlru.jl")
 include("hara.jl")
 include("hara_h2.jl")
 include("h2_basis.jl")
+include("h2_factor.jl")
 include("triangular.jl")
 include("lu.jl")
 include("cholesky.jl")
@@ -144,6 +145,11 @@ export ClusterTree,
     h2_proxy_block,
     h2_orthog!,
     h2_compress!,
+    h2_to_hmatrix,
+    lrdecomp_h2matrix,
+    lrsolve_h2matrix,
+    choldecomp_h2matrix,
+    H2LU,
     hlru!,
     hadd!,
     AbstractMatvecSampler,

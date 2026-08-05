@@ -42,10 +42,16 @@ hlru!(H, X, Y; rtol=1e-6)
 # compatible-tree add: C ← A + B
 hadd!(C, A, B, 1, 1; rtol=1e-6)
 
-# factors
+# factors (classic H)
 F = lu(H; rtol=1e-6)
 x = F \ b
 Fc = cholesky(H; ridge=1e-10, rtol=1e-6)
+
+# H² factorization (H2Lib lrdecomp_h2matrix port: H²→H then hierarchical LU)
+F2 = lu(H2; rtol=1e-4)                 # -> H2LU
+x  = F2 \ b
+out = lrdecomp_h2matrix(H2; rtol=1e-4) # (; L, U, F, H)
+Hh  = h2_to_hmatrix(H2; method=:block) # conversion only
 
 # GMRES (+ optional hierarchical left precond)
 x, stats = gmres_h(H, b; Pl=F, rtol=1e-8)
