@@ -90,6 +90,7 @@ include("dhmatrix.jl")
 include("multiplication.jl")
 include("hlru.jl")
 include("hara.jl")
+include("hara_h2.jl")
 include("h2_basis.jl")
 include("triangular.jl")
 include("lu.jl")
@@ -149,6 +150,7 @@ export ClusterTree,
     FunctionSampler,
     KernelMatvecSampler,
     hara,
+    hara_h2,
     hara_product,
     add_diag_ridge!,
     gmres_h,
