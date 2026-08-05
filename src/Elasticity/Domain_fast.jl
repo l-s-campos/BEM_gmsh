@@ -165,6 +165,20 @@ function _dibem_elast_compress_D(dad, pts, method::Symbol; atol=1e-6, rtol=1e-6,
     adm = StrongAdmissibilityStd(; eta=eta)
 
     if fmt === :H2
+        # FMM Kelvin matvecs → nested H² on expand_tree; else entry/proxy assemble_h2
+        if hss_method in (:fmm, :FMM, :matvec)
+            Pmat_h2 = Matrix{Float64}(undef, 2, nt)
+            @inbounds for j in 1:nt
+                Pmat_h2[1, j] = pts[j][1]
+                Pmat_h2[2, j] = pts[j][2]
+            end
+            KF = FMM.fmm_kelvin2d_matrix(Pmat_h2;
+                μ=shear_modulus(props), ν=effective_nu(props),
+                eps=Float64(eps), nmax=nmax, η=Float64(eta))
+            rH2 = rank == typemax(Int) ? 48 : Int(rank)
+            return FMM.assemble_h2_fmm(KF, etree; rtol=rtol, rank=rH2, alpha=alpha,
+                nsample=max(64, 2rH2), global_index=true)
+        end
         # True H² on block-expanded tree: proxies × 2 load dirs → nested ID bases.
         # far_method=:aca → on-the-fly PartialACA for far B (near always dense).
         far_m = hss_method in (:aca, :ACA) ? :aca : :dense

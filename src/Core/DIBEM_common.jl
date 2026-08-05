@@ -189,11 +189,22 @@ function LinearAlgebra.mul!(y::AbstractVector, S::_ScaledFMM, x::AbstractVector,
     return y
 end
 Base.:*(S::_ScaledFMM, x::AbstractVector) = mul!(similar(x, Float64), S, x)
+function LinearAlgebra.mul!(Y::AbstractMatrix, S::_ScaledFMM, X::AbstractMatrix)
+    mul!(Y, S.A, X)
+    Y .*= S.α
+    return Y
+end
 function LinearAlgebra.mul!(y::AbstractVector, St::Adjoint{<:Any,<:_ScaledFMM}, x::AbstractVector)
     S = parent(St)
     mul!(y, adjoint(S.A), x)
     y .*= S.α
     return y
+end
+function LinearAlgebra.mul!(Y::AbstractMatrix, St::Adjoint{<:Any,<:_ScaledFMM}, X::AbstractMatrix)
+    S = parent(St)
+    mul!(Y, adjoint(S.A), X)
+    Y .*= S.α
+    return Y
 end
 
 """

@@ -78,6 +78,17 @@ H2c = hara_h2(FunctionSampler((Y,X)->mul!(Y,A,B*X), n; f_adj! = ...), tree)
 | `hara(S, rowtree, coltree)` | `HMatrix` | matvecs |
 | `hara_h2(S, tree)` | `H2Matrix` | matvecs |
 | `assemble_h2(K, tree)` | `H2Matrix` | entries / proxies |
+| `assemble_h2_fmm(A, tree)` / `assemble_h2_fmm(points; kernel=…)` | `H2Matrix` | **FMM matvecs** (HARA) |
+
+```julia
+# FMM → nested H² (large-n path)
+A  = FMM.fmm_laplace2d_matrix(Pmat; eps=1e-6)
+H2 = assemble_h2_fmm(A, tree; rtol=1e-4, nsample=64)
+# or one-shot:
+H2 = assemble_h2_fmm(Pmat; kernel=:laplace2d, scale=-1/(2π))
+# DIBEM:
+DIBEM(dad; method=:h2, hss_method=:fmm)
+```
 
 Demos: `scripts/hara_product_demo.jl`, `scripts/hmat_gmres_precond_demo.jl`.
 

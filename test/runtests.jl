@@ -403,6 +403,10 @@ ti = time()
         include(joinpath(@__DIR__, "test_hara_h2.jl"))
     end
 
+    @testset "H² from FMM" begin
+        include(joinpath(@__DIR__, "test_h2_fmm.jl"))
+    end
+
     @testset "MMM modal smoke" begin
         include(joinpath(@__DIR__, "test_mmm.jl"))
     end
