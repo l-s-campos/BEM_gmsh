@@ -3,6 +3,7 @@
 
 export AbstractBasis, AbstractRadialBasis, AbstractPHS
 export PHS, PHS1, PHS2, PHS3, PHS4, PHS5, PHS6, PHS7
+export FundamentalRBF, fundamental_rbf
 export IMQ, Gaussian
 export MonomialBasis, degree, dim
 export RBF, rbf_weights, rbf_evaluate, rbf_partial_weights, rbf_partial, rbf_cardinal
@@ -46,7 +47,7 @@ function rbf_length_scale(xs::AbstractVector)
         dmin = Inf
         for j in 1:n
             j == i && continue
-            d = euclidean(xs[i], xs[j])
+            d = norm(xs[i] - xs[j])
             d < dmin && (dmin = d)
         end
         isfinite(dmin) && dmin > 0 && push!(ds, dmin)
@@ -55,7 +56,7 @@ function rbf_length_scale(xs::AbstractVector)
     return median(ds)
 end
 
-_scale_r2(r2, h) = r2 / (h * h)
+_scale_r(r, h) = r / h
 
 # =============================================================================
 # PHS kernels
@@ -80,14 +81,14 @@ struct PHS1{T <: Int} <: AbstractPHS
         return new{T}(poly_deg)
     end
 end
-(phs::PHS1)(r2::Number) = sqrt(r2)
-(phs::PHS1)(x::Point, xᵢ::Point) = phs(sqeuclidean(x, xᵢ))
+(phs::PHS1)(r::Number) = float(r)
+(phs::PHS1)(x::Point, xᵢ::Point) = phs(norm(x - xᵢ))
 function ∂(::PHS1, dim::Int, x::Point, xᵢ::Point)
-    r = euclidean(x, xᵢ)
+    r = norm(x - xᵢ)
     return (x[dim] - xᵢ[dim]) / (r + AVOID_INF)
 end
-int(::PHS1, x::Point2D, xᵢ::Point2D) = (r = euclidean(x, xᵢ); r^3 / 3)
-int(::PHS1, x::Point3D, xᵢ::Point3D) = (r = euclidean(x, xᵢ); r^4 / 4)
+int(::PHS1, x::Point2D, xᵢ::Point2D) = (r = norm(x - xᵢ); r^3 / 3)
+int(::PHS1, x::Point3D, xᵢ::Point3D) = (r = norm(x - xᵢ); r^4 / 4)
 
 struct PHS2{T <: Int} <: AbstractPHS
     poly_deg::T
@@ -96,14 +97,14 @@ struct PHS2{T <: Int} <: AbstractPHS
         return new{T}(poly_deg)
     end
 end
-(phs::PHS2)(r2) = r2 * log(sqrt(r2) + AVOID_INF)
-(phs::PHS2)(x, xᵢ) = phs(sqeuclidean(x, xᵢ))
+(phs::PHS2)(r::Number) = (r = float(r); r * r * log(r + AVOID_INF))
+(phs::PHS2)(x, xᵢ) = phs(norm(x - xᵢ))
 function ∂(::PHS2, dim::Int, x::Point, xᵢ::Point)
-    r = euclidean(x, xᵢ)
+    r = norm(x - xᵢ)
     return (x[dim] - xᵢ[dim]) * (2 * log(r + AVOID_INF) + 1)
 end
-int(::PHS2, x::Point2D, xᵢ::Point2D) = (r = euclidean(x, xᵢ); (4 * r^4 * log(r + AVOID_INF) - r^4) / 16)
-int(::PHS2, x::Point3D, xᵢ::Point3D) = (r = euclidean(x, xᵢ); (5 * r^5 * log(r + AVOID_INF) - r^5) / 25)
+int(::PHS2, x::Point2D, xᵢ::Point2D) = (r = norm(x - xᵢ); (4 * r^4 * log(r + AVOID_INF) - r^4) / 16)
+int(::PHS2, x::Point3D, xᵢ::Point3D) = (r = norm(x - xᵢ); (5 * r^5 * log(r + AVOID_INF) - r^5) / 25)
 
 struct PHS3{T <: Int} <: AbstractPHS
     poly_deg::T
@@ -112,14 +113,14 @@ struct PHS3{T <: Int} <: AbstractPHS
         return new{T}(poly_deg)
     end
 end
-(phs::PHS3)(r2) = r2 * sqrt(r2)
-(phs::PHS3)(x, xᵢ) = phs(sqeuclidean(x, xᵢ))
+(phs::PHS3)(r::Number) = float(r)^3
+(phs::PHS3)(x, xᵢ) = phs(norm(x - xᵢ))
 function ∂(::PHS3, dim::Int, x::Point, xᵢ::Point)
-    r = euclidean(x, xᵢ)
+    r = norm(x - xᵢ)
     return 3 * (x[dim] - xᵢ[dim]) * r
 end
-int(::PHS3, x::Point2D, xᵢ::Point2D) = (r = euclidean(x, xᵢ); r^5 / 5)
-int(::PHS3, x::Point3D, xᵢ::Point3D) = (r = euclidean(x, xᵢ); r^6 / 6)
+int(::PHS3, x::Point2D, xᵢ::Point2D) = (r = norm(x - xᵢ); r^5 / 5)
+int(::PHS3, x::Point3D, xᵢ::Point3D) = (r = norm(x - xᵢ); r^6 / 6)
 
 struct PHS4{T <: Int} <: AbstractPHS
     poly_deg::T
@@ -128,14 +129,14 @@ struct PHS4{T <: Int} <: AbstractPHS
         return new{T}(poly_deg)
     end
 end
-(phs::PHS4)(r2) = r2^2 * log(sqrt(r2) + AVOID_INF)
-(phs::PHS4)(x, xᵢ) = phs(sqeuclidean(x, xᵢ))
+(phs::PHS4)(r::Number) = (r = float(r); r^4 * log(r + AVOID_INF))
+(phs::PHS4)(x, xᵢ) = phs(norm(x - xᵢ))
 function ∂(::PHS4, dim::Int, x::Point, xᵢ::Point)
-    r = euclidean(x, xᵢ)
+    r = norm(x - xᵢ)
     return (x[dim] - xᵢ[dim]) * r^2 * (4 * log(r + AVOID_INF) + 1)
 end
-int(::PHS4, x::Point2D, xᵢ::Point2D) = (r = euclidean(x, xᵢ); (r^6 * log(r + AVOID_INF)) / 6 - r^6 / 36)
-int(::PHS4, x::Point3D, xᵢ::Point3D) = (r = euclidean(x, xᵢ); (r^7 * log(r + AVOID_INF)) / 7 - r^7 / 49)
+int(::PHS4, x::Point2D, xᵢ::Point2D) = (r = norm(x - xᵢ); (r^6 * log(r + AVOID_INF)) / 6 - r^6 / 36)
+int(::PHS4, x::Point3D, xᵢ::Point3D) = (r = norm(x - xᵢ); (r^7 * log(r + AVOID_INF)) / 7 - r^7 / 49)
 
 struct PHS5{T <: Int} <: AbstractPHS
     poly_deg::T
@@ -144,14 +145,14 @@ struct PHS5{T <: Int} <: AbstractPHS
         return new{T}(poly_deg)
     end
 end
-(phs::PHS5)(r2) = r2^2 * sqrt(r2)
-(phs::PHS5)(x, xᵢ) = phs(sqeuclidean(x, xᵢ))
+(phs::PHS5)(r::Number) = float(r)^5
+(phs::PHS5)(x, xᵢ) = phs(norm(x - xᵢ))
 function ∂(::PHS5, dim::Int, x::Point, xᵢ::Point)
-    r = euclidean(x, xᵢ)
+    r = norm(x - xᵢ)
     return 5 * (x[dim] - xᵢ[dim]) * r^3
 end
-int(::PHS5, x::Point2D, xᵢ::Point2D) = (r = euclidean(x, xᵢ); r^7 / 7)
-int(::PHS5, x::Point3D, xᵢ::Point3D) = (r = euclidean(x, xᵢ); r^8 / 8)
+int(::PHS5, x::Point2D, xᵢ::Point2D) = (r = norm(x - xᵢ); r^7 / 7)
+int(::PHS5, x::Point3D, xᵢ::Point3D) = (r = norm(x - xᵢ); r^8 / 8)
 
 struct PHS6{T <: Int} <: AbstractPHS
     poly_deg::T
@@ -160,14 +161,14 @@ struct PHS6{T <: Int} <: AbstractPHS
         return new{T}(poly_deg)
     end
 end
-(phs::PHS6)(r2) = r2^3 * log(sqrt(r2) + AVOID_INF)
-(phs::PHS6)(x, xᵢ) = phs(sqeuclidean(x, xᵢ))
+(phs::PHS6)(r::Number) = (r = float(r); r^6 * log(r + AVOID_INF))
+(phs::PHS6)(x, xᵢ) = phs(norm(x - xᵢ))
 function ∂(::PHS6, dim::Int, x::Point, xᵢ::Point)
-    r = euclidean(x, xᵢ)
+    r = norm(x - xᵢ)
     return (x[dim] - xᵢ[dim]) * r^4 * (6 * log(r + AVOID_INF) + 1)
 end
-int(::PHS6, x::Point2D, xᵢ::Point2D) = (r = euclidean(x, xᵢ); (r^8 * log(r + AVOID_INF)) / 8 - r^8 / 64)
-int(::PHS6, x::Point3D, xᵢ::Point3D) = (r = euclidean(x, xᵢ); (r^9 * log(r + AVOID_INF)) / 9 - r^9 / 81)
+int(::PHS6, x::Point2D, xᵢ::Point2D) = (r = norm(x - xᵢ); (r^8 * log(r + AVOID_INF)) / 8 - r^8 / 64)
+int(::PHS6, x::Point3D, xᵢ::Point3D) = (r = norm(x - xᵢ); (r^9 * log(r + AVOID_INF)) / 9 - r^9 / 81)
 
 struct PHS7{T <: Int} <: AbstractPHS
     poly_deg::T
@@ -176,14 +177,14 @@ struct PHS7{T <: Int} <: AbstractPHS
         return new{T}(poly_deg)
     end
 end
-(phs::PHS7)(r2) = r2^3 * sqrt(r2)
-(phs::PHS7)(x, xᵢ) = phs(sqeuclidean(x, xᵢ))
+(phs::PHS7)(r::Number) = float(r)^7
+(phs::PHS7)(x, xᵢ) = phs(norm(x - xᵢ))
 function ∂(::PHS7, dim::Int, x::Point, xᵢ::Point)
-    r = euclidean(x, xᵢ)
+    r = norm(x - xᵢ)
     return 7 * (x[dim] - xᵢ[dim]) * r^5
 end
-int(::PHS7, x::Point2D, xᵢ::Point2D) = (r = euclidean(x, xᵢ); r^9 / 9)
-int(::PHS7, x::Point3D, xᵢ::Point3D) = (r = euclidean(x, xᵢ); r^10 / 10)
+int(::PHS7, x::Point2D, xᵢ::Point2D) = (r = norm(x - xᵢ); r^9 / 9)
+int(::PHS7, x::Point3D, xᵢ::Point3D) = (r = norm(x - xᵢ); r^10 / 10)
 
 for phs in (:PHS1, :PHS2, :PHS3, :PHS4, :PHS5, :PHS6, :PHS7)
     @eval $phs(; poly_deg::Int = 2) = $phs(poly_deg)
@@ -215,10 +216,10 @@ struct IMQ{T <: Real} <: AbstractRadialBasis
         return new{T}(ε, poly_deg)
     end
 end
-(b::IMQ)(r2::Number) = 1 / sqrt(1 + (b.ε^2) * r2)
-(b::IMQ)(x::Point, xᵢ::Point) = b(sqeuclidean(x, xᵢ))
+(b::IMQ)(r::Number) = 1 / sqrt(1 + (b.ε * float(r))^2)
+(b::IMQ)(x::Point, xᵢ::Point) = b(norm(x - xᵢ))
 function ∂(b::IMQ, dim::Int, x::Point, xᵢ::Point)
-    r2 = sqeuclidean(x, xᵢ)
+    r2 = norm(x - xᵢ)^2
     s = 1 + b.ε^2 * r2
     return -(b.ε^2) * (x[dim] - xᵢ[dim]) * s^(-1.5)
 end
@@ -232,16 +233,82 @@ struct Gaussian{T <: Real} <: AbstractRadialBasis
         return new{T}(ε, poly_deg)
     end
 end
-(b::Gaussian)(r2::Number) = exp(-(b.ε^2) * r2)
-(b::Gaussian)(x::Point, xᵢ::Point) = b(sqeuclidean(x, xᵢ))
+(b::Gaussian)(r::Number) = exp(-(b.ε * float(r))^2)
+(b::Gaussian)(x::Point, xᵢ::Point) = b(norm(x - xᵢ))
 function ∂(b::Gaussian, dim::Int, x::Point, xᵢ::Point)
-    r2 = sqeuclidean(x, xᵢ)
+    r2 = norm(x - xᵢ)^2
     return -2 * b.ε^2 * (x[dim] - xᵢ[dim]) * exp(-(b.ε^2) * r2)
 end
 
 poly_deg(b::AbstractPHS) = b.poly_deg
 poly_deg(b::IMQ) = b.poly_deg
 poly_deg(b::Gaussian) = b.poly_deg
+
+# =============================================================================
+# Fundamental solution as DIBEM RBF (same u* as single-layer G)
+# =============================================================================
+#
+# φ(R) = u*(R) with F_ii set by [`_zero_rowsum_diag!`](@ref):
+#   F_ii = 1 − ∑_{j≠i} F_ij  ⇒  F 1 = 1  (constants in the range of F).
+#
+# Radial particular for IF: ∫_0^R φ(ρ) ρ^{d-1} dρ  (same as DIBEM ID for FS).
+# =============================================================================
+
+"""
+    FundamentalRBF(; k=1.0, dim=2, poly_deg=-1)
+
+Use the Laplace fundamental solution as the DIBEM radial basis:
+
+- 2D: ``φ = −\\log(R)/(2πk)``
+- 3D: ``φ = 1/(4πk R)``
+
+Callable as `φ(r)` (Euclidean distance) or `φ(x, xᵢ)`. Default `poly_deg=-1`
+(no polynomial tail). Pair with [`_zero_rowsum_diag!`](@ref) on the Gram matrix
+so each row of `F` sums to one.
+"""
+struct FundamentalRBF{T<:Real} <: AbstractRadialBasis
+    k::T
+    dim::Int
+    poly_deg::Int
+end
+
+function FundamentalRBF(; k::Real=1.0, dim::Int=2, poly_deg::Int=-1)
+    dim in (2, 3) || throw(ArgumentError("FundamentalRBF dim must be 2 or 3"))
+    check_poly_deg(poly_deg)
+    return FundamentalRBF(float(k), dim, poly_deg)
+end
+
+"""Convenience: pull `k` from a Laplace problem / BEMdata."""
+fundamental_rbf(props::Laplace; dim::Int=2, poly_deg::Int=-1) =
+    FundamentalRBF(; k=float(props.k), dim=dim, poly_deg=poly_deg)
+fundamental_rbf(dad::BEMdata{<:Laplace}; poly_deg::Int=-1) =
+    fundamental_rbf(dad.properties; dim=dad.dimension, poly_deg=poly_deg)
+
+function (b::FundamentalRBF)(r::Number)
+    R = max(float(r), 0.0)
+    R < 1e-15 && return 0.0          # diagonal filled later by zero-row-sum
+    if b.dim == 2
+        return -log(R) / (2π * b.k)
+    else
+        return 1 / (4π * b.k * R)
+    end
+end
+(b::FundamentalRBF)(x::Point, xᵢ::Point) = b(norm(x - xᵢ))
+
+poly_deg(b::FundamentalRBF) = b.poly_deg
+
+# ∫_0^R φ(ρ) ρ dρ  (2D) / ∫_0^R φ(ρ) ρ² dρ (3D) — matches Domain.jl radial_integral(Laplace)
+function int(b::FundamentalRBF, x::Point2D, xᵢ::Point2D)
+    R = norm(x - xᵢ)
+    R < 1e-30 && return 0.0
+    # −(2 R² log R − R²) / (8π k)
+    return -(2 * R^2 * log(R) - R^2) / (8π * b.k)
+end
+function int(b::FundamentalRBF, x::Point3D, xᵢ::Point3D)
+    R = norm(x - xᵢ)
+    R < 1e-30 && return 0.0
+    return R^2 / (8π * b.k)   # 1/(4πk) * R²/2
+end
 
 # =============================================================================
 # Monomial basis
@@ -329,9 +396,30 @@ function ∂(m::MonomialBasis{2, 2}, dim::Int, x)
     end
     return d
 end
-function ∂(m::MonomialBasis{3, Deg}, dim::Int, x) where {Deg}
+function ∂(::MonomialBasis{3, 0}, dim::Int, x)
+    return [0.0]
+end
+function ∂(::MonomialBasis{3, 1}, dim::Int, x)
+    d = zeros(4)
+    dim == 1 && (d[2] = 1)
+    dim == 2 && (d[3] = 1)
+    dim == 3 && (d[4] = 1)
+    return d
+end
+function ∂(::MonomialBasis{3, 2}, dim::Int, x)
+    d = zeros(10)
+    if dim == 1
+        d[2] = 1; d[5] = x[2]; d[6] = x[3]; d[8] = 2x[1]
+    elseif dim == 2
+        d[3] = 1; d[5] = x[1]; d[7] = x[3]; d[9] = 2x[2]
+    else
+        d[4] = 1; d[6] = x[1]; d[7] = x[2]; d[10] = 2x[3]
+    end
+    return d
+end
+function ∂(::MonomialBasis{3, Deg}, dim::Int, x) where {Deg}
     n = binomial(3 + Deg, 3)
-    return zeros(n)  # fallback
+    return zeros(n)
 end
 function ∂(m::MonomialBasis{1, Deg}, dim::Int, x) where {Deg}
     n = Deg + 1
@@ -347,16 +435,16 @@ end
 
 # radial integrals of monomials (DIBEM geo props) — simplified
 function int(::MonomialBasis{2, 0}, pf::Point, x::Point)
-    R = euclidean(pf, x)
+    R = norm(pf - x)
     return [R^2 / 2]
 end
 function int(::MonomialBasis{2, 1}, pf::Point, x::Point)
-    R = euclidean(pf, x)
+    R = norm(pf - x)
     r = x - pf
     return [R^2 / 2; R^2 / 3 * r + R^2 / 2 * SVector(pf[1], pf[2])]
 end
 function int(m::MonomialBasis{2, 2}, pf::Point, x::Point)
-    R = euclidean(pf, x)
+    R = norm(pf - x)
     r = x - pf
     return [
         R^2 / 2
@@ -368,11 +456,42 @@ function int(m::MonomialBasis{2, 2}, pf::Point, x::Point)
     ]
 end
 function int(::MonomialBasis{3, 0}, pf::Point, x::Point)
-    R = euclidean(pf, x)
+    R = norm(pf - x)
     return [R^3 / 3]
 end
+function int(::MonomialBasis{3, 1}, pf::Point, x::Point)
+    R = norm(pf - x)
+    e = (x - pf) / (R + eps(R))
+    R3 = R^3 / 3
+    R4 = R^4 / 4
+    return [R3
+            pf[1] * R3 + e[1] * R4
+            pf[2] * R3 + e[2] * R4
+            pf[3] * R3 + e[3] * R4]
+end
+function int(::MonomialBasis{3, 2}, pf::Point, x::Point)
+    R = norm(pf - x)
+    e = (x - pf) / (R + eps(R))
+    R3 = R^3 / 3
+    R4 = R^4 / 4
+    R5 = R^5 / 5
+    x0, y0, z0 = pf[1], pf[2], pf[3]
+    ex, ey, ez = e[1], e[2], e[3]
+    return [
+        R3
+        x0 * R3 + ex * R4
+        y0 * R3 + ey * R4
+        z0 * R3 + ez * R4
+        x0 * y0 * R3 + (x0 * ey + y0 * ex) * R4 + ex * ey * R5
+        x0 * z0 * R3 + (x0 * ez + z0 * ex) * R4 + ex * ez * R5
+        y0 * z0 * R3 + (y0 * ez + z0 * ey) * R4 + ey * ez * R5
+        x0^2 * R3 + 2 * x0 * ex * R4 + ex^2 * R5
+        y0^2 * R3 + 2 * y0 * ey * R4 + ey^2 * R5
+        z0^2 * R3 + 2 * z0 * ez * R4 + ez^2 * R5
+    ]
+end
 function int(m::MonomialBasis{3, Deg}, pf::Point, x::Point) where {Deg}
-    R = euclidean(pf, x)
+    R = norm(pf - x)
     n = binomial(3 + Deg, 3)
     v = zeros(n)
     v[1] = R^3 / 3
@@ -393,7 +512,7 @@ function rbf_cardinal(
     n = length(xs)
     n == 0 && return Float64[]
     @inbounds for j in 1:n
-        if sqeuclidean(xstar, xs[j]) < 1e-28
+        if norm(xstar - xs[j])^2 < 1e-28
             w = zeros(n)
             w[j] = 1.0
             return w
@@ -409,7 +528,7 @@ function rbf_cardinal(
     hh = max(hh, 1e-14)
     A = zeros(n, n)
     @inbounds for j in 1:n, i in 1:j
-        aij = basis(_scale_r2(sqeuclidean(xs[i], xs[j]), hh))
+        aij = basis(_scale_r(norm(xs[i] - xs[j]), hh))
         A[i, j] = aij
         A[j, i] = aij
     end
@@ -418,7 +537,7 @@ function rbf_cardinal(
         A[i, i] += ε
     end
     if npoly == 0
-        ψ = [basis(_scale_r2(sqeuclidean(xstar, xs[i]), hh)) for i in 1:n]
+        ψ = [basis(_scale_r(norm(xstar - xs[i]), hh)) for i in 1:n]
         return A \ ψ
     end
     mon = MonomialBasis(dim, deg)
@@ -427,7 +546,7 @@ function rbf_cardinal(
         P[i, :] = mon(xs[i])
     end
     K = [A P; P' zeros(npoly, npoly)]
-    ψ = [basis(_scale_r2(sqeuclidean(xstar, xs[i]), hh)) for i in 1:n]
+    ψ = [basis(_scale_r(norm(xstar - xs[i]), hh)) for i in 1:n]
     rhs = vcat(ψ, mon(xstar))
     coef = try
         K \ rhs
@@ -435,7 +554,7 @@ function rbf_cardinal(
         w = zeros(n)
         s = 0.0
         @inbounds for i in 1:n
-            wi = 1 / (euclidean(xstar, xs[i]) + 1e-14)
+            wi = 1 / (norm(xstar - xs[i]) + 1e-14)
             w[i] = wi
             s += wi
         end
@@ -503,7 +622,7 @@ function RBF(
     hh = max(hh, 1e-14)
     F = zeros(k, k)
     @inbounds for j in 1:k, i in 1:j
-        fij = basis(_scale_r2(sqeuclidean(x[i], x[j]), hh))
+        fij = basis(_scale_r(norm(x[i] - x[j]), hh))
         F[i, j] = fij
         F[j, i] = fij
     end
@@ -539,13 +658,13 @@ function rbf_weights(rbf::RBF, x::Point)
     k = length(rbf.x)
     ψ = zeros(k)
     @inbounds for i in 1:k
-        ψ[i] = rbf.rbf_basis(_scale_r2(sqeuclidean(x, rbf.x[i]), rbf.h))
+        ψ[i] = rbf.rbf_basis(_scale_r(norm(x - rbf.x[i]), rbf.h))
     end
     if rbf.npoly == 0
         return rbf.fat \ ψ
     end
     p = rbf.monomial_basis(x)
-    return (rbf.fat \ [ψ; p])[1:k]
+    return (rbf.fat \ vcat(ψ, p))[1:k]
 end
 
 function rbf_partial_weights(rbf::RBF, dim::Int, x::Point)
@@ -560,7 +679,7 @@ function rbf_partial_weights(rbf::RBF, dim::Int, x::Point)
         return rbf.fat \ ψ
     end
     p = ∂(rbf.monomial_basis, dim, x)
-    return (rbf.fat \ [ψ; p])[1:k]
+    return (rbf.fat \ vcat(ψ, p))[1:k]
 end
 
 function rbf_evaluate(rbf::RBF, xt::AbstractVector{<:Point}, y::AbstractVector{<:Real})
@@ -573,7 +692,7 @@ function rbf_evaluate(rbf::RBF, xt::AbstractVector{<:Point}, y::AbstractVector{<
     @inbounds for j in 1:nt
         s = 0.0
         for i in 1:k
-            s += coef[i] * rbf.rbf_basis(_scale_r2(sqeuclidean(xt[j], rbf.x[i]), rbf.h))
+            s += coef[i] * rbf.rbf_basis(_scale_r(norm(xt[j] - rbf.x[i]), rbf.h))
         end
         if rbf.npoly > 0
             p = rbf.monomial_basis(xt[j])

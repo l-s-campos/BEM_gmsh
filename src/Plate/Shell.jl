@@ -38,7 +38,7 @@ at solve time as load transfer:
 function assemble_shell_coupling(shell::ShallowShell; npg=10)
     plate = shell.plate
     dad = shell.dad_pe
-    isempty(plate.H) && assemble_plate!(plate; npg=npg)
+    has_cache(plate, :H) || assemble_plate!(plate; npg=npg)
     A_pl, b_pl, _, _ = apply_bc_plate(plate)
     has_cache(dad, :H) || H_G_full_direct(dad; npg=npg, threaded=false)
     applyBC(dad)
@@ -67,14 +67,14 @@ function solve_shallow_shell!(shell::ShallowShell; niter=8, ω=0.5)
     # initial plate solve (no coupling)
     x_pl = shell.A_pl \ shell.b_pl
     # store into plate via solve_plate path
-    plate.u = x_pl  # approximate; full pack not needed for centre estimate
-    n = length(plate.nodes)
-    ni = length(plate.internal)
+    set_cache!(plate; u=x_pl, T=x_pl)
+    n = plate.n
+    ni = plate.ni
     w_c = ni > 0 ? x_pl[2n+1] : 0.0
 
     E = dad.properties.E
     ν = dad.properties.nu
-    h = plate.props.h
+    h = plate.properties.h
     CB = E * h / (1 - ν^2)
 
     for _ in 1:niter
@@ -86,13 +86,14 @@ function solve_shallow_shell!(shell::ShallowShell; niter=8, ω=0.5)
         q_extra = Nxx * invR11 + Nyy * invR22
         # add as uniform load contribution proportional to plate.q scale
         b = copy(shell.b_pl)
-        if norm(plate.q) > 0 && abs(plate.props.q_c) > 0
-            b .+= plate.q .* (q_extra / plate.props.q_c)
+        qload = has_cache(plate, :plate_q) ? plate.plate_q : nothing
+        if qload !== nothing && norm(qload) > 0 && abs(plate.properties.q_c) > 0
+            b .+= qload .* (q_extra / plate.properties.q_c)
         end
         x_pl = shell.A_pl \ b
         w_new = ni > 0 ? x_pl[2n+1] : 0.0
         w_c = ω * w_new + (1 - ω) * w_c
     end
-    plate.u = Float64.(x_pl)
+    set_cache!(plate; u=Float64.(x_pl), T=Float64.(x_pl))
     return (w_center=w_c, x_plate=x_pl)
 end

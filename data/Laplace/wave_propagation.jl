@@ -108,6 +108,19 @@ function mesh_membrane_fixed(; ndiv=20, Lx=1.0, Ly=1.0, nome="wave_mem_fixed", s
 end
 
 """
+    mesh_square_hardwall(; ndiv=16, L=1.5, nome="wave_hardwall", show=false)
+
+Square ``(-L,L)²`` with homogeneous Neumann ``q=0`` on every edge
+(acoustic hard wall / ``∂p/∂n = 0``).
+"""
+function mesh_square_hardwall(; ndiv=16, L=1.5, nome="wave_hardwall", show=false)
+    return _square_mesh_bc(;
+        nome=nome, Lx=2L, Ly=2L, x0=-L, y0=-L, ndiv=ndiv, ordem=1, show=show,
+        bottom="1;0", right="1;0", top="1;0", left="1;0",
+    )
+end
+
+"""
     mesh_membrane_forced_edge(; ndiv=20, P=1.0, nome="wave_mem_forced", show=false)
 
 §4.5 — unit square: left edge Dirichlet ``u = P`` (sudden), other edges ``u = 0``.
@@ -158,12 +171,12 @@ with ``ωₙ = (2n-1) π / 2``.
 function ana_bar_sudden(; N=500, c=1.0, L=1.0)
     u = (pt; t=0.0) -> begin
         x = _wave_sv(pt, 2)[1]
-        s = x  # static particular for unit load / E=1, L=1 scaled: u_static = x
-        # scale: for general L, u_static = (P/E) x with P=E=1 → x
+        s = x  # static: P=E=1 → u = x (end value L)
+        # modal coeffs of −x on [0,L] scale with L (unit-length factor is 8/((2n−1)π)²)
         @inbounds for n in 1:N
             kn = (2n - 1) * π / (2L)
             ωn = c * kn
-            s += 8 * (-1)^n / ((2n - 1) * π)^2 * cos(ωn * t) * sin(kn * x)
+            s += 8 * L * (-1)^n / ((2n - 1) * π)^2 * cos(ωn * t) * sin(kn * x)
         end
         return s
     end
@@ -175,7 +188,7 @@ function ana_bar_sudden(; N=500, c=1.0, L=1.0)
         @inbounds for n in 1:N
             kn = (2n - 1) * π / (2L)
             ωn = c * kn
-            dudx += 8 * (-1)^n / ((2n - 1) * π)^2 * cos(ωn * t) * kn * cos(kn * x)
+            dudx += 8 * L * (-1)^n / ((2n - 1) * π)^2 * cos(ωn * t) * kn * cos(kn * x)
         end
         return -dudx * m[1]   # ignore y-variation (1D field)
     end
@@ -185,6 +198,25 @@ function ana_bar_sudden(; N=500, c=1.0, L=1.0)
         q=q,
         description="Uniform bar sudden load (wave bar sudden)",
     )
+end
+
+"""1-D bar series: `(u, ü, ∂u/∂x)` at `x` (first coordinate of `pt`)."""
+function bar_sudden_fields(pt, t; N::Int=400, c::Real=1.0, L::Real=1.0)
+    x = _wave_sv(pt, 2)[1]
+    u = float(x)
+    ddu = 0.0
+    dudx = 1.0
+    @inbounds for n in 1:N
+        kn = (2n - 1) * π / (2L)
+        ωn = c * kn
+        a = 8 * L * (-1)^n / ((2n - 1) * π)^2
+        s = sin(kn * x)
+        cg = cos(ωn * t)
+        u += a * cg * s
+        ddu += a * (-ωn^2) * cg * s
+        dudx += a * cg * kn * cos(kn * x)
+    end
+    return (u=u, ddu=ddu, dudx=dudx)
 end
 
 """

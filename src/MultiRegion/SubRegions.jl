@@ -3,11 +3,15 @@
 
 export InterfacePair, ContactPair, MultiRegionProblem
 export pair_interfaces!, pair_contacts!, assemble_multiregion, solve_multiregion!
+export multiregion_ndof
 export solve_contact_friction!, solve_contact_friction_stepped!
+export solve_contact_friction_fretting!, set_farfield_displacement!
 export alart_curnier
+export project_contact_traction, project_contact_multipliers
 export CohesiveContactState, solve_cohesive_contact!
 export solve_multibody_elasticity_contact!
 export contact_nodes_elasticity, project_point_to_segment2d
+export contact_common_normal, apply_contact_common_normals!
 
 """
 BC type codes (Gmsh physical name `"type;value"`):
@@ -54,6 +58,8 @@ mutable struct ContactPair
     N2::Float64
     tn::Float64
     tt::Float64
+    """Locked relative tangential gap for incremental stick (Mindlin residual)."""
+    ut_lock::Float64
 end
 
 function ContactPair(
@@ -71,12 +77,14 @@ function ContactPair(
         N2::Real = 0.0,
         tn::Real = 0.0,
         tt::Real = 0.0,
+        ut_lock::Real = 0.0,
     )
     mnodes = master_nodes === nothing ? Int[Int(node_b)] : collect(Int, master_nodes)
     return ContactPair(
         Int(reg_a), Int(node_a), Int(reg_b), Int(node_b),
         float(μ), float(gap0), Int(state),
         method, mnodes, float(ξ), float(N1), float(N2), float(tn), float(tt),
+        float(ut_lock),
     )
 end
 
@@ -163,10 +171,11 @@ Pair collocation nodes tagged `BC == 4` between regions.
 - `tol` — NTN matching length scale (also used as a soft filter)
 
 Friction coefficient `μ` is taken from `BV` of the contact-typed dof. Initial
-gap is the geometric normal separation (positive = open).
+gap (`gap=:euclidean`, Contato `calc_gap_subreg`) is ``‖x_B-x_A‖``; `gap=:normal`
+uses ``(x_B-x_A)·n_{AB}``.
 """
 function pair_contacts!(prob::MultiRegionProblem; method::Symbol=:ntn, tol=1e-4,
-        slave_reg::Int=0, master_reg::Int=0)
+        slave_reg::Int=0, master_reg::Int=0, gap::Symbol=:euclidean)
     method === :ntn || method === :nts ||
         throw(ArgumentError("method must be :ntn or :nts (got $method)"))
     regs = prob.regions
@@ -214,8 +223,14 @@ function pair_contacts!(prob::MultiRegionProblem; method::Symbol=:ntn, tol=1e-4,
                 if best_ib > 0 && (best_d < tol * 10 || best_d < 1.0)
                     nb = nodes[rb][best_ib]
                     pb = regs[rb].Nodes[nb]
-                    n̂ = na_n / (norm(na_n) + eps())
-                    gap0 = max(0.0, dot(pb - pa, n̂))
+                    n̂ = contact_common_normal(na_n, _contact_young(regs[ra]),
+                        regs[rb].Normal[nb], _contact_young(regs[rb]))
+                    gap0 = if gap === :euclidean
+                        d = norm(pb - pa)
+                        d < 1e-8 ? 0.0 : d
+                    else
+                        max(0.0, dot(pb - pa, n̂))
+                    end
                     μ = max(mus[ra][ia], mus[rb][best_ib])
                     push!(pairs, ContactPair(ra, na, rb, nb, μ, gap0, 1;
                         method=:ntn, master_nodes=Int[nb], N1=1.0, N2=0.0))
@@ -226,6 +241,23 @@ function pair_contacts!(prob::MultiRegionProblem; method::Symbol=:ntn, tol=1e-4,
         end
     end
     prob.contacts = pairs
+    gap === :euclidean && _contato_snap_gaps!(pairs)
+    return pairs
+end
+
+"""Contato `calc_gap_subreg`: dist < 1e-8 → 0. If the closest pair is a
+light geometric miss (Gmsh), shift so min h = 0 (cylinder sits on the flat)."""
+function _contato_snap_gaps!(pairs)
+    isempty(pairs) && return pairs
+    for cp in pairs
+        cp.gap0 < 1e-8 && (cp.gap0 = 0.0)
+    end
+    hmin = minimum(cp.gap0 for cp in pairs)
+    if 0 < hmin < 1e-3
+        for cp in pairs
+            cp.gap0 = max(0.0, cp.gap0 - hmin)
+        end
+    end
     return pairs
 end
 
@@ -289,11 +321,12 @@ function _pair_contacts_nts(regs, nodes, mus, ra::Int, rb::Int; tol=1e-4)
     μ_m = isempty(mus[rb]) ? 0.0 : maximum(mus[rb])
     for (ia, na) in enumerate(slave)
         ps = dad_s.Nodes[na]
-        n̂ = dad_s.Normal[na]
-        n̂ = n̂ / (norm(n̂) + eps())
+        nA = dad_s.Normal[na]
         if length(master) == 1
             nb = master[1]
             pb = dad_m.Nodes[nb]
+            n̂ = contact_common_normal(nA, _contact_young(dad_s),
+                dad_m.Normal[nb], _contact_young(dad_m))
             gap0 = max(0.0, dot(pb - ps, n̂))
             μ = max(mus[ra][ia], μ_m)
             push!(pairs, ContactPair(ra, na, rb, nb, μ, gap0, 1;
@@ -310,6 +343,8 @@ function _pair_contacts_nts(regs, nodes, mus, ra::Int, rb::Int; tol=1e-4)
         end
         # primary master node = larger weight
         nb = best.N1 >= best.N2 ? best.m1 : best.m2
+        n̂ = contact_common_normal(nA, _contact_young(dad_s),
+            dad_m.Normal[nb], _contact_young(dad_m))
         gap0 = max(0.0, dot(best.p̄ - ps, n̂))
         μ = max(mus[ra][ia], μ_m)
         push!(pairs, ContactPair(ra, na, rb, nb, μ, gap0, 1;
@@ -326,8 +361,8 @@ end
 """
     assemble_multiregion(prob::MultiRegionProblem{<:Laplace})
 
-Assemble each subregion (`H_G_full_direct`) then build a global coupled system
-enforcing interface continuity ``T_a = T_b`` and flux balance ``q_a + q_b = 0``.
+Assemble each subregion independently (`H_G_full_direct`). Interface coupling
+is applied in [`solve_multiregion!`](@ref).
 """
 function assemble_multiregion(prob::MultiRegionProblem{<:Laplace}; npg=16)
     for dad in prob.regions
@@ -337,182 +372,355 @@ function assemble_multiregion(prob::MultiRegionProblem{<:Laplace}; npg=16)
 end
 
 """
-    solve_multiregion!(prob::MultiRegionProblem{<:Laplace})
+    solve_multiregion!(prob::MultiRegionProblem{<:Laplace}; strategy=:dense)
 
-Solve multi-region Laplace with Dirichlet/Neumann exterior BCs and type-3
-interface coupling (displacement continuity + traction equilibrium).
+Perfect-interface Laplace (`T_a = T_b`, `q_a + q_b = 0` with
+`q = -k ∂T/∂n`). Each zone is mixed-BC collocation with interface nodes
+treated as Neumann (unknown `T`); the unknown interface flux `q_if` is
+shared (`q_b = -q_if`).
+
+# Strategies
+
+- `:dense` — fill a single dense matrix of size `∑n_t + n_if` (original
+  MATLAB-style assembly).
+- `:noncondensing` — Kane / Saigal (IJNME 1990) **noncondensing** multi-zone:
+  same equations, stored as block-diagonal zone matrices plus interface
+  border. Block Gaussian elimination factors each full `A_r` and a Schur
+  complement of size `n_if` (continuity). All zone DOFs stay in the
+  unreduced system.
+- `:condense` — Kane **zone condensation**: eliminate exterior DOFs of each
+  zone (`A_ee`) first. The global system is the stacked condensed interface
+  maps on shared `(T_if, q_if)`, size `2 n_if`. Zone interiors are recovered
+  by back-substitution.
+
+Aliases: `:blocked` → `:noncondensing`, `:condensation` → `:condense`.
+Set `apply_bc=false` to reuse an already mixed `A,b` (timing / repeated solves).
 """
-function solve_multiregion!(prob::MultiRegionProblem{<:Laplace})
-    regs = prob.regions
+function solve_multiregion!(prob::MultiRegionProblem{<:Laplace};
+        strategy::Symbol=:dense, apply_bc::Bool=true)
+    strategy = _mr_strategy(strategy)
     isempty(prob.interfaces) && pair_interfaces!(prob)
+    if apply_bc
+        _tag_coupling_as_neumann!(prob)
+        for dad in prob.regions
+            applyBC(dad)
+        end
+    end
+    if strategy === :dense
+        return _solve_mr_dense!(prob)
+    elseif strategy === :noncondensing
+        return _solve_mr_noncondensing!(prob)
+    elseif strategy === :condense
+        return _solve_mr_condense!(prob)
+    else
+        throw(ArgumentError("unknown multi-region strategy $strategy; use :dense, :noncondensing, or :condense"))
+    end
+end
 
-    # per-region sizes (boundary only for coupling; keep full nt for internals)
-    ns = [dad.n for dad in regs]
-    nts = [dad.nt for dad in regs]
-    offsets = cumsum([0; nts[1:end-1]])
-    N = sum(nts)
+_mr_strategy(s::Symbol) =
+    s === :blocked ? :noncondensing :
+    s === :kane ? :noncondensing :
+    s === :condensation ? :condense : s
 
-    # Build block-diagonal A x = b treating interface nodes as Neumann unknowns
-    # then add coupling.  Strategy:
-    # 1. For each region, form local system with standard BC on non-interface
-    #    nodes; interface nodes kept as unknown T with unknown q (both free).
-    # 2. Global unknown vector: for each region the standard mixed unknown
-    #    (q on Dir, T on Neu/Interface/internal).
-    # Simpler monolithic approach used here:
-    # unknown = all T on every node (boundary+internal) of every region, plus
-    # q on every boundary node.  Then equations:
-    #   H T - G q = 0  (per region, nt eqs)
-    #   BC Dirichlet: T_i = T̄
-    #   BC Neumann:   q_i = q̄
-    #   Interface:    T_a - T_b = 0,  q_a + q_b = 0
+"""Global unknown count for `strategy` (`:dense`, `:noncondensing`, `:condense`)."""
+function multiregion_ndof(prob::MultiRegionProblem; strategy::Symbol=:dense)
+    strategy = _mr_strategy(strategy)
+    nts = [dad.nt for dad in prob.regions]
+    n_if = length(prob.interfaces)
+    Nloc = sum(nts)
+    if strategy === :dense || strategy === :noncondensing
+        return Nloc + n_if
+    elseif strategy === :condense
+        return 2 * n_if
+    else
+        throw(ArgumentError("unknown multi-region strategy $strategy"))
+    end
+end
 
-    # Count DOFs
-    # We'll use condensed system: apply known BC, free DOFs only.
-    # Free per region: unknown T (Neu + interface + internal) and unknown q (Dir + interface)
+function _tag_node_neumann!(dad, node::Int)
+    if dad.properties isa Scalar
+        dad.BC[node] = BC_NEUMANN
+        dad.BV[node] = 0.0
+    else
+        dim = dad.dimension
+        for k in 1:dim
+            dad.BC[dim * (node - 1) + k] = BC_NEUMANN
+            dad.BV[dim * (node - 1) + k] = 0.0
+        end
+    end
+    return nothing
+end
 
-    # --- Build global dense system with coupling rows ---
-    # Unknown layout per region r:
-    #   [q_1..q_n | T_1..T_nt ] but with knowns eliminated → use full and Lagrange
-
-    # Full unknown: x = [x_1; x_2; ...] where x_r is the standard mixed unknown
-    # of size nt_r after applyBC-style column swap for Dir/Neu only; interface
-    # treated as Neumann (unknown T).
-
-    # Step 1: tag interface nodes as Neumann for local applyBC
+function _tag_coupling_as_neumann!(prob::MultiRegionProblem)
+    regs = prob.regions
     for (r, dad) in enumerate(regs)
         for ip in prob.interfaces
             if ip.reg_a == r
-                dad.BC[ip.node_a] = BC_NEUMANN
-                dad.BV[ip.node_a] = 0.0   # temporary
+                _tag_node_neumann!(dad, ip.node_a)
             elseif ip.reg_b == r
-                dad.BC[ip.node_b] = BC_NEUMANN
-                dad.BV[ip.node_b] = 0.0
+                _tag_node_neumann!(dad, ip.node_b)
             end
         end
-        # restore type-3 was only for pairing; contact type-4 left as Neumann open
         for cp in prob.contacts
             if cp.reg_a == r
-                dad.BC[cp.node_a] = BC_NEUMANN
-                dad.BV[cp.node_a] = 0.0
+                _tag_node_neumann!(dad, cp.node_a)
             elseif cp.reg_b == r
-                dad.BC[cp.node_b] = BC_NEUMANN
-                dad.BV[cp.node_b] = 0.0
+                _tag_node_neumann!(dad, cp.node_b)
             end
         end
-        applyBC(dad)
     end
+    return nothing
+end
 
-    # Local systems A_r x_r = b_r of size nt_r
-    # Interface coupling: we need q at interface nodes as well.
-    # Extract from split: after solve, q is recovered.
-    # For coupling during solve, expand unknowns to include interface fluxes.
-
-    # Monolithic construction:
-    # unknowns per region: T[1:nt] and q[1:n]
-    # eqs per region: H T - G q = 0  (nt)
-    # + Dirichlet T_i = T̄, Neumann q_i = q̄ for exterior
-    # + interface T_a=T_b, q_a+q_b=0
-
-    nT = sum(nts)
-    nq = sum(ns)
+"""`B_r` such that zone `r` reads `A_r x_r + B_r q_if = b_r` (`q_b = -q_if`)."""
+function _mr_flux_columns(prob::MultiRegionProblem{<:Laplace})
+    regs = prob.regions
     n_if = length(prob.interfaces)
-    # unknowns: all T (nT) + all q (nq)  — then replace knowns with identity rows
-    nu = nT + nq
-    A = zeros(nu + 2n_if, nu)   # extra rows for interface (may overdet; use square via replacement)
-    # Better: start with nt_total eqs from BIE + BC rows replacing, + interface
-
-    # Rebuild square system of size nT + n_if
-    # Standard multi-region: each region contributes nt eqs (BIE with BC applied
-    # treating interface as unknown T and free q). Coupling adds 2 eqs per pair
-    # but also 2 unknowns (T shared counts once... ).
-
-    # Practical approach matching MATLAB compatibilidade_equilibrio:
-    # Block-diagonal A from each region (interface = unknown T, like Neumann).
-    # Then ADD rows: T_a - T_b = 0 and columns for interface q with q_a + q_b = 0
-    # by introducing interface traction unknowns.
-
-    # --- Block diagonal of local A (size sum nt) ---
-    Nloc = sum(nts)
-    n_if = length(prob.interfaces)
-    # Extra unknowns: interface flux q_if[k] (= q_a = -q_b)
-    N = Nloc + n_if
-    Ag = zeros(N, N)
-    bg = zeros(N)
-
-    off_T = offsets_from(nts)   # start index of T-block (= local x) per region
-
-    for (r, dad) in enumerate(regs)
-        o = off_T[r]
-        nr = nts[r]
-        # Local A x = b with interface as Neumann 0; we'll correct interface columns
-        Ag[o+1:o+nr, o+1:o+nr] .= dad.A
-        bg[o+1:o+nr] .= dad.b
-    end
-
-    # For each interface pair, the local systems currently assume q=0 on those
-    # nodes (Neumann 0). True equation: contribution G*q_if on side a and
-    # G*(-q_if) on side b.
-    # Local unknown x mixes q (Dir columns) and T (Neu columns).
-    # Interface nodes are Neumann → unknown is T at position node index in x.
-    # We need to add G columns * q_if.
-
+    Bs = [zeros(dad.nt, n_if) for dad in regs]
     for (k, ip) in enumerate(prob.interfaces)
-        col_q = Nloc + k   # global column for q_if
-        # region a: BIE has ... - G[:,na] * q_a, and q_a = q_if
-        # After applyBC with Neu, A has H columns for interface T.
-        # The residual is A x - b - G[:,na]*q_if = 0 on side a
-        #                 A x - b - G[:,nb]*(-q_if) = 0 on side b
         dad_a = regs[ip.reg_a]
         dad_b = regs[ip.reg_b]
-        oa, ob = off_T[ip.reg_a], off_T[ip.reg_b]
-        Ga = dad_a.G
-        Gb = dad_b.G
         na, nb = ip.node_a, ip.node_b
-        # Add -G[:,na] to column col_q for rows of region a
+        Ga, Gb = dad_a.G, dad_b.G
         if na <= size(Ga, 2)
-            Ag[oa+1:oa+nts[ip.reg_a], col_q] .-= Ga[:, na]
+            @views Bs[ip.reg_a][:, k] .-= Ga[:, na]
         end
-        # Add +G[:,nb] for region b (since q_b = -q_if)
         if nb <= size(Gb, 2)
-            Ag[ob+1:ob+nts[ip.reg_b], col_q] .+= Gb[:, nb]
+            @views Bs[ip.reg_b][:, k] .+= Gb[:, nb]
         end
     end
+    return Bs
+end
 
-    # Continuity rows: T_a - T_b = 0
-    # T is the unknown at Neumann/interface position = node index in local x
-    for (k, ip) in enumerate(prob.interfaces)
-        row = Nloc + k
-        oa, ob = off_T[ip.reg_a], off_T[ip.reg_b]
-        # local unknown index for T at interface node = node index (Neu)
-        Ag[row, oa + ip.node_a] = 1.0
-        Ag[row, ob + ip.node_b] = -1.0
-        bg[row] = 0.0
-    end
-
-    x = Ag \ bg
-
-    # Split solution back
+function _scatter_mr_sol!(prob::MultiRegionProblem{<:Laplace},
+        xs::Vector{<:AbstractVector}, qif::AbstractVector)
+    regs = prob.regions
     for (r, dad) in enumerate(regs)
-        o = off_T[r]
-        xr = x[o+1:o+nts[r]]
         Tfull = zeros(dad.nt)
         qfull = zeros(dad.n)
-        Tfull .= xr
-        # recover q from split for Dir/Neu
+        Tfull .= xs[r]
         split_sol!(dad, Tfull, qfull)
-        # interface q from q_if
         for (k, ip) in enumerate(prob.interfaces)
-            qif = x[Nloc + k]
             if ip.reg_a == r
-                qfull[ip.node_a] = qif
-                # T already in Tfull
+                qfull[ip.node_a] = qif[k]
             elseif ip.reg_b == r
-                qfull[ip.node_b] = -qif
+                qfull[ip.node_b] = -qif[k]
             end
         end
         set_cache!(dad; T=Tfull, q=qfull)
     end
+    return nothing
+end
+
+function _pack_mr_x(xs, qif)
+    nloc = sum(length, xs)
+    x = zeros(nloc + length(qif))
+    o = 0
+    for xr in xs
+        n = length(xr)
+        x[o+1:o+n] .= xr
+        o += n
+    end
+    x[o+1:end] .= qif
     return x
+end
+
+# ---------------------------------------------------------------------------
+# :dense — fill ∑n_t + n_if  (compatibilidade / equilíbrio)
+# ---------------------------------------------------------------------------
+function _solve_mr_dense!(prob::MultiRegionProblem{<:Laplace})
+    regs = prob.regions
+    nts = [dad.nt for dad in regs]
+    n_if = length(prob.interfaces)
+    Nloc = sum(nts)
+    N = Nloc + n_if
+    Ag = zeros(N, N)
+    bg = zeros(N)
+    off = offsets_from(nts)
+    Bs = _mr_flux_columns(prob)
+    for (r, dad) in enumerate(regs)
+        o = off[r]
+        nr = nts[r]
+        Ag[o+1:o+nr, o+1:o+nr] .= dad.A
+        bg[o+1:o+nr] .= dad.b
+        if n_if > 0
+            Ag[o+1:o+nr, Nloc+1:N] .= Bs[r]
+        end
+    end
+    for (k, ip) in enumerate(prob.interfaces)
+        row = Nloc + k
+        Ag[row, off[ip.reg_a] + ip.node_a] = 1.0
+        Ag[row, off[ip.reg_b] + ip.node_b] = -1.0
+    end
+    x = bem_linsolve(Ag, bg)
+    xs = [x[off[r]+1:off[r]+nts[r]] for r in eachindex(regs)]
+    qif = n_if == 0 ? Float64[] : x[Nloc+1:N]
+    _scatter_mr_sol!(prob, xs, qif)
+    return x
+end
+
+# ---------------------------------------------------------------------------
+# :noncondensing — Kane blocked system, all zone DOFs kept
+#   A_r x_r + B_r q_if = b_r
+#   T_a - T_b = 0
+# Factor each full A_r; Schur on q_if is n_if × n_if.
+# ---------------------------------------------------------------------------
+function _solve_mr_noncondensing!(prob::MultiRegionProblem{<:Laplace})
+    regs = prob.regions
+    n_if = length(prob.interfaces)
+    nR = length(regs)
+    Bs = _mr_flux_columns(prob)
+    Ys = Vector{Matrix{Float64}}(undef, nR)
+    zs = Vector{Vector{Float64}}(undef, nR)
+    for r in 1:nR
+        A = Matrix{Float64}(regs[r].A)
+        b = collect(Float64, regs[r].b)
+        if n_if == 0
+            zs[r] = bem_linsolve(A, b)
+            Ys[r] = zeros(length(b), 0)
+        else
+            F = lu(A)
+            zs[r] = F \ b
+            Ys[r] = F \ Bs[r]
+        end
+    end
+    qif = zeros(n_if)
+    if n_if > 0
+        S = zeros(n_if, n_if)
+        rhs = zeros(n_if)
+        for (k, ip) in enumerate(prob.interfaces)
+            S[k, :] .= view(Ys[ip.reg_a], ip.node_a, :) .- view(Ys[ip.reg_b], ip.node_b, :)
+            rhs[k] = zs[ip.reg_a][ip.node_a] - zs[ip.reg_b][ip.node_b]
+        end
+        qif .= bem_linsolve(S, rhs)
+    end
+    xs = [zs[r] .- Ys[r] * qif for r in 1:nR]
+    _scatter_mr_sol!(prob, xs, qif)
+    return _pack_mr_x(xs, qif)
+end
+
+# ---------------------------------------------------------------------------
+# :condense — Kane zone condensation onto shared (T_if, q_if)
+# Exterior DOFs of zone r: A_ee x_e + A_ei T_if + B_e q_if = b_e
+# Interface rows become the condensed map after eliminating x_e.
+# ---------------------------------------------------------------------------
+function _solve_mr_condense!(prob::MultiRegionProblem{<:Laplace})
+    regs = prob.regions
+    n_if = length(prob.interfaces)
+    nR = length(regs)
+    if n_if == 0
+        xs = [bem_linsolve(Matrix{Float64}(regs[r].A), collect(Float64, regs[r].b)) for r in 1:nR]
+        _scatter_mr_sol!(prob, xs, Float64[])
+        return _pack_mr_x(xs, Float64[])
+    end
+    Bs = _mr_flux_columns(prob)
+
+    # stacked condensed rows: one block of n_if_local per zone
+    n_rows = 0
+    zone_if = Vector{Vector{Int}}(undef, nR)
+    zone_pair = Vector{Vector{Int}}(undef, nR)
+    for r in 1:nR
+        if_local = Int[]
+        pair_of = Int[]
+        for (k, ip) in enumerate(prob.interfaces)
+            if ip.reg_a == r
+                push!(if_local, ip.node_a)
+                push!(pair_of, k)
+            elseif ip.reg_b == r
+                push!(if_local, ip.node_b)
+                push!(pair_of, k)
+            end
+        end
+        zone_if[r] = if_local
+        zone_pair[r] = pair_of
+        n_rows += length(if_local)
+    end
+    K = zeros(n_rows, 2 * n_if)
+    f = zeros(n_rows)
+    # expansion data
+    e_idx = Vector{Vector{Int}}(undef, nR)
+    AeeF = Vector{Any}(undef, nR)
+    Aei = Vector{Matrix{Float64}}(undef, nR)
+    Be = Vector{Matrix{Float64}}(undef, nR)
+    be = Vector{Vector{Float64}}(undef, nR)
+
+    row0 = 0
+    for r in 1:nR
+        dad = regs[r]
+        A = Matrix{Float64}(dad.A)
+        b = collect(Float64, dad.b)
+        B = Bs[r]
+        nt = dad.nt
+        if_local = zone_if[r]
+        pair_of = zone_pair[r]
+        nl = length(if_local)
+        e = setdiff(1:nt, if_local)
+        e_idx[r] = e
+        ne = length(e)
+        if nl == 0
+            # zone not on any interface: solve fully, no condensed rows
+            AeeF[r] = lu(A)
+            Aei[r] = zeros(nt, 0)
+            Be[r] = zeros(nt, n_if)
+            be[r] = b
+            e_idx[r] = collect(1:nt)
+            continue
+        end
+        Aii = A[if_local, if_local]
+        Bi = B[if_local, :]
+        bi = b[if_local]
+        if ne == 0
+            AeeF[r] = nothing
+            Aei[r] = zeros(0, nl)
+            Be[r] = zeros(0, n_if)
+            be[r] = Float64[]
+            See = Aii
+            Ce = Bi
+            fe = bi
+        else
+            F = lu(A[e, e])
+            AeeF[r] = F
+            Aei[r] = A[e, if_local]
+            Be[r] = B[e, :]
+            be[r] = b[e]
+            Aie = A[if_local, e]
+            RHS = hcat(Aei[r], Be[r], be[r])
+            Y = F \ RHS
+            See = Aii - Aie * view(Y, :, 1:nl)
+            Ce = Bi - Aie * view(Y, :, nl+1:nl+n_if)
+            fe = bi - Aie * view(Y, :, nl+n_if+1)
+        end
+        rows = row0+1:row0+nl
+        @inbounds for j in 1:nl
+            K[rows, pair_of[j]] .= view(See, :, j)
+        end
+        K[rows, n_if+1:2n_if] .= Ce
+        f[rows] .= fe
+        row0 += nl
+    end
+    y = bem_linsolve(K, f)
+    Tif = y[1:n_if]
+    qif = y[n_if+1:end]
+
+    xs = Vector{Vector{Float64}}(undef, nR)
+    for r in 1:nR
+        nt = regs[r].nt
+        xr = zeros(nt)
+        if_local = zone_if[r]
+        pair_of = zone_pair[r]
+        if isempty(if_local)
+            xr .= AeeF[r] \ be[r]
+        else
+            xr[if_local] .= Tif[pair_of]
+            if AeeF[r] !== nothing
+                rhs_e = be[r] .- Aei[r] * Tif[pair_of] .- Be[r] * qif
+                xr[e_idx[r]] .= AeeF[r] \ rhs_e
+            end
+        end
+        xs[r] = xr
+    end
+    _scatter_mr_sol!(prob, xs, qif)
+    return _pack_mr_x(xs, qif)
 end
 
 function offsets_from(sizes)
@@ -526,1124 +734,121 @@ function offsets_from(sizes)
 end
 
 # =============================================================================
-# Frictional contact between subregions (type 4) — Laplace frictionless first,
-# elasticity with Coulomb stick/slip
+# Multi-region assembly + solve (2-D elasticity, perfect interface)
 # =============================================================================
 
-"""
-    solve_contact_friction!(prob; δ=0.0, tol=1e-8, maxiter=50)
+const ElasticMR = Union{Elasticity, AnisotropicElasticity}
 
-Frictional contact iteration for type-4 pairs (from ContatoMultiCorpos2 logic).
-
-States per pair: `1=open`, `2=slip`, `3=stick`.
-
-# Laplace (scalar)
-Contact is frictionless unilateral: gap ≥ 0, q ≤ 0 (compression), complementarity.
-`μ` ignored for scalar.
-
-# Elasticity
-Coulomb: stick ``u_t^a = u_t^b``, ``|t_t| ≤ μ |t_n|``;
-slip ``t_t = ±μ t_n``, gap closed in normal direction.
-`δ` = additional rigid normal approach.
-"""
-function solve_contact_friction!(prob::MultiRegionProblem{<:Laplace};
-    δ=0.0, tol=1e-8, maxiter=40)
-    isempty(prob.contacts) && pair_contacts!(prob)
-    # Frictionless unilateral for scalar potential/heat: treat like Signorini
-    # on the normal flux.  We iterate active set.
+"""Assemble each elastic subregion (`assemble!` or [`H_G_hyper`](@ref))."""
+function assemble_multiregion(prob::MultiRegionProblem{<:ElasticMR};
+        npg::Int=16, bie::Symbol=:cbie, threaded::Bool=false)
     for dad in prob.regions
-        has_cache(dad, :H) || H_G_full_direct(dad, 16)
+        if bie === :hbie
+            H_G_hyper(dad; npg=npg, threaded=threaded)
+        else
+            H_G_full_direct(dad; npg=npg, threaded=threaded)
+        end
     end
-
-    for _it in 1:maxiter
-        # set BC from contact state
-        for cp in prob.contacts
-            da, db = prob.regions[cp.reg_a], prob.regions[cp.reg_b]
-            if cp.state == 1  # open: Neumann 0 both
-                da.BC[cp.node_a] = BC_NEUMANN; da.BV[cp.node_a] = 0.0
-                db.BC[cp.node_b] = BC_NEUMANN; db.BV[cp.node_b] = 0.0
-            else  # closed: interface-like continuity of T, balance of q
-                da.BC[cp.node_a] = BC_INTERFACE
-                db.BC[cp.node_b] = BC_INTERFACE
-            end
-        end
-        # rebuild interfaces from closed contacts + type-3
-        pair_interfaces!(prob)
-        # also add closed contacts as interfaces
-        for cp in prob.contacts
-            if cp.state != 1
-                push!(prob.interfaces, InterfacePair(cp.reg_a, cp.node_a, cp.reg_b, cp.node_b))
-            end
-        end
-        solve_multiregion!(prob)
-
-        changed = false
-        for cp in prob.contacts
-            da, db = prob.regions[cp.reg_a], prob.regions[cp.reg_b]
-            Ta, Tb = da.T[cp.node_a], db.T[cp.node_b]
-            qa, qb = da.q[cp.node_a], db.q[cp.node_b]
-            # gap estimate: geometric + (Tb - Ta) as relative "penetration" proxy
-            # For potential this is not a mechanical gap; use flux sign
-            gap = cp.gap0 - δ + (Tb - Ta)  # heuristic
-            compression = -(qa)  # positive if flux into a from contact
-            if cp.state == 1  # open
-                if gap < -tol
-                    cp.state = 3; changed = true
-                end
-            else  # closed
-                if compression < -tol  # tension → open
-                    cp.state = 1; changed = true
-                end
-            end
-        end
-        !changed && break
-    end
-    return prob
+    return nothing
 end
 
 """
-Elasticity frictional contact — Contato (MATLAB) multi-body **active-set** scheme.
+    solve_multiregion!(prob::MultiRegionProblem{<:Union{Elasticity,AnisotropicElasticity}})
 
-Builds a **coupled** global system in the nodal (n,t) frame (Leonardo / Contato):
-
-1. Each region: ``Ĥ, Ĝ`` via local rotation; exterior BCs applied; contact faces
-   keep free ``u`` with contact tractions as extra unknowns.
-2. Contact pairs contribute 4 algebraic rows (open / slip / stick) as in
-   `aplica_contato_com_atrito_multicorpos.m`.
-3. **Explicit active-set loop** (Contato with frozen set = one linear solve):
-   ```text
-   state ← verify(x)
-   A, b  ← assemble(state)
-   x     ← A \\ b
-   until ‖Δx‖ small and/or states stable
-   ```
-   Equivalent to one Newton step on ``R = Ax - b`` with ``J = A``.
-
-States: `1=open`, `±2=slip`, `3=stick` (MATLAB codes).
-
-Solvers:
-- `:activeset` (default) — Contato verify → assemble → ``x=A\\b``
-- `:ssn` — semi-smooth Newton on Alart–Curnier residual (same unknowns)
-- `:alm` — Uzawa augmented Lagrangian (multiplier projection + BIE with fixed ``t``)
-
-For robustness under large approach/load prefer
-[`solve_contact_friction_stepped!`](@ref) (outer load loop + warm start).
-
-# Keywords
-- `δ` — rigid approach (``h = g₀ - δ``)
-- `solver` — `:activeset` | `:ssn` | `:alm`
-- `rn`, `rt` — augmentation / AC scales (default: auto from ``E/L``); `:ssn` and `:alm`
-- `alm_omega` — multiplier under-relaxation in `(0,1]` (default `0.5`); `:alm` only
-- `r_grow` — multiply ``(rn,rt)`` each outer ALM iter if still penetrating (default `1`)
-- `x0` — optional warm-start unknown vector
-- `reset_states` — if `true` (default), all pairs start open
-- `return_x` — also return the unknown vector for warm starts
+Perfect interface: ``u_a = u_b``, ``t_a + t_b = 0``. Dense system of size
+``∑ 2 n_r + 2 n_{if}``.
 """
-function solve_contact_friction!(prob::MultiRegionProblem{<:Elasticity};
-        δ=0.0, tol=1e-8, maxiter=40, npg=12, verbose=false,
-        method::Symbol=:ntn,
-        solver::Symbol=:activeset,
-        rn::Union{Nothing,Real}=nothing,
-        rt::Union{Nothing,Real}=nothing,
-        alm_omega::Real=0.5,
-        r_grow::Real=1.0,
-        x0::Union{Nothing,AbstractVector}=nothing,
-        reset_states::Bool=true,
-        return_x::Bool=false)
-    ctx = _contact_friction_setup(prob; method=method, npg=npg)
-    ctx === nothing && return return_x ? (prob, Float64[]) : prob
-    prep, pairs = ctx.prep, ctx.pairs
-    h = [cp.gap0 - δ for cp in pairs]
-    N = ctx.N
-    x_init = if x0 === nothing
-        zeros(N)
-    else
-        length(x0) == N || throw(DimensionMismatch("x0 length $(length(x0)) ≠ $N"))
-        collect(Float64, x0)
-    end
-    if reset_states
-        for cp in pairs
-            cp.state = 1
+function solve_multiregion!(prob::MultiRegionProblem{<:ElasticMR}; apply_bc::Bool=true)
+    isempty(prob.interfaces) && pair_interfaces!(prob)
+    if apply_bc
+        _tag_coupling_as_neumann!(prob)
+        for dad in prob.regions
+            applyBC(dad)
         end
     end
-    x, ok = _contact_inner_solve!(prep, pairs, h, x_init;
-        solver=solver, tol=tol, maxiter=maxiter, verbose=verbose,
-        rn=rn, rt=rt, alm_omega=alm_omega, r_grow=r_grow)
-    ok || @warn "solve_contact_friction! did not fully converge" δ=δ solver=solver
-    _verify_contact_states!(pairs, prep, h, x; epsc=1e-7)
-    _scatter_contact_solution!(prob, prep, pairs, x)
-    if !isempty(prob.regions)
-        set_cache!(prob.regions[1]; contact_x=copy(x))
-    end
-    return return_x ? (prob, x) : prob
+    return _solve_mr_dense_elast!(prob)
 end
 
-"""
-    solve_contact_friction_stepped!(prob; δ_end, nsteps=10, ...)
-
-**Load-stepped** frictional contact: outer loop on rigid approach ``δ``, inner
-solver (Contato active-set, SSN, or augmented Lagrangian).
-
-```text
-for s = 1:nsteps
-    δ_s = δ_end * s/nsteps
-    x ← inner_solve(δ_s; warm-start x)   # :activeset | :ssn | :alm
-end
-```
-
-# Keywords
-- `δ_end` / `δ_start` / `nsteps` / `δ_path` — approach schedule
-- `solver` — `:activeset` (default) | `:ssn` | `:alm`
-- `rn`, `rt` — augmentation scales for `:ssn` / `:alm` (default auto)
-- `alm_omega`, `r_grow` — Uzawa ALM options
-- `adaptive` — bisect a failed step once and retry
-- `tol`, `maxiter`, `method`, `verbose`, `npg`
-
-History: `contact_δ_hist`, `contact_tn_hist`, `contact_x` on `prob.regions[1]`.
-"""
-function solve_contact_friction_stepped!(prob::MultiRegionProblem{<:Elasticity};
-        δ_end::Union{Nothing,Real}=nothing,
-        δ_start::Real=0.0,
-        nsteps::Int=10,
-        δ_path::Union{Nothing,AbstractVector}=nothing,
-        adaptive::Bool=true,
-        tol=1e-8,
-        maxiter=40,
-        npg=12,
-        verbose=false,
-        method::Symbol=:ntn,
-        solver::Symbol=:activeset,
-        rn::Union{Nothing,Real}=nothing,
-        rt::Union{Nothing,Real}=nothing,
-        alm_omega::Real=0.5,
-        r_grow::Real=1.0,
-        max_bisect::Int=6)
-    ctx = _contact_friction_setup(prob; method=method, npg=npg)
-    ctx === nothing && return prob
-    prep, pairs = ctx.prep, ctx.pairs
-    N = ctx.N
-
-    if δ_path !== nothing
-        path = collect(Float64, δ_path)
-    else
-        δ_end === nothing && throw(ArgumentError("pass δ_end or δ_path"))
-        nsteps >= 1 || throw(ArgumentError("nsteps ≥ 1"))
-        path = collect(range(float(δ_start), float(δ_end); length=nsteps + 1))[2:end]
-    end
-
-    x = zeros(N)
-    if has_cache(prob.regions[1], :contact_x)
-        xw = prob.regions[1].contact_x
-        length(xw) == N && (x = collect(Float64, xw))
-    end
-    for cp in pairs
-        cp.state = 1
-    end
-
-    δ_hist = Float64[]
-    tn_hist = Float64[]
-    s = 1
-    n_bisect = 0
-    δ_ref = δ_end === nothing ? (isempty(path) ? 1.0 : path[end]) : float(δ_end)
-    while s <= length(path)
-        δ = path[s]
-        h = [cp.gap0 - δ for cp in pairs]
-        x_try, ok = _contact_inner_solve!(prep, pairs, h, x;
-            solver=solver, tol=tol, maxiter=maxiter, verbose=verbose,
-            rn=rn, rt=rt, alm_omega=alm_omega, r_grow=r_grow)
-        if !ok && adaptive && n_bisect < max_bisect
-            δ_prev = s == 1 ? float(δ_start) : path[s - 1]
-            δ_mid = 0.5 * (δ_prev + δ)
-            if abs(δ_mid - δ_prev) > 1e-14 * max(abs(δ_ref), 1.0)
-                verbose && @info "contact step failed; bisecting" δ=δ δ_mid=δ_mid solver=solver
-                insert!(path, s, δ_mid)
-                n_bisect += 1
-                continue
-            end
-        end
-        if !ok
-            @warn "solve_contact_friction_stepped! step failed" s=s δ=δ solver=solver
-        end
-        x = x_try
-        _verify_contact_states!(pairs, prep, h, x; epsc=1e-7)
-        push!(δ_hist, δ)
-        tn_mean = mean(abs(cp.tn) for cp in pairs)
-        push!(tn_hist, tn_mean)
-        verbose && @info "contact step" s=s δ=δ solver=solver n_closed=count(cp -> abs(cp.state) != 1, pairs) tn_mean=tn_mean
-        s += 1
-    end
-
-    _scatter_contact_solution!(prob, prep, pairs, x)
-    set_cache!(prob.regions[1]; contact_x=copy(x),
-        contact_δ_hist=δ_hist, contact_tn_hist=tn_hist)
-    return prob
-end
-
-# ---------------------------------------------------------------------------
-# Shared setup + explicit active-set driver (Contato)
-# ---------------------------------------------------------------------------
-
-function _contact_friction_setup(prob::MultiRegionProblem{<:Elasticity};
-        method::Symbol=:ntn, npg=12)
-    isempty(prob.contacts) && pair_contacts!(prob; method=method)
+function _mr_traction_columns(prob::MultiRegionProblem{<:ElasticMR})
     regs = prob.regions
-    length(regs) >= 2 || error("need ≥2 regions")
-    for dad in regs
-        dad.dimension == 2 || error("elasticity contact is 2D only")
-        has_cache(dad, :H) || H_G_full_direct(dad, npg)
-    end
-    BC0 = [copy(d.BC) for d in regs]
-    BV0 = [copy(d.BV) for d in regs]
-    prep = _prepare_regions_contact_local(regs, BC0, BV0)
-    pairs = prob.contacts
-    isempty(pairs) && (@warn "no contact pairs"; return nothing)
-    N = sum(p.ndof for p in prep) + 4 * length(pairs)
-    return (; prep, pairs, N)
-end
-
-"""
-Contato active-set iteration (explicit linear solves).
-
-```text
-for it = 1:maxiter
-    state ← verify(x)                 # open / stick / ±slip
-    A, b  ← assemble(state, h)
-    x_new ← A \\ b                    # exact for frozen set
-    stop if ‖x_new - x‖ < tol
-    x ← x_new
-end
-```
-
-Returns `(x, converged)`.
-"""
-function _contact_activeset!(prep, pairs, h, x_init;
-        tol=1e-8, maxiter=40, verbose=false, epsc=1e-7)
-    x = collect(Float64, x_init)
-    ok = false
-    for it in 1:maxiter
-        _verify_contact_states!(pairs, prep, h, x; epsc=epsc)
-        A, b = _assemble_contact_system(prep, pairs, h, x)
-        x_new = A \ b
-        dist = norm(x_new - x)
-        verbose && @info "contact active-set" it dist n_closed=count(cp -> abs(cp.state) != 1, pairs)
-        x .= x_new
-        if dist < tol
-            ok = true
-            break
-        end
-    end
-    return x, ok
-end
-
-"""Dispatch inner contact solve: `:activeset`, `:ssn`, or `:alm`."""
-function _contact_inner_solve!(prep, pairs, h, x_init;
-        solver::Symbol=:activeset, tol=1e-8, maxiter=40, verbose=false,
-        rn=nothing, rt=nothing, alm_omega::Real=0.5, r_grow::Real=1.0)
-    if solver === :activeset
-        return _contact_activeset!(prep, pairs, h, x_init; tol=tol, maxiter=maxiter,
-            verbose=verbose)
-    elseif solver === :ssn
-        return _contact_ssn!(prep, pairs, h, x_init; tol=tol, maxiter=maxiter,
-            verbose=verbose, rn=rn, rt=rt)
-    elseif solver === :alm || solver === :uzawa
-        return _contact_alm!(prep, pairs, h, x_init; tol=tol, maxiter=maxiter,
-            verbose=verbose, rn=rn, rt=rt, omega=alm_omega, r_grow=r_grow)
-    else
-        throw(ArgumentError(
-            "unknown contact solver $(repr(solver)); use :activeset, :ssn, or :alm"))
-    end
-end
-
-# -----------------------------------------------------------------------------
-# Semi-smooth Newton (Alart–Curnier) on Contato unknowns
-# -----------------------------------------------------------------------------
-
-"""Default AC scales ``r ∼ 10 E / L`` from region properties / bbox."""
-function _default_contact_r(prep)
-    E = mean(float(p.dad.properties.E) for p in prep)
-    xmin = ymin = Inf
-    xmax = ymax = -Inf
-    for p in prep
-        for pt in p.dad.Nodes
-            xmin = min(xmin, pt[1]); xmax = max(xmax, pt[1])
-            ymin = min(ymin, pt[2]); ymax = max(ymax, pt[2])
-        end
-    end
-    L = max(xmax - xmin, ymax - ymin, 1e-12)
-    r = 10.0 * E / L
-    return r, r
-end
-
-"""
-Local kinematics at contact pair `k` (Contato / verify convention).
-
-Returns `(dun, dut, gn, gt, tn1, tt1, tn2, tt2, R, iu1, iu2, ot)` with
-``g_n = h - dun`` (positive = open), ``g_t = dut``.
-"""
-function _contact_pair_kinematics(prep, cp, h_k, x, k, nx)
-    pr1 = prep[cp.reg_a]
-    pr2 = prep[cp.reg_b]
-    na, nb = cp.node_a, cp.node_b
-    ot = nx + 4(k - 1)
-    tn1 = x[ot + 1]
-    tt1 = x[ot + 2]
-    tn2 = x[ot + 3]
-    tt2 = x[ot + 4]
-    iu1 = pr1.off + (2na - 1)
-    iu2 = pr2.off + (2nb - 1)
-    un1 = x[iu1]
-    ut1 = x[iu1 + 1]
-    un2 = x[iu2]
-    ut2 = x[iu2 + 1]
-    R1 = Matrix(node_rotation2d(pr1.dad.Normal[na]))
-    R2 = Matrix(node_rotation2d(pr2.dad.Normal[nb]))
-    R = R2 * R1'
-    u2_in_1 = R * SVector(un2, ut2)
-    dun = un1 - u2_in_1[1]
-    dut = ut1 - u2_in_1[2]
-    gn = h_k - dun
-    gt = dut
-    return (; dun, dut, gn, gt, tn1, tt1, tn2, tt2, R, iu1, iu2, ot,
-        un1, ut1, un2, ut2)
-end
-
-"""
-Alart–Curnier NCF for 2D Coulomb (compression multiplier ``λ_n = -t_n``).
-
-Returns `(Cn, Ct, regime, s_slip, τn, τt, λn⁺)` with
-`regime ∈ (:open, :stick, :slip)` and `s_slip = sign(τt)` on the slip piece.
-"""
-function alart_curnier(gn::Real, gt::Real, tn::Real, tt::Real, μ::Real,
-        rn::Real, rt::Real)
-    λn = -float(tn)
-    λt = -float(tt)
-    τn = λn - rn * gn
-    τt = λt - rt * gt
-    λn⁺ = max(0.0, τn)
-    if τn <= 0.0
-        # open: proj radius 0
-        Cn = λn
-        Ct = λt
-        return Cn, Ct, :open, 0.0, τn, τt, λn⁺
-    end
-    bound = μ * λn⁺
-    if abs(τt) <= bound + 1e-15
-        # stick
-        Cn = rn * gn          # = λn - τn
-        Ct = rt * gt          # = λt - τt
-        return Cn, Ct, :stick, 0.0, τn, τt, λn⁺
-    end
-    # slip
-    s = τt == 0.0 ? 1.0 : sign(τt)
-    λt_hat = s * bound
-    Cn = rn * gn
-    Ct = λt - λt_hat         # = λt - s μ (λn - rn gn)
-    return Cn, Ct, :slip, s, τn, τt, λn⁺
-end
-
-function _add_gn_row!(J, r, iu1, iu2, R, α)
-    # gn = h - (un1 - R[1,:]·u2) ⇒ ∂gn/∂un1=-1, ∂gn/∂u2=R[1,:]
-    J[r, iu1]     += α * (-1.0)
-    J[r, iu2]     += α * R[1, 1]
-    J[r, iu2 + 1] += α * R[1, 2]
-    return J
-end
-
-function _add_gt_row!(J, r, iu1, iu2, R, α)
-    # gt = ut1 - R[2,:]·u2
-    J[r, iu1 + 1] += α * 1.0
-    J[r, iu2]     += α * (-R[2, 1])
-    J[r, iu2 + 1] += α * (-R[2, 2])
-    return J
-end
-
-"""
-Assemble SSN residual ``R`` and generalized Jacobian ``J`` on Contato layout.
-
-Unknowns: mixed BIE DOFs then per pair ``(t_n¹,t_t¹,t_n²,t_t²)``.
-Contact rows: ``(C_n, C_t, E_n, E_t)`` with Alart–Curnier + traction equilibrium.
-"""
-function _assemble_contact_R_J(prep, pairs, h, x; rn::Real=1.0, rt::Real=1.0)
-    nx = sum(p.ndof for p in prep)
-    np = length(pairs)
-    N = nx + 4 * np
-    R = zeros(N)
-    J = zeros(N, N)
-
-    # --- BIE blocks ---
-    for pr in prep
-        o = pr.off
-        nd = pr.ndof
-        xr = @view x[o+1:o+nd]
-        J[o+1:o+nd, o+1:o+nd] .= pr.A
-        mul!(@view(R[o+1:o+nd]), pr.A, xr)
-        R[o+1:o+nd] .-= pr.b
-    end
-    for (k, cp) in enumerate(pairs)
-        pr1 = prep[cp.reg_a]
-        pr2 = prep[cp.reg_b]
-        na, nb = cp.node_a, cp.node_b
-        ot = nx + 4(k - 1)
-        t1 = SVector(x[ot+1], x[ot+2])
-        t2 = SVector(x[ot+3], x[ot+4])
-        if haskey(pr1.Gc_cols, na)
-            cols = pr1.Gc_cols[na]
-            G1 = pr1.G_local[:, cols]
-            R[pr1.off+1:pr1.off+pr1.ndof] .-= G1 * t1
-            J[pr1.off+1:pr1.off+pr1.ndof, ot+1:ot+2] .-= G1
-        end
-        if haskey(pr2.Gc_cols, nb)
-            cols = pr2.Gc_cols[nb]
-            G2 = pr2.G_local[:, cols]
-            R[pr2.off+1:pr2.off+pr2.ndof] .-= G2 * t2
-            J[pr2.off+1:pr2.off+pr2.ndof, ot+3:ot+4] .-= G2
-        end
-    end
-
-    # --- contact NCF + equilibrium ---
-    for (k, cp) in enumerate(pairs)
-        kin = _contact_pair_kinematics(prep, cp, h[k], x, k, nx)
-        Rmat = kin.R
-        ot, iu1, iu2 = kin.ot, kin.iu1, kin.iu2
-        tn1, tt1, tn2, tt2 = kin.tn1, kin.tt1, kin.tn2, kin.tt2
-        Cn, Ct, regime, s, _, _, _ = alart_curnier(kin.gn, kin.gt, tn1, tt1, cp.μ, rn, rt)
-
-        r1, r2, r3, r4 = ot + 1, ot + 2, ot + 3, ot + 4
-        R[r1] = Cn
-        R[r2] = Ct
-        R[r3] = tn1 + Rmat[1, 1] * tn2 + Rmat[1, 2] * tt2
-        R[r4] = tt1 + Rmat[2, 1] * tn2 + Rmat[2, 2] * tt2
-
-        # equilibrium Jacobian (always)
-        J[r3, ot+1] = 1.0
-        J[r3, ot+3] = Rmat[1, 1]
-        J[r3, ot+4] = Rmat[1, 2]
-        J[r4, ot+2] = 1.0
-        J[r4, ot+3] = Rmat[2, 1]
-        J[r4, ot+4] = Rmat[2, 2]
-
-        μ = cp.μ
-        if regime === :open
-            # Cn = λn = -tn1, Ct = λt = -tt1
-            J[r1, ot+1] = -1.0
-            J[r2, ot+2] = -1.0
-        elseif regime === :stick
-            # Cn = rn gn, Ct = rt gt
-            _add_gn_row!(J, r1, iu1, iu2, Rmat, rn)
-            _add_gt_row!(J, r2, iu1, iu2, Rmat, rt)
-        else
-            # slip: Cn = rn gn
-            # Ct = -tt + s μ tn + s μ rn gn   (λ form chained through λ=-t)
-            _add_gn_row!(J, r1, iu1, iu2, Rmat, rn)
-            J[r2, ot+2] = -1.0
-            J[r2, ot+1] = s * μ
-            _add_gn_row!(J, r2, iu1, iu2, Rmat, s * μ * rn)
-        end
-
-        # store regime as Contato state for diagnostics (overwritten by verify later)
-        if regime === :open
-            cp.state = 1
-        elseif regime === :stick
-            cp.state = 3
-        else
-            # slip sign from traction (Contato: ±2)
-            cp.state = Int((tt1 == 0.0 ? s : sign(tt1)) * 2)
-            cp.state == 0 && (cp.state = Int(s * 2))
-        end
-        cp.tn = tn1
-        cp.tt = tt1
-    end
-    return R, J
-end
-
-"""Residual-only evaluation (for line search)."""
-function _assemble_contact_R(prep, pairs, h, x; rn::Real=1.0, rt::Real=1.0)
-    R, _ = _assemble_contact_R_J(prep, pairs, h, x; rn=rn, rt=rt)
-    return R
-end
-
-"""
-Semi-smooth Newton on Alart–Curnier contact residual.
-
-```text
-for it
-    R, J ← assemble_R_J(x)
-    solve J Δx = -R
-    line-search α on ‖R‖
-    x ← x + α Δx
-```
-"""
-function _contact_ssn!(prep, pairs, h, x_init;
-        tol=1e-8, maxiter=40, verbose=false,
-        rn::Union{Nothing,Real}=nothing,
-        rt::Union{Nothing,Real}=nothing,
-        ls_max::Int=8)
-    x = collect(Float64, x_init)
-    rn0, rt0 = _default_contact_r(prep)
-    rn_ = rn === nothing ? rn0 : float(rn)
-    rt_ = rt === nothing ? rt0 : float(rt)
-    ok = false
-    nR = Inf
-    for it in 1:maxiter
-        R, J = _assemble_contact_R_J(prep, pairs, h, x; rn=rn_, rt=rt_)
-        nR = norm(R)
-        verbose && @info "contact SSN" it nR rn=rn_ n_closed=count(cp -> abs(cp.state) != 1, pairs)
-        if nR < tol
-            ok = true
-            break
-        end
-        dx = J \ (-R)
-        # Armijo-like backtracking on ‖R‖
-        α = 1.0
-        nR_new = nR
-        x_trial = similar(x)
-        accepted = false
-        for _ls in 1:ls_max
-            x_trial .= x .+ α .* dx
-            R_try = _assemble_contact_R(prep, pairs, h, x_trial; rn=rn_, rt=rt_)
-            nR_new = norm(R_try)
-            if nR_new < (1.0 - 1e-4 * α) * nR || nR_new < tol
-                accepted = true
-                break
+    n_if = length(prob.interfaces)
+    dim = 2
+    Bs = [zeros(2 * dad.n, dim * n_if) for dad in regs]
+    for (k, ip) in enumerate(prob.interfaces)
+        Ga, Gb = regs[ip.reg_a].G, regs[ip.reg_b].G
+        for d in 1:dim
+            col = dim * (k - 1) + d
+            dofa = dim * (ip.node_a - 1) + d
+            dofb = dim * (ip.node_b - 1) + d
+            if dofa <= size(Ga, 2)
+                @views Bs[ip.reg_a][:, col] .-= Ga[:, dofa]
             end
-            α *= 0.5
-        end
-        if !accepted
-            # take smallest trial anyway (damped progress)
-            x_trial .= x .+ α .* dx
-            nR_new = norm(_assemble_contact_R(prep, pairs, h, x_trial; rn=rn_, rt=rt_))
-        end
-        x .= x_trial
-        if nR_new < tol
-            ok = true
-            break
-        end
-        # also stop on tiny step
-        if α * norm(dx) < tol * max(1.0, norm(x))
-            ok = nR_new < max(tol, 1e-6 * max(1.0, nR))
-            break
-        end
-    end
-    # final residual / state tags
-    R, _ = _assemble_contact_R_J(prep, pairs, h, x; rn=rn_, rt=rt_)
-    nR = norm(R)
-    ok = ok || nR < tol
-    verbose && @info "contact SSN done" ok nR
-    return x, ok
-end
-
-# -----------------------------------------------------------------------------
-# Augmented Lagrangian (Uzawa) frictional contact
-# -----------------------------------------------------------------------------
-
-"""
-Write body-1 tractions from multipliers `λ=-t` and enforce traction equilibrium
-on body 2: `t1 + R*t2 = 0` ⇒ `t2 = -R\\t1`.
-"""
-function _contact_set_t_from_lambda!(prep, pairs, x, λn, λt)
-    nx = sum(p.ndof for p in prep)
-    for (k, cp) in enumerate(pairs)
-        pr1 = prep[cp.reg_a]
-        pr2 = prep[cp.reg_b]
-        na, nb = cp.node_a, cp.node_b
-        R1 = Matrix(node_rotation2d(pr1.dad.Normal[na]))
-        R2 = Matrix(node_rotation2d(pr2.dad.Normal[nb]))
-        R = R2 * R1'
-        tn1 = -λn[k]
-        tt1 = -λt[k]
-        t2 = -(R \ SVector(tn1, tt1))
-        ot = nx + 4(k - 1)
-        x[ot + 1] = tn1
-        x[ot + 2] = tt1
-        x[ot + 3] = t2[1]
-        x[ot + 4] = t2[2]
-        cp.tn = tn1
-        cp.tt = tt1
-    end
-    return x
-end
-
-"""
-Solve mixed BIE blocks with **fixed** contact tractions in `x`:
-`A_r * x_mix_r = b_r + G_c * t_c`.
-Uses cached LU factors of each region `A`.
-"""
-function _solve_bie_fixed_contact_t!(prep, pairs, x, Afac)
-    nx = sum(p.ndof for p in prep)
-    nreg = length(prep)
-    rhs = [copy(pr.b) for pr in prep]
-    for (k, cp) in enumerate(pairs)
-        pr1 = prep[cp.reg_a]
-        pr2 = prep[cp.reg_b]
-        na, nb = cp.node_a, cp.node_b
-        ot = nx + 4(k - 1)
-        t1 = SVector(x[ot + 1], x[ot + 2])
-        t2 = SVector(x[ot + 3], x[ot + 4])
-        if haskey(pr1.Gc_cols, na)
-            cols = pr1.Gc_cols[na]
-            rhs[cp.reg_a] .+= pr1.G_local[:, cols] * t1
-        end
-        if haskey(pr2.Gc_cols, nb)
-            cols = pr2.Gc_cols[nb]
-            rhs[cp.reg_b] .+= pr2.G_local[:, cols] * t2
-        end
-    end
-    for r in 1:nreg
-        pr = prep[r]
-        xr = Afac[r] \ rhs[r]
-        x[pr.off+1:pr.off+pr.ndof] .= xr
-    end
-    return x
-end
-
-"""
-Alart–Curnier / ALM multiplier projection (open-positive gap `g_n`).
-
-`λn ← max(0, λn - rn*gn)`, `λt ← proj_{|s|≤μ λn}(λt - rt*gt)`.
-"""
-function _alm_project_multipliers(gn, gt, λn, λt, μ, rn, rt)
-    λn_new = max(0.0, λn - rn * gn)
-    τt = λt - rt * gt
-    bound = μ * λn_new
-    if abs(τt) <= bound + 1e-15
-        λt_new = τt
-        regime = λn_new <= 1e-15 ? :open : :stick
-    else
-        s = τt == 0.0 ? 1.0 : sign(τt)
-        λt_new = s * bound
-        regime = λn_new <= 1e-15 ? :open : :slip
-    end
-    if λn_new <= 1e-15
-        λt_new = 0.0
-        regime = :open
-    end
-    return λn_new, λt_new, regime
-end
-
-"""
-Uzawa **augmented Lagrangian** frictional contact on Contato unknowns.
-
-Outer loop (multipliers `λn=-tn`, `λt=-tt`):
-
-1. Set contact tractions from `λ` + equilibrium on body 2.
-2. Solve each region BIE with fixed contact Neumann data.
-3. Evaluate gaps `(gn, gt)`; project multipliers (ALM / AC update).
-4. Under-relaxation `ω` (default 0.5) and optional mild growth of `(rn, rt)`.
-
-Defaults use a softer augmentation than SSN (`r ∼ E/L`) to avoid Uzawa
-overshoot; `r_grow>1` increases `r` only when penetration stagnates.
-"""
-function _contact_alm!(prep, pairs, h, x_init;
-        tol=1e-8, maxiter=120, verbose=false,
-        rn::Union{Nothing,Real}=nothing,
-        rt::Union{Nothing,Real}=nothing,
-        omega::Real=0.5,
-        r_grow::Real=1.0)
-    x = collect(Float64, x_init)
-    nx = sum(p.ndof for p in prep)
-    np = length(pairs)
-    # Softer default than SSN: Uzawa is first-order and overshoots if r large
-    rn0, rt0 = _default_contact_r(prep)
-    rn_ = rn === nothing ? 0.1 * rn0 : float(rn)
-    rt_ = rt === nothing ? 0.1 * rt0 : float(rt)
-    r_cap = 50.0 * rn0
-    ω = clamp(float(omega), 1e-3, 1.0)
-    grow = max(float(r_grow), 1.0)
-
-    λn = zeros(np)
-    λt = zeros(np)
-    for (k, cp) in enumerate(pairs)
-        ot = nx + 4(k - 1)
-        λn[k] = max(0.0, -x[ot + 1])
-        λt[k] = -x[ot + 2]
-        # keep friction inside Coulomb disk of current λn
-        bound0 = cp.μ * λn[k]
-        if abs(λt[k]) > bound0
-            λt[k] = bound0 == 0 ? 0.0 : bound0 * sign(λt[k])
-        end
-    end
-
-    Afac = [lu(Matrix(pr.A)) for pr in prep]
-    ok = false
-    pen_max = Inf
-    dλ = Inf
-    nR = Inf
-    pen_prev = Inf
-    λ_scale = 1.0
-    for it in 1:maxiter
-        _contact_set_t_from_lambda!(prep, pairs, x, λn, λt)
-        _solve_bie_fixed_contact_t!(prep, pairs, x, Afac)
-
-        dλ2 = 0.0
-        pen_max = 0.0
-        gap_comp = 0.0   # max |min(gn, λn)| complementarity
-        n_closed = 0
-        for (k, cp) in enumerate(pairs)
-            kin = _contact_pair_kinematics(prep, cp, h[k], x, k, nx)
-            pen_max = max(pen_max, max(0.0, -kin.gn))
-            λn_p, λt_p, regime = _alm_project_multipliers(
-                kin.gn, kin.gt, λn[k], λt[k], cp.μ, rn_, rt_)
-            λn_new = (1 - ω) * λn[k] + ω * λn_p
-            λt_new = (1 - ω) * λt[k] + ω * λt_p
-            dλ2 += (λn_new - λn[k])^2 + (λt_new - λt[k])^2
-            λn[k] = λn_new
-            λt[k] = λt_new
-            gap_comp = max(gap_comp, abs(min(kin.gn, λn[k])))
-            if regime === :open || λn[k] <= 1e-14
-                cp.state = 1
-            elseif regime === :stick
-                cp.state = 3
-                n_closed += 1
-            else
-                s = λt[k] == 0.0 ? 1.0 : sign(λt[k])
-                cp.state = Int(s * 2)
-                n_closed += 1
+            if dofb <= size(Gb, 2)
+                @views Bs[ip.reg_b][:, col] .+= Gb[:, dofb]
             end
-            cp.tn = -λn[k]
-            cp.tt = -λt[k]
         end
-        dλ = sqrt(dλ2)
-        λ_scale = max(1.0, maximum(λn; init=0.0), maximum(abs, λt; init=0.0))
-        _contact_set_t_from_lambda!(prep, pairs, x, λn, λt)
-
-        # consistency residual at current r (same NCF as SSN)
-        nR = norm(_assemble_contact_R(prep, pairs, h, x; rn=rn_, rt=rt_))
-        verbose && @info "contact ALM" it dλ pen_max nR rn=rn_ n_closed=n_closed ω=ω
-
-        tol_λ = tol * λ_scale
-        tol_g = tol * max(1.0, maximum(abs, h; init=1.0))
-        if (dλ <= tol_λ && pen_max <= tol_g) || nR <= tol * max(1.0, λ_scale)
-            ok = true
-            break
-        end
-
-        # mild r growth only if penetration not improving
-        if grow > 1.0 + 1e-15 && pen_max > tol_g && pen_max >= 0.5 * pen_prev && it % 5 == 0
-            rn_ = min(r_cap, rn_ * grow)
-            rt_ = min(r_cap, rt_ * grow)
-        end
-        # shrink r if multiplier steps explode (oscillation)
-        if dλ > 10 * λ_scale && it > 3
-            rn_ *= 0.5
-            rt_ *= 0.5
-            ω = max(0.2, 0.8 * ω)
-        end
-        pen_prev = pen_max
     end
-    # final consistent fields
-    _contact_set_t_from_lambda!(prep, pairs, x, λn, λt)
-    _solve_bie_fixed_contact_t!(prep, pairs, x, Afac)
-    _contact_set_t_from_lambda!(prep, pairs, x, λn, λt)
-    for (k, cp) in enumerate(pairs)
-        cp.tn = -λn[k]
-        cp.tt = -λt[k]
-    end
-    nR = norm(_assemble_contact_R(prep, pairs, h, x; rn=rn_, rt=rt_))
-    tol_λ = tol * max(1.0, maximum(λn; init=0.0))
-    tol_g = tol * max(1.0, maximum(abs, h; init=1.0))
-    ok = ok || nR <= tol * max(1.0, λ_scale) || (dλ <= tol_λ && pen_max <= tol_g)
-    verbose && @info "contact ALM done" ok nR dλ pen_max rn=rn_
-    return x, ok
+    return Bs
 end
 
-# -----------------------------------------------------------------------------
-# Region preparation (local frame + exterior BC)
-# -----------------------------------------------------------------------------
-
-"""Per-region data after local transform and exterior BC column exchange."""
-struct _RegContactPrep
-    dad::BEMdata
-    A::Matrix{Float64}          # mixed BIE operator (ndof×ndof)
-    b::Vector{Float64}          # known RHS from exterior BC
-    Gc_cols::Dict{Int,UnitRange{Int}}  # node → columns of G_local for contact t
-    G_local::Matrix{Float64}
-    H_local::Matrix{Float64}
-    BC_ext::Vector{Int}         # exterior BC in local (contact marked Neumann)
-    BV_ext::Vector{Float64}
-    is_contact_node::Vector{Bool}
-    ndof::Int
-    off::Int                    # global offset of this region's mixed DOFs
-end
-
-function _prepare_regions_contact_local(regs, BC0, BV0)
-    # mark contact nodes
-    contact_nodes = [falses(d.n) for d in regs]
-    # will fill after we know pairs — first pass: any BC type 4
+function _scatter_mr_sol_elast!(prob::MultiRegionProblem{<:ElasticMR},
+        xs::Vector{<:AbstractVector}, tif::AbstractVector)
+    regs = prob.regions
+    dim = 2
     for (r, dad) in enumerate(regs)
-        for i in 1:dad.n
-            if BC0[r][2i-1] == BC_CONTACT || BC0[r][2i] == BC_CONTACT
-                contact_nodes[r][i] = true
-            end
-        end
-    end
-
-    preps = _RegContactPrep[]
-    off = 0
-    for (r, dad) in enumerate(regs)
-        H, G = dad.H, dad.G
-        Hloc, Gloc = transform_HG_local(H, G, dad)
-        ndof = 2 * dad.n
-        A = Matrix(Hloc[1:ndof, 1:ndof])
-        Bmat = Matrix(Gloc[1:ndof, 1:ndof])
-        b = zeros(ndof)
-
-        BC = copy(BC0[r])
-        BV = copy(BV0[r])
-        # exterior → local; force contact nodes to Neumann (t free)
-        _exterior_bc_to_local!(BC, BV, dad)
-        for i in 1:dad.n
-            if contact_nodes[r][i]
-                BC[2i-1] = BC_NEUMANN; BV[2i-1] = 0.0
-                BC[2i]   = BC_NEUMANN; BV[2i]   = 0.0
-            end
-        end
-
-        # Column exchange for exterior Dirichlet only (non-contact)
-        for dof in 1:ndof
-            if BC[dof] == BC_DIRICHLET
-                # swap A/B columns: unknown becomes t
-                colA = A[:, dof]
-                A[:, dof] .= .-Bmat[:, dof]
-                Bmat[:, dof] .= .-colA
-            end
-        end
-        # RHS from known values (Dirichlet u or Neumann t on exterior)
-        for dof in 1:ndof
-            if contact_nodes[r][cld(dof, 2)]
-                # contact: t not in known RHS (extra unknown); u free
-                continue
-            end
-            if BC[dof] == BC_DIRICHLET
-                # after swap, Bmat column holds -H; known is u
-                b .-= Bmat[:, dof] .* BV[dof]
-            else
-                b .+= Bmat[:, dof] .* BV[dof]
-            end
-        end
-
-        Gc = Dict{Int,UnitRange{Int}}()
-        for i in 1:dad.n
-            contact_nodes[r][i] || continue
-            Gc[i] = 2i-1:2i
-        end
-
-        push!(preps, _RegContactPrep(dad, A, b, Gc, Gloc[1:ndof, 1:ndof], Hloc[1:ndof, 1:ndof],
-            BC, BV, contact_nodes[r], ndof, off))
-        off += ndof
-    end
-    return preps
-end
-
-# -----------------------------------------------------------------------------
-# Coupled system assembly (BIE + contact constraints)
-# -----------------------------------------------------------------------------
-
-function _assemble_contact_system(prep::Vector{_RegContactPrep}, pairs, h, x)
-    nx = sum(p.ndof for p in prep)
-    np = length(pairs)
-    nt = 4 * np
-    N = nx + nt
-    A = zeros(N, N)
-    b = zeros(N)
-
-    # --- BIE blocks (diagonal) + -G_c * t_c columns ---
-    for (r, pr) in enumerate(prep)
-        o = pr.off
-        nd = pr.ndof
-        A[o+1:o+nd, o+1:o+nd] .= pr.A
-        b[o+1:o+nd] .= pr.b
-    end
-
-    # map pair index → traction unknown offset
-    # t unknowns layout per pair k (1-based): [tn1, tt1, tn2, tt2]
-    for (k, cp) in enumerate(pairs)
-        pr1 = prep[cp.reg_a]
-        pr2 = prep[cp.reg_b]
-        na, nb = cp.node_a, cp.node_b
-        ot = nx + 4(k - 1)          # 0-based start of t block
-        # G columns for contact tractions contribute -G to BIE of each region
-        if haskey(pr1.Gc_cols, na)
-            cols = pr1.Gc_cols[na]
-            # t1 = (tn1, tt1) multiplies G_local columns of node na
-            A[pr1.off+1:pr1.off+pr1.ndof, ot+1:ot+2] .-= pr1.G_local[:, cols]
-        end
-        if haskey(pr2.Gc_cols, nb)
-            cols = pr2.Gc_cols[nb]
-            A[pr2.off+1:pr2.off+pr2.ndof, ot+3:ot+4] .-= pr2.G_local[:, cols]
-        end
-    end
-
-    # --- Contact constraint rows (MATLAB aplica_contato_com_atrito_multicorpos) ---
-    for (k, cp) in enumerate(pairs)
-        pr1 = prep[cp.reg_a]
-        pr2 = prep[cp.reg_b]
-        na, nb = cp.node_a, cp.node_b
-        # local→global rotations
-        R1 = Matrix(node_rotation2d(pr1.dad.Normal[na]))
-        R2 = Matrix(node_rotation2d(pr2.dad.Normal[nb]))
-        R = R2 * R1'   # maps local-1 related quantities (MATLAB)
-        μ = cp.μ
-        st = cp.state
-        ot = nx + 4(k - 1)
-        # mixed unknown indices for u at contact nodes (Neumann → unknown is u)
-        # After BC swap: contact nodes are Neumann so unknown DOF is u (column still H)
-        iu1 = pr1.off + (2na - 1)
-        iu2 = pr2.off + (2nb - 1)
-        # rows for this pair's 4 equations
-        rows = ot+1:ot+4
-
-        if st == 1  # open: tn1=tt1=tn2=tt2=0
-            A[rows[1], ot+1] = 1.0
-            A[rows[2], ot+2] = 1.0
-            A[rows[3], ot+3] = 1.0
-            A[rows[4], ot+4] = 1.0
-            b[rows] .= 0.0
-        elseif abs(st) == 2  # slip
-            sμ = μ * sign(st == 0 ? 1 : st)  # st = ±2
-            # un1 - R[1,:]·u2 = h
-            A[rows[1], iu1] = 1.0
-            A[rows[1], iu1+1] = 0.0
-            A[rows[1], iu2] = -R[1, 1]
-            A[rows[1], iu2+1] = -R[1, 2]
-            b[rows[1]] = h[k]
-            # tn1 + R[1,:]·t2 = 0  (equilibrium normal)
-            A[rows[2], ot+1] = 1.0
-            A[rows[2], ot+3] = R[1, 1]
-            A[rows[2], ot+4] = R[1, 2]
-            b[rows[2]] = 0.0
-            # tt1 - sμ*tn1 = 0
-            A[rows[3], ot+1] = sμ
-            A[rows[3], ot+2] = 1.0
-            b[rows[3]] = 0.0
-            # tt2 related: tt1 + R[2,:]·t2 = 0  (MATLAB: 0 1 R21 R22 on t)
-            A[rows[4], ot+2] = 1.0
-            A[rows[4], ot+3] = R[2, 1]
-            A[rows[4], ot+4] = R[2, 2]
-            b[rows[4]] = 0.0
-        else  # stick (3)
-            # un1 - R row1 u2 = h
-            A[rows[1], iu1] = 1.0
-            A[rows[1], iu2] = -R[1, 1]
-            A[rows[1], iu2+1] = -R[1, 2]
-            b[rows[1]] = h[k]
-            # ut1 - R row2 u2 = 0
-            A[rows[2], iu1+1] = 1.0
-            A[rows[2], iu2] = -R[2, 1]
-            A[rows[2], iu2+1] = -R[2, 2]
-            b[rows[2]] = 0.0
-            # tn1 + R row1 t2 = 0
-            A[rows[3], ot+1] = 1.0
-            A[rows[3], ot+3] = R[1, 1]
-            A[rows[3], ot+4] = R[1, 2]
-            b[rows[3]] = 0.0
-            # tt1 + R row2 t2 = 0
-            A[rows[4], ot+2] = 1.0
-            A[rows[4], ot+3] = R[2, 1]
-            A[rows[4], ot+4] = R[2, 2]
-            b[rows[4]] = 0.0
-        end
-    end
-    return A, b
-end
-
-# -----------------------------------------------------------------------------
-# State update (MATLAB verfica_contato_com_atrito_multicorpos)
-# -----------------------------------------------------------------------------
-
-function _verify_contact_states!(pairs, prep, h, x; epsc=1e-7)
-    nx = sum(p.ndof for p in prep)
-    for (k, cp) in enumerate(pairs)
-        pr1 = prep[cp.reg_a]
-        pr2 = prep[cp.reg_b]
-        na, nb = cp.node_a, cp.node_b
-        ot = nx + 4(k - 1)
-        tn1 = x[ot+1]
-        tt1 = x[ot+2]
-        # local displacements at contact (Neumann → unknown is u)
-        un1 = x[pr1.off + 2na - 1]
-        ut1 = x[pr1.off + 2na]
-        un2 = x[pr2.off + 2nb - 1]
-        ut2 = x[pr2.off + 2nb]
-        R1 = Matrix(node_rotation2d(pr1.dad.Normal[na]))
-        R2 = Matrix(node_rotation2d(pr2.dad.Normal[nb]))
-        R = R2 * R1'
-        u2_in_1 = R * SVector(un2, ut2)
-        dun = un1 - u2_in_1[1]
-        dut = ut1 - u2_in_1[2]
-        μ = cp.μ
-        sinal_tt = tt1 == 0 ? 1.0 : sign(tt1)
-        sinal_dut = dut == 0 ? 1.0 : sign(dut)
-        μ == 0 && (sinal_tt = 1.0)
-
-        if abs(tn1) <= epsc  # free / open traction
-            if dun + epsc > h[k]   # penetration → stick
-                cp.state = 3
-            else
-                cp.state = 1
-            end
-        else
-            if tn1 > epsc          # tension → open
-                cp.state = 1
-            elseif abs(tt1) + epsc > μ * abs(tn1)  # slip
-                if sinal_dut * sinal_tt > 0
-                    cp.state = 3     # reverse slip sense → stick
-                else
-                    cp.state = Int(sinal_tt * 2)
+        nd = dim * dad.n
+        u = zeros(nd)
+        t = zeros(nd)
+        split_sol!(dad, xs[r], u, t)
+        for (k, ip) in enumerate(prob.interfaces)
+            for d in 1:dim
+                col = dim * (k - 1) + d
+                if ip.reg_a == r
+                    t[dim * (ip.node_a - 1) + d] = tif[col]
+                elseif ip.reg_b == r
+                    t[dim * (ip.node_b - 1) + d] = -tif[col]
                 end
-            else
-                cp.state = 3
             end
         end
-        cp.tn = tn1
-        cp.tt = tt1
+        set_cache!(dad; u=u, traction=t, T=u)
     end
-    return pairs
+    return nothing
 end
 
-function _scatter_contact_solution!(prob, prep, pairs, x)
-    nx = sum(p.ndof for p in prep)
-    # per region: recover local u,t then map to global
-    for pr in prep
-        dad = pr.dad
-        nd = pr.ndof
-        xr = x[pr.off+1:pr.off+nd]
-        u_loc = zeros(nd)
-        t_loc = zeros(nd)
-        BC = pr.BC_ext
-        BV = pr.BV_ext
-        for dof in 1:nd
-            inode = cld(dof, 2)
-            if pr.is_contact_node[inode]
-                # unknown is u; t from contact block filled below
-                u_loc[dof] = xr[dof]
-            elseif BC[dof] == BC_DIRICHLET
-                u_loc[dof] = BV[dof]
-                t_loc[dof] = xr[dof]   # after swap unknown was t
-            else
-                t_loc[dof] = BV[dof]
-                u_loc[dof] = xr[dof]
-            end
+function _solve_mr_dense_elast!(prob::MultiRegionProblem{<:ElasticMR})
+    regs = prob.regions
+    dim = 2
+    nts = [dim * dad.n for dad in regs]
+    n_if = length(prob.interfaces)
+    n_tif = dim * n_if
+    Nloc = sum(nts)
+    N = Nloc + n_tif
+    Ag = zeros(N, N)
+    bg = zeros(N)
+    off = offsets_from(nts)
+    Bs = _mr_traction_columns(prob)
+    for (r, dad) in enumerate(regs)
+        o = off[r]
+        nr = nts[r]
+        Ag[o+1:o+nr, o+1:o+nr] .= dad.A
+        bg[o+1:o+nr] .= dad.b
+        if n_tif > 0
+            Ag[o+1:o+nr, Nloc+1:N] .= Bs[r]
         end
-        # write contact tractions from global t block
-        for (k, cp) in enumerate(pairs)
-            ot = nx + 4(k - 1)
-            if cp.reg_a == findfirst(p -> p.dad === dad, prep)
-                na = cp.node_a
-                t_loc[2na-1] = x[ot+1]
-                t_loc[2na]   = x[ot+2]
-            end
-            if cp.reg_b == findfirst(p -> p.dad === dad, prep)
-                nb = cp.node_b
-                t_loc[2nb-1] = x[ot+3]
-                t_loc[2nb]   = x[ot+4]
-            end
-        end
-        u_glb = local_to_global_field(dad, u_loc)
-        t_glb = local_to_global_field(dad, t_loc)
-        set_cache!(dad; u=u_glb, traction=t_glb, T=u_glb,
-                   u_local=u_loc, traction_local=t_loc)
     end
-    return prob
+    for (k, ip) in enumerate(prob.interfaces)
+        oa, ob = off[ip.reg_a], off[ip.reg_b]
+        for d in 1:dim
+            row = Nloc + dim * (k - 1) + d
+            Ag[row, oa + dim * (ip.node_a - 1) + d] = 1.0
+            Ag[row, ob + dim * (ip.node_b - 1) + d] = -1.0
+        end
+    end
+    x = bem_linsolve(Ag, bg)
+    xs = [x[off[r]+1:off[r]+nts[r]] for r in eachindex(regs)]
+    tif = n_tif == 0 ? Float64[] : x[Nloc+1:N]
+    _scatter_mr_sol_elast!(prob, xs, tif)
+    return x
 end
 
 # =============================================================================
@@ -2023,71 +1228,11 @@ function _accumulate_master_traction_local!(db::BEMdata, cp::ContactPair, tx, ty
     return nothing
 end
 
-"""
-Convert exterior BC/BV arrays from global (x,y) to nodal (n,t).
-
-- Same type on both DOFs: rotate BV by ``R^T`` (Leonardo §4.7)
-- Contact (type 4): left tagged for the contact loop
-- Mixed Dir/Neu: map common roller / symmetry cases on axis-aligned faces;
-  otherwise fall back to rotating the Neumann part and assigning Dirichlet to
-  the local axis best aligned with the constrained global axis
-"""
-function _exterior_bc_to_local!(BC::Vector{Int}, BV::Vector{Float64}, dad::BEMdata)
-    @inbounds for j in 1:dad.n
-        d1, d2 = 2j - 1, 2j
-        bcx, bcy = BC[d1], BC[d2]
-        if bcx == BC_CONTACT || bcy == BC_CONTACT
-            BC[d1] = BC_CONTACT
-            BC[d2] = BC_CONTACT
-            continue
-        end
-        n̂, t̂ = local_basis2d(dad.Normal[j])
-        R = @SMatrix [n̂[1] t̂[1]; n̂[2] t̂[2]]
-        vx, vy = BV[d1], BV[d2]
-        if bcx == bcy
-            vl = R' * SVector(vx, vy)
-            BV[d1] = vl[1]
-            BV[d2] = vl[2]
-            continue
-        end
-        # Mixed global BCs → local
-        dir_x = bcx == BC_DIRICHLET
-        dir_y = bcy == BC_DIRICHLET
-        # default: both Neumann 0, then overwrite
-        BC[d1] = BC_NEUMANN; BV[d1] = 0.0
-        BC[d2] = BC_NEUMANN; BV[d2] = 0.0
-        ugx = dir_x ? vx : NaN
-        ugy = dir_y ? vy : NaN
-        tgx = dir_x ? NaN : vx
-        tgy = dir_y ? NaN : vy
-        # Dirichlet → local axis most aligned with the constrained global axis.
-        # On axis-aligned faces: un = n_k * u_k (other u free), etc.
-        tg = SVector(isnan(tgx) ? 0.0 : tgx, isnan(tgy) ? 0.0 : tgy)
-        if dir_x && !dir_y
-            if abs(n̂[1]) >= abs(t̂[1])
-                BC[d1] = BC_DIRICHLET
-                BV[d1] = n̂[1] * ugx          # un ≈ n₁ uₓ
-                BC[d2] = BC_NEUMANN
-                BV[d2] = dot(t̂, tg)          # t_t
-            else
-                BC[d2] = BC_DIRICHLET
-                BV[d2] = t̂[1] * ugx
-                BC[d1] = BC_NEUMANN
-                BV[d1] = dot(n̂, tg)
-            end
-        elseif dir_y && !dir_x
-            if abs(n̂[2]) >= abs(t̂[2])
-                BC[d1] = BC_DIRICHLET
-                BV[d1] = n̂[2] * ugy
-                BC[d2] = BC_NEUMANN
-                BV[d2] = dot(t̂, tg)
-            else
-                BC[d2] = BC_DIRICHLET
-                BV[d2] = t̂[2] * ugy
-                BC[d1] = BC_NEUMANN
-                BV[d1] = dot(n̂, tg)
-            end
-        end
-    end
-    return nothing
-end
+# =============================================================================
+# Frictional contact solvers (included)
+# =============================================================================
+include("ContactCommon.jl")
+include("ContactActiveSet.jl")
+include("ContactSSN.jl")
+include("ContactProjectedNewton.jl")
+include("ContactFriction.jl")

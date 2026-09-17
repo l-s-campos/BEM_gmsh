@@ -1,0 +1,266 @@
+# Escudero 2018 ch. 6: constant-cell von Mises vs thesis cylinder (appendix O)
+# and the quarter plate with a hole.
+using DrWatson
+@quickactivate :BEM
+using LinearAlgebra
+using Statistics: median, mean
+using Printf
+using Plots
+
+include(datadir("elastico", "iso", "pressurized_tube.jl"))
+include(datadir("elastico", "iso", "escudero2018.jl"))
+
+const DOMAIN = :cells
+const OUT = plotsdir(DOMAIN === :dibem ? "escudero2018_dibem" : "escudero2018")
+mkpath(OUT)
+
+_outer_u(dad, b; tol=0.08 * b) = begin
+    us = Float64[]
+    @inbounds for i in 1:dad.n
+        r = hypot(dad.Nodes[i][1], dad.Nodes[i][2])
+        abs(r - b) < tol || continue
+        push!(us, hypot(dad.u[2i-1], dad.u[2i]))
+    end
+    return us
+end
+
+_cell_polar(dad) = begin
+    pts = has_cache(dad, :plastic_pts) ? dad.plastic_pts :
+          [c.centroid for c in extract_domain_cells(dad)]
+    n = length(pts)
+    r = Vector{Float64}(undef, n)
+    σr = Vector{Float64}(undef, n)
+    σθ = Vector{Float64}(undef, n)
+    @inbounds for k in 1:n
+        c = pts[k]
+        ρ = hypot(c[1], c[2])
+        e = ρ < 1e-14 ? SVector(1.0, 0.0) : c / ρ
+        sxx, syy, txy = dad.stress[k, 1], dad.stress[k, 2], dad.stress[k, 3]
+        r[k] = ρ
+        σr[k] = sxx * e[1]^2 + syy * e[2]^2 + 2txy * e[1] * e[2]
+        σθ[k] = sxx * e[2]^2 + syy * e[1]^2 - 2txy * e[1] * e[2]
+    end
+    return r, σr, σθ
+end
+
+function run_cylinder(; ndiv=16, nsteps=16, p=19.8, σY=30.0, E=2.1e4, ν=0.3,
+        a=100.0, b=200.0, tipo=1, relax=0.3, maxiter=100)
+    println("\n=== Escudero §6.2 / appendix O  thick cylinder  domain=$DOMAIN ===")
+    println("a=$a  b=$b  E=$E  ν=$ν  σY=$σY  p=$p  (Tresca analytic in the thesis)")
+    props = Elasticity(E, ν, 1.0; plane_strain=true)
+    msh = mesh_pressurized_tube(; a=a, b=b, ndiv=ndiv, nome="escudero_cyl",
+        ordem=tipo)
+    dad = format2d(msh, props; pontointerno=true, tipo=tipo)
+    apply_radius_pressure!(dad, p; R=a, tol=0.08 * a)
+    ninner = count(i -> abs(hypot(dad.Nodes[i][1], dad.Nodes[i][2]) - a) < 0.08 * a,
+        1:dad.n)
+    println("n=$(dad.n)  ni=$(dad.ni)  cells=$(length(extract_domain_cells(dad)))  inner nodes=$ninner")
+    assemble!(dad, 10)
+    assemble_plastic_ops!(dad; domain=DOMAIN, npg=10, npg_stress=12, threaded=true)
+    solve_elastoplastic!(dad, VonMises(σY=σY, H′=0.0); nsteps=nsteps,
+        maxiter=maxiter, tol=1e-4, save_history=true, threaded=true,
+        domain=DOMAIN, relax=relax)
+    hist = dad.plastic_history
+    anaT = ana_thick_cylinder_tresca(b; a=a, b=b, p=p, σY=σY, E=E, ν=ν)
+    anaV = ana_thick_cylinder_plastic(b; a=a, b=b, p=p, σY=σY, E=E, ν=ν)
+    ub = _outer_u(dad, b)
+    ubm = median(ub)
+    @printf("plastic cells = %d / %d\n", count(>(1e-12), dad.plastic_strain),
+        length(dad.plastic_strain))
+    @printf("u(b) BEM median = %.5f   Tresca (app. O) = %.5f  (c=%.2f)   von Mises = %.5f (c=%.2f)\n",
+        ubm, anaT.u, anaT.c, anaV.u, anaV.c)
+    @printf("relative |u(b)| vs Tresca = %.2f %%   vs von Mises = %.2f %%\n",
+        100 * abs(ubm - anaT.u) / abs(anaT.u),
+        100 * abs(ubm - anaV.u) / abs(anaV.u))
+    @printf("last step resid = %.3e  niters = %d\n", hist[end].resid, hist[end].niters)
+
+    # appendix O Fortran outer |u| vs |t| (node 26 / 53)
+    p_th = [hypot(7.954155, 7.950418), hypot(8.342921, 8.339001),
+            hypot(9.713080, 9.708516), hypot(11.074103, 11.06890),
+            hypot(12.127235, 12.12154), hypot(12.942129, 12.93605),
+            hypot(13.572678, 13.56630), hypot(14.060586, 14.05398)]
+    u_th = [hypot(0.045945, 0.045945), hypot(0.048338, 0.048314),
+            hypot(0.057733, 0.057815), hypot(0.070292, 0.070152),
+            hypot(0.083251, 0.083020), hypot(0.096579, 0.096585),
+            hypot(0.110021, 0.110157), hypot(0.124142, 0.126057)]
+
+    p_bem = Float64[]
+    u_bem = Float64[]
+    for h in hist
+        dad.u = h.u
+        push!(p_bem, h.load * p)
+        push!(u_bem, median(_outer_u(dad, b)))
+    end
+    cs = range(a, b; length=40)
+    pT = [ana_thick_cylinder_tresca(b; a=a, b=b,
+        p=min(σY * log(b / a) * 0.99, σY * (log(c / a) + (b^2 - c^2) / (2b^2))),
+        σY=σY, E=E, ν=ν).u for c in cs]
+    # u(b) vs p from Tresca: invert via c
+    pTcurve = [σY * (log(c / a) + (b^2 - c^2) / (2b^2)) for c in cs]
+    uTcurve = [(1 + ν) * σY * c^2 / (2 * E * b^2) * ((1 - 2ν) * b + b) for c in cs]
+
+    pV = range(0.05 * anaV.pel, 0.98 * anaV.plim; length=40)
+    uVcurve = [ana_thick_cylinder_plastic(b; a=a, b=b, p=pp, σY=σY, E=E, ν=ν).u for pp in pV]
+    plt = plot(uTcurve, pTcurve; color=:black, label="Tresca (appendix O)",
+        xlabel="u(b)", ylabel="p", title="Escudero cylinder  u(b)–p")
+    plot!(plt, uVcurve, collect(pV); color=:steelblue, label="von Mises analytic")
+    plot!(plt, u_bem, p_bem; marker=:circle,
+        label=DOMAIN === :dibem ? "BEM von Mises, DIBEM" : "BEM von Mises, constant cells")
+    scatter!(plt, u_th, p_th; marker=:diamond, label="thesis Fortran")
+    savefig(plt, joinpath(OUT, "cylinder_ub_p.png"))
+    savefig(plt, joinpath(OUT, "cylinder_ub_p.pdf"))
+
+    r, σr, σθ = _cell_polar(dad)
+    rs = sortperm(r)
+    rT = range(a, b; length=80)
+    σrT = [ana_thick_cylinder_tresca(ρ; a=a, b=b, p=p, σY=σY, E=E, ν=ν).σr for ρ in rT]
+    σθT = [ana_thick_cylinder_tresca(ρ; a=a, b=b, p=p, σY=σY, E=E, ν=ν).σθ for ρ in rT]
+    σrV = [ana_thick_cylinder_plastic(ρ; a=a, b=b, p=p, σY=σY, E=E, ν=ν).σr for ρ in rT]
+    σθV = [ana_thick_cylinder_plastic(ρ; a=a, b=b, p=p, σY=σY, E=E, ν=ν).σθ for ρ in rT]
+    plt2 = plot(rT, σrT; color=:black, ls=:dash, label="Tresca σr",
+        xlabel="r", ylabel="σ", title="Escudero cylinder  σ(r) at p=$p")
+    plot!(plt2, rT, σθT; color=:black, label="Tresca σθ")
+    plot!(plt2, rT, σrV; color=:steelblue, ls=:dash, label="von Mises σr")
+    plot!(plt2, rT, σθV; color=:steelblue, label="von Mises σθ")
+    scatter!(plt2, r[rs], σr[rs]; ms=3, label="BEM σr")
+    scatter!(plt2, r[rs], σθ[rs]; ms=3, label="BEM σθ")
+    savefig(plt2, joinpath(OUT, "cylinder_sigma_r.png"))
+    savefig(plt2, joinpath(OUT, "cylinder_sigma_r.pdf"))
+
+    # thesis Fortran stresses on x=0 (nodes 12–18)
+    r_f = [175.0, 150.0, 125.0, 187.5, 162.5, 137.5, 112.5]
+    σθ_f = [23.56205, 23.07459, 17.44193, 21.39009, 24.79246, 19.99748, 13.46746]
+    σr_f = [-2.713124, -7.205396, -13.04322, -1.393559, -5.214625, -10.46945, -16.67609]
+    scatter!(plt2, r_f, σr_f; marker=:diamond, label="Fortran σr")
+    scatter!(plt2, r_f, σθ_f; marker=:diamond, label="Fortran σθ")
+    savefig(plt2, joinpath(OUT, "cylinder_sigma_r.png"))
+    savefig(plt2, joinpath(OUT, "cylinder_sigma_r.pdf"))
+    return dad
+end
+
+function apply_edge_traction!(dad, t; x=180.0, tol=1.0)
+    @inbounds for i in 1:dad.n
+        abs(dad.Nodes[i][1] - x) > tol && continue
+        dad.BC[2i-1] = 1
+        dad.BC[2i] = 1
+        dad.BV[2i-1] = t
+        dad.BV[2i] = 0.0
+    end
+    return dad
+end
+
+function run_plate(; ndiv=10, nsteps=10, t=10.0, σY=24.3, H′=24.3,
+        E=7.0e4, ν=0.2, L=180.0, W=100.0, R=50.0)
+    println("\n=== Escudero §6.1  quarter plate with hole  domain=$DOMAIN ===")
+    println("L=$L  W=$W  R=$R  E=$E  ν=$ν  σY=$σY  H′=$H′  t=$t")
+    println("(thesis text has σY=0.8 MPa, t=3 kN/m — that load stays elastic;")
+    println(" 24.3 is the Telles yield that also appears as H′ in the text.)")
+    props = Elasticity(E, ν, 1.0; plane_stress=true)
+    msh = mesh_escudero_plate_hole(; L=L, W=W, R=R, ndiv=ndiv, nome="escudero_plate")
+    dad = format2d(msh, props; pontointerno=true, tipo=1)
+    apply_edge_traction!(dad, t; x=L, tol=0.05 * L)
+    println("n=$(dad.n)  ni=$(dad.ni)  cells=$(length(extract_domain_cells(dad)))")
+    assemble!(dad, 10)
+    assemble_plastic_ops!(dad; domain=DOMAIN, npg=10, npg_stress=12, threaded=true)
+    solve_elastoplastic!(dad, VonMises(σY=σY, H′=H′); nsteps=nsteps,
+        maxiter=30, tol=1e-4, save_history=true, threaded=true, domain=DOMAIN)
+    hist = dad.plastic_history
+    # midpoint of the loaded edge: thesis (18, 5) in cm = (180, 50)
+    function u_mid(u)
+        best = 1
+        dmin = Inf
+        @inbounds for i in 1:dad.n
+            p = dad.Nodes[i]
+            abs(p[1] - L) > 0.05 * L && continue
+            d = abs(p[2] - W / 2)
+            if d < dmin
+                dmin = d
+                best = i
+            end
+        end
+        return u[2best-1], hypot(dad.Nodes[best][1] - L, dad.Nodes[best][2] - W / 2)
+    end
+    ux0, d0 = u_mid(dad.u)
+    @printf("plastic cells = %d / %d\n", count(>(1e-12), dad.plastic_strain),
+        length(dad.plastic_strain))
+    @printf("u_x at loaded-edge mid (dist=%.2f) = %.5e\n", d0, ux0)
+    @printf("last step resid = %.3e  niters = %d  max ε̄ᵖ = %.4e\n",
+        hist[end].resid, hist[end].niters, maximum(dad.plastic_strain))
+    ts = [h.load * t for h in hist]
+    uxs = [u_mid(h.u)[1] for h in hist]
+    plt = plot(uxs, ts; marker=:circle,
+        xlabel="u_x at (L, W/2)", ylabel="remote t",
+        title="Escudero plate-with-hole  load–displacement",
+        label="BEM constant cells")
+    savefig(plt, joinpath(OUT, "plate_load_disp.png"))
+    savefig(plt, joinpath(OUT, "plate_load_disp.pdf"))
+    pts = dad.plastic_pts
+    xs = [p[1] for p in pts]
+    ys = [p[2] for p in pts]
+    plt2 = scatter(xs, ys; zcolor=dad.plastic_strain, ms=5, msw=0,
+        aspect_ratio=1, xlabel="x", ylabel="y",
+        title="equivalent plastic strain", colorbar_title="ε̄ᵖ")
+    savefig(plt2, joinpath(OUT, "plate_ep.png"))
+    savefig(plt2, joinpath(OUT, "plate_ep.pdf"))
+    return dad
+end
+
+function _sigma_rel(dad; a, b, p, σY, E, ν)
+    r, σr, σθ = _cell_polar(dad)
+    e2 = 0.0
+    d2 = 0.0
+    @inbounds for k in eachindex(r)
+        ana = ana_thick_cylinder_plastic(r[k]; a=a, b=b, p=p, σY=σY, E=E, ν=ν)
+        e2 += (σr[k] - ana.σr)^2 + (σθ[k] - ana.σθ)^2
+        d2 += ana.σr^2 + ana.σθ^2
+    end
+    return sqrt(e2 / max(d2, eps()))
+end
+
+function run_cylinder_refine(; ndivs=(16, 24, 32), nsteps=16, tipo=1,
+        p=19.8, σY=30.0, E=2.1e4, ν=0.3, a=100.0, b=200.0)
+    anaV = ana_thick_cylinder_plastic(b; a=a, b=b, p=p, σY=σY, E=E, ν=ν)
+    println("\n=== cylinder refine  domain=$DOMAIN  tipo=$tipo  vs von Mises u(b)=$(anaV.u)  c=$(anaV.c) ===")
+    @printf("%6s %6s %6s %12s %10s %10s\n", "ndiv", "n", "nc", "u(b)", "err_u %", "err_σ")
+    rows = []
+    dads = []
+    for ndiv in ndivs
+        dad = run_cylinder(; ndiv=ndiv, nsteps=nsteps, p=p, σY=σY, E=E, ν=ν,
+            a=a, b=b, tipo=tipo)
+        ubm = median(_outer_u(dad, b))
+        erru = 100 * abs(ubm - anaV.u) / abs(anaV.u)
+        errσ = _sigma_rel(dad; a=a, b=b, p=p, σY=σY, E=E, ν=ν)
+        @printf("%6d %6d %6d %12.5f %10.2f %10.4f\n",
+            ndiv, dad.n, dad.plastic_nc, ubm, erru, errσ)
+        push!(rows, (; ndiv, n=dad.n, nc=dad.plastic_nc, ub=ubm, erru, errσ))
+        push!(dads, dad)
+    end
+    dad = dads[end]
+    r, σr, σθ = _cell_polar(dad)
+    rs = sortperm(r)
+    rT = range(a, b; length=120)
+    σrV = [ana_thick_cylinder_plastic(ρ; a=a, b=b, p=p, σY=σY, E=E, ν=ν).σr for ρ in rT]
+    σθV = [ana_thick_cylinder_plastic(ρ; a=a, b=b, p=p, σY=σY, E=E, ν=ν).σθ for ρ in rT]
+    plt = plot(rT, σrV; color=:steelblue, ls=:dash, label="analytic σr",
+        xlabel="r", ylabel="σ", title="DIBEM cylinder  finest mesh vs von Mises")
+    plot!(plt, rT, σθV; color=:steelblue, label="analytic σθ")
+    scatter!(plt, r[rs], σr[rs]; ms=2, label="BEM σr")
+    scatter!(plt, r[rs], σθ[rs]; ms=2, label="BEM σθ")
+    savefig(plt, joinpath(OUT, "cylinder_refine_sigma.png"))
+    savefig(plt, joinpath(OUT, "cylinder_refine_sigma.pdf"))
+    plt2 = plot([r.ndiv for r in rows], [r.erru for r in rows]; marker=:circle,
+        xlabel="ndiv", ylabel="relative error %", label="u(b)", yscale=:log10)
+    plot!(plt2, [r.ndiv for r in rows], [100 * r.errσ for r in rows]; marker=:square,
+        label="σ (L2)")
+    savefig(plt2, joinpath(OUT, "cylinder_refine_err.png"))
+    savefig(plt2, joinpath(OUT, "cylinder_refine_err.pdf"))
+    return rows
+end
+
+if !isempty(ARGS) && ARGS[1] == "refine"
+    run_cylinder_refine()
+else
+    dad_c = run_cylinder()
+    dad_p = run_plate()
+end
+println("\nfigures → ", OUT)

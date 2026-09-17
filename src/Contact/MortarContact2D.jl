@@ -33,10 +33,13 @@ using LinearAlgebra
 using SparseArrays
 using Statistics
 using ..ContactHalfPlane2D
-using ..CattaneoMindlin: solve_cattaneo_halfplane, contact_halfwidth_from_p
+using ..CattaneoMindlin:
+    solve_cattaneo_halfplane,
+    contact_halfwidth_from_p,
+    map_mindlin_shear_to_pressure
 
 export MortarMesh1D, build_mortar_projection, mortar_assemble_DM
-export solve_cattaneo_mortar_halfplane
+export solve_cattaneo_mortar_halfplane, solve_cattaneo_mortar_history_halfplane
 export project_point_to_polyline
 
 """1-D contact mesh (panel centres + endpoints)."""
@@ -159,7 +162,7 @@ end
 # =============================================================================
 
 """
-    solve_cattaneo_mortar_halfplane(x_s, x_m, R_eq, P, Q, f, G, ν; ...)
+    solve_cattaneo_mortar_halfplane(x_s, x_m, R_eq, P, Q, f, G, ν; Q_hist, ...)
 
 Solve Cattaneo–Mindlin with **non-matching** slave/master 1-D meshes:
 
@@ -167,10 +170,10 @@ Solve Cattaneo–Mindlin with **non-matching** slave/master 1-D meshes:
 2. Map tractions to the master grid by mortar: ``t_m = M^{+} D t_s``
 3. Report both slave fields and mortar-projected master fields
 
-When `x_s == x_m` this reduces to standard node-to-node (D and M diagonal-ish).
-
-If only one grid is of interest, pass a refined slave and coarse master to
-illustrate STS transfer (Loyola remark on coarse `a` accuracy).
+# History
+Pass `Q_hist` (tangential loads culminating in `Q`) so the slave shear carries
+Mindlin–Deresiewicz residual. Prefer
+[`solve_cattaneo_mortar_history_halfplane`](@ref) for a full A–E path.
 """
 function solve_cattaneo_mortar_halfplane(
     x_s::AbstractVector,
@@ -182,13 +185,40 @@ function solve_cattaneo_mortar_halfplane(
     G::Real,
     ν::Real;
     tol=1e-10,
+    Q_hist=nothing,
 )
     slave = MortarMesh1D(x_s)
     master = MortarMesh1D(x_m)
     hs = mean_spacing(x_s)
     hp = ElasticHalfPlane2D(G, ν; h=hs)
 
-    sol_s = solve_cattaneo_halfplane(x_s, R_eq, P, Q, f, hp; tol=tol)
+    sol_base = solve_cattaneo_halfplane(x_s, R_eq, P, Q, f, hp; tol=tol)
+    p_s = copy(sol_base.p)
+    contact = copy(sol_base.contact)
+    if Q_hist !== nothing
+        hist = collect(float(q) for q in Q_hist)
+        isempty(hist) && push!(hist, float(Q))
+        abs(hist[end] - float(Q)) > tol && push!(hist, float(Q))
+        sh = map_mindlin_shear_to_pressure(
+            x_s, p_s, contact, f, P, hist; h=hs, tol=tol)
+        τ_s = sh.τ
+        stick = sh.stick
+        slip = sh.slip
+        a_s = sh.a
+        p0_s = sh.p0
+    else
+        τ_s = copy(sol_base.τ)
+        stick = copy(sol_base.stick)
+        slip = copy(sol_base.slip)
+        a_s = sol_base.a
+        p0_s = sol_base.p0
+    end
+    sol_s = (;
+        sol_base...,
+        p=p_s, τ=τ_s, contact, stick, slip, a=a_s, p0=p0_s,
+        force_n=sum(p_s) * hs,
+        force_t=sum(τ_s) * hs,
+    )
 
     proj = build_mortar_projection(slave, master)
     D, M = mortar_assemble_DM(slave, master, proj)
@@ -197,13 +227,8 @@ function solve_cattaneo_mortar_halfplane(
     p_m = _nnls_transfer(M, D * sol_s.p)
     τ_m = _solve_transfer(M, D * sol_s.τ)
 
-    # master force
-    hm = mean_spacing(x_m)
-    # use master panel lengths
     force_n_m = dot_panel(p_m, master.h)
     force_t_m = dot_panel(τ_m, master.h)
-
-    a_s = sol_s.a
     a_m = contact_halfwidth_from_p(x_m, p_m)
 
     return (;
@@ -218,7 +243,37 @@ function solve_cattaneo_mortar_halfplane(
         a_s, a_m,
         p0_s=sol_s.p0,
         p0_m=maximum(p_m),
+        Q_hist=Q_hist === nothing ? nothing : collect(float(q) for q in Q_hist),
     )
+end
+
+"""
+    solve_cattaneo_mortar_history_halfplane(x_s, x_m, R_eq, f, G, ν, steps; ...) -> Vector
+
+Walk a full Cattaneo–Mindlin load history with mortar STS transfer at every
+step. Slave shear uses Mindlin residual; master tractions follow by mortar.
+"""
+function solve_cattaneo_mortar_history_halfplane(
+    x_s::AbstractVector,
+    x_m::AbstractVector,
+    R_eq::Real,
+    f::Real,
+    G::Real,
+    ν::Real,
+    steps;
+    tol=1e-10,
+)
+    results = NamedTuple[]
+    Q_path = Float64[]
+    for st in steps
+        push!(Q_path, float(st.Q))
+        sol = solve_cattaneo_mortar_halfplane(
+            x_s, x_m, R_eq, st.P, st.Q, f, G, ν;
+            tol=tol, Q_hist=copy(Q_path),
+        )
+        push!(results, (; name=st.name, P=st.P, Q=st.Q, sol...))
+    end
+    return results
 end
 
 mean_spacing(x) = length(x) > 1 ? abs(x[2] - x[1]) : 1.0

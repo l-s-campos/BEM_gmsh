@@ -10,7 +10,7 @@ half-space on a **uniform rectangular grid**, following
 # Contents
 1. Influence coefficients ``K_{ab}`` (Boussinesq / Cerruti integrated over
    flat rectangular patches) — Eqs. (12)–(21)
-2. FFT fast convolution ``u = \\mathcal{FC}_{ab}(b)`` — Eq. (23)
+2. Fast convolution ``u = \\mathcal{FC}_{ab}(b)`` — FFT (default), H-matrix, or FMM
 3. CG inverse ``b = \\mathcal{FC}_{ab}^{-1}(u, I_s)`` — Eqs. (24)–(31)
 4. Coulomb partial-slip solver — Sect. 5
 
@@ -21,38 +21,84 @@ module ContactHalfSpace
 
 using LinearAlgebra
 using FFTW
-using Printf
+using StaticArrays
+using ..HMatrices
+using ..FMM
 
-export ElasticHalfSpace, InfluenceComponent
+export ElasticHalfSpace, InfluenceComponent, combined_halfspace
 export Kxx, Kxy, Kxz, Kyx, Kyy, Kyz, Kzx, Kzy, Kzz
-export influence_coeff, influence_kernel, precompute_kernels
+export influence_coeff, influence_kernel, precompute_kernels, love_rectangle_F
 export fc_forward!, fc_forward, fc_inverse
+export fc_displacements, fc_displacements!
+export PohrtKernel, pohrt_grid_points, build_pohrt_operator
 export solve_normal_contact, solve_partial_slip
-export contact_modulus, hertz_pressure, hertz_halfwidth
+export contact_modulus, G_from_E, default_penalties
+export hertz_sphere, hertz_sphere_load, hertz_pressure, hertz_halfwidth
 
 # =============================================================================
 # Material / grid
 # =============================================================================
 
 """
-    ElasticHalfSpace(G, ν; hx=1.0, hy=hx)
+    ElasticHalfSpace(G, ν; hx=1.0, hy=hx, K=nothing)
 
 Elastic half-space with shear modulus `G`, Poisson ratio `ν`, and
 rectangular cell sizes `hx`, `hy`.
+
+`K` is the normal–tangential coupling coefficient
+``K = (1-2ν)/(4G)`` for a single body (Pohrt–Li). For two bodies use
+[`combined_halfspace`](@ref), which sets the Pohrt-equivalent `G` and
+``K = (1-2ν_A)/(4G_A) - (1-2ν_B)/(4G_B)`` (zero when the bodies are identical).
 """
 struct ElasticHalfSpace{T<:Real}
     G::T
     ν::T
+    K::T
     hx::T
     hy::T
 end
 
-ElasticHalfSpace(G::Real, ν::Real; hx::Real=1.0, hy::Real=hx) =
-    ElasticHalfSpace(promote(float(G), float(ν), float(hx), float(hy))...)
+function ElasticHalfSpace(G::Real, ν::Real; hx::Real=1.0, hy::Real=hx, K::Union{Real,Nothing}=nothing)
+    Gf, νf, hxf, hyf = promote(float(G), float(ν), float(hx), float(hy))
+    Kf = K === nothing ? (1 - 2νf) / (4Gf) : oftype(Gf, float(K))
+    return ElasticHalfSpace{typeof(Gf)}(Gf, νf, Kf, hxf, hyf)
+end
 
-shear_to_E(hs::ElasticHalfSpace) = 2hs.G * (1 + hs.ν)
-"""Plane-strain contact modulus ``E* = E / (1-ν²) = 2G/(1-ν)``."""
+"""
+    combined_halfspace(G_A, ν_A, G_B, ν_B; hx=1.0, hy=hx) -> ElasticHalfSpace
+
+Two-body Kalker combination used in Juliá Lerma (Paper 1 eq. 6), mapped onto
+the Pohrt–Li one-body kernels:
+
+```
+G = 1 / (1/G_A + 1/G_B)
+ν = G (ν_A/G_A + ν_B/G_B)
+K = (1-2ν_A)/(4 G_A) − (1-2ν_B)/(4 G_B)
+```
+
+Identical materials give `K = 0` (no relative normal–tangential coupling).
+A rigid body B (`G_B → ∞`) recovers the single-body Pohrt operator on A.
+"""
+function combined_halfspace(G_A::Real, ν_A::Real, G_B::Real, ν_B::Real; hx::Real=1.0, hy::Real=hx)
+    GA, νA, GB, νB = float(G_A), float(ν_A), float(G_B), float(ν_B)
+    G = 1 / (1 / GA + 1 / GB)
+    ν = G * (νA / GA + νB / GB)
+    K = (1 - 2νA) / (4GA) - (1 - 2νB) / (4GB)
+    return ElasticHalfSpace(G, ν; hx=hx, hy=hy, K=K)
+end
+
+"""Shear modulus from Young's modulus: ``G = E / 2(1+ν)``."""
+G_from_E(E, ν) = E / (2(1 + ν))
+
+"""Combined contact modulus ``E* = 2G/(1-ν)`` (Hertz, two-body if `G` is Pohrt-combined)."""
 contact_modulus(hs::ElasticHalfSpace) = 2hs.G / (1 - hs.ν)
+
+"""Uzawa penalties ``r_n = f / A_{zz}^{00}``, ``r_t = f / A_{xx}^{00}`` (default ``f=1/4``)."""
+function default_penalties(hs::ElasticHalfSpace; frac=0.25)
+    rn = frac / max(influence_coeff(Kzz, 0, 0, hs), eps())
+    rt = frac / max(influence_coeff(Kxx, 0, 0, hs), eps())
+    return rn, rt
+end
 
 @enum InfluenceComponent begin
     Kxx = 1
@@ -65,12 +111,6 @@ contact_modulus(hs::ElasticHalfSpace) = 2hs.G / (1 - hs.ν)
     Kzy = 8
     Kzz = 9
 end
-
-const COMPONENT_NAMES = Dict(
-    Kxx => "xx", Kxy => "xy", Kxz => "xz",
-    Kyx => "yx", Kyy => "yy", Kyz => "yz",
-    Kzx => "zx", Kzy => "zy", Kzz => "zz",
-)
 
 # =============================================================================
 # Geometry helpers for Love / Cerruti integrals  — Eq. (13)
@@ -93,9 +133,16 @@ end
     return log(max(num, floatmin(typeof(num))) / max(den, floatmin(typeof(den))))
 end
 
+@inline function _atan_pv(y, x)
+    # 1-arg atan(y/x) ∈ (−π/2, π/2). `atan(y, x)` (atan2) jumps by 2π when
+    # x < 0 and y crosses 0, which added a constant even part to Kxz/Kyz and
+    # destroyed antisymmetry (radial Poisson slip became a uniform slide).
+    iszero(x) && return zero(x)
+    return atan(y / x)
+end
+
 @inline function _atan_diff(y1, x1, y2, x2)
-    # arctan(y1/x1) - arctan(y2/x2) via atan2 for quadrant safety
-    return atan(y1, x1) - atan(y2, x2)
+    return _atan_pv(y1, x1) - _atan_pv(y2, x2)
 end
 
 # =============================================================================
@@ -109,30 +156,37 @@ Influence coefficient ``K_{ab}^{ij,i'j'}`` for relative cell offset
 `(di,dj) = (i-i', j-j')`.
 """
 function influence_coeff(comp::InfluenceComponent, di::Real, dj::Real, hs::ElasticHalfSpace)
-    G, ν, hx, hy = hs.G, hs.ν, hs.hx, hs.hy
-    k, m, l, n = _kmnl(di, dj, hx, hy)
-    return _coeff(comp, k, m, l, n, G, ν)
+    k, m, l, n = _kmnl(di, dj, hs.hx, hs.hy)
+    return _coeff(comp, k, m, l, n, hs.G, hs.ν, hs.K)
 end
 
 # Prefactors include π from classical Boussinesq/Cerruti (the printed paper
 # formulae drop π in several places due to typesetting; continuum kernels are
 # ∼1/(π G R)).
 
-function _coeff(::Val{Kzz}, k, m, l, n, G, ν)
-    # Love (1929) / Eq. (12)
+"""Love rectangle integral ``F`` of the four-corner log stencil (Eq. 12)."""
+function love_rectangle_F(di::Real, dj::Real, hx::Real, hy::Real)
+    return _love_F(_kmnl(di, dj, hx, hy)...)
+end
+
+function _love_F(k, m, l, n)
     s_km = _hypot2(k, m); s_kn = _hypot2(k, n)
     s_lm = _hypot2(l, m); s_ln = _hypot2(l, n)
-    F = (
+    return (
         k * _ln_ratio(m + s_km, n + s_kn) +
         l * _ln_ratio(n + s_ln, m + s_lm) +
         m * _ln_ratio(k + s_km, l + s_lm) +
         n * _ln_ratio(l + s_ln, k + s_kn)
     )
-    return (1 - ν) / (2π * G) * F
 end
 
-function _coeff(::Val{Kxz}, k, m, l, n, G, ν)
-    # Eq. (14) — u_x due to p_z
+function _coeff(::Val{Kzz}, k, m, l, n, G, ν, _Kcoup)
+    # Love (1929) / Eq. (12): (1−ν)/(2πG) F = F / (π E*)
+    return (1 - ν) / (2π * G) * _love_F(k, m, l, n)
+end
+
+function _coeff(::Val{Kxz}, k, m, l, n, G, ν, Kcoup)
+    # Eq. (14) — u_x due to p_z. Prefactor Kcoup/π; one-body Kcoup = (1-2ν)/(4G).
     s_km2 = k * k + m * m
     s_lm2 = l * l + m * m
     s_ln2 = l * l + n * n
@@ -140,10 +194,10 @@ function _coeff(::Val{Kxz}, k, m, l, n, G, ν)
     F = 0.5 * (m * _ln_ratio(s_km2, s_lm2) + n * _ln_ratio(s_ln2, s_kn2)) +
         k * _atan_diff(m, k, n, k) +
         l * _atan_diff(n, l, m, l)
-    return -(1 - 2ν) / (4π * G) * F
+    return -Kcoup / π * F
 end
 
-function _coeff(::Val{Kyz}, k, m, l, n, G, ν)
+function _coeff(::Val{Kyz}, k, m, l, n, G, ν, Kcoup)
     # Eq. (15) — u_y due to p_z
     s_km2 = k * k + m * m
     s_kn2 = k * k + n * n
@@ -152,15 +206,15 @@ function _coeff(::Val{Kyz}, k, m, l, n, G, ν)
     F = 0.5 * (k * _ln_ratio(s_km2, s_kn2) + l * _ln_ratio(s_ln2, s_lm2)) +
         m * _atan_diff(k, m, l, m) +
         n * _atan_diff(l, n, k, n)
-    return -(1 - 2ν) / (4π * G) * F
+    return -Kcoup / π * F
 end
 
-function _coeff(::Val{Kzx}, k, m, l, n, G, ν)
+function _coeff(::Val{Kzx}, k, m, l, n, G, ν, Kcoup)
     # Eq. (16)
-    return -_coeff(Val(Kxz), k, m, l, n, G, ν)
+    return -_coeff(Val(Kxz), k, m, l, n, G, ν, Kcoup)
 end
 
-function _coeff(::Val{Kxx}, k, m, l, n, G, ν)
+function _coeff(::Val{Kxx}, k, m, l, n, G, ν, Kcoup)
     # Eq. (17) — u_x due to τ_x
     s_km = _hypot2(k, m); s_kn = _hypot2(k, n)
     s_lm = _hypot2(l, m); s_ln = _hypot2(l, n)
@@ -175,7 +229,7 @@ function _coeff(::Val{Kxx}, k, m, l, n, G, ν)
     return 1 / (2π * G) * ((1 - ν) * Fν + F1)
 end
 
-function _coeff(::Val{Kyx}, k, m, l, n, G, ν)
+function _coeff(::Val{Kyx}, k, m, l, n, G, ν, Kcoup)
     # Eq. (18) — u_y due to τ_x
     F = (
         _hypot2(n, k) - _hypot2(m, k) +
@@ -184,12 +238,12 @@ function _coeff(::Val{Kyx}, k, m, l, n, G, ν)
     return ν / (2π * G) * F
 end
 
-function _coeff(::Val{Kzy}, k, m, l, n, G, ν)
+function _coeff(::Val{Kzy}, k, m, l, n, G, ν, Kcoup)
     # Eq. (19) — u_z due to τ_y
-    return -_coeff(Val(Kyz), k, m, l, n, G, ν)
+    return -_coeff(Val(Kyz), k, m, l, n, G, ν, Kcoup)
 end
 
-function _coeff(::Val{Kyy}, k, m, l, n, G, ν)
+function _coeff(::Val{Kyy}, k, m, l, n, G, ν, Kcoup)
     # Eq. (20) — swap roles of (k,l)↔(m,n) relative to Kxx
     s_km = _hypot2(k, m); s_kn = _hypot2(k, n)
     s_lm = _hypot2(l, m); s_ln = _hypot2(l, n)
@@ -204,14 +258,14 @@ function _coeff(::Val{Kyy}, k, m, l, n, G, ν)
     return 1 / (2π * G) * ((1 - ν) * Fν + F1)
 end
 
-function _coeff(::Val{Kxy}, k, m, l, n, G, ν)
+function _coeff(::Val{Kxy}, k, m, l, n, G, ν, Kcoup)
     # Eq. (21)
-    return _coeff(Val(Kyx), k, m, l, n, G, ν)
+    return _coeff(Val(Kyx), k, m, l, n, G, ν, Kcoup)
 end
 
 # dispatch on enum
-_coeff(comp::InfluenceComponent, k, m, l, n, G, ν) =
-    _coeff(Val(comp), k, m, l, n, G, ν)
+_coeff(comp::InfluenceComponent, k, m, l, n, G, ν, Kcoup) =
+    _coeff(Val(comp), k, m, l, n, G, ν, Kcoup)
 
 # =============================================================================
 # Kernel construction for FFT convolution
@@ -237,27 +291,48 @@ function influence_kernel(comp::InfluenceComponent, nx::Int, ny::Int, hs::Elasti
 end
 
 """
-    precompute_kernels(nx, ny, hs; components=...) -> NamedTuple
+    precompute_kernels(nx, ny, hs; components=..., method=:fft) -> NamedTuple
 
-FFT of zero-padded influence kernels for the requested components.
-Default: all 9.
+Precompute the requested influence operators.
+
+`method`:
+- `:fft` (default) — circulant embedding, ``O(N \\log N)`` on a uniform grid
+- `:dense` — full ``N×N`` Love/Cerruti matrix
+- `:hmatrix` — hierarchical ACA (`assemble_hmatrix`)
+- `:h2` — NNCA H² (`assemble_h2`)
+- `:hss` — nested ID HSS (`assemble_hss`) of the same Love matrix
+- `:fmm` — Laplace 3-D FMM (`fmm_laplace3d_matrix`, same plan as DIBEM)
+  for the far 1/r field, scaled by ``4A/E*``, with Love
+  [`influence_coeff`](@ref) on a near stencil (HalfSpaceBEM `lfmm3d`
+  pattern). `Kzz` only.
+
+Default components: all 9.
 """
 function precompute_kernels(
     nx::Int, ny::Int, hs::ElasticHalfSpace;
     components=instances(InfluenceComponent),
+    method::Symbol=:fft,
+    kwargs...,
 )
-    # padded FFT size (next pow2 optional; use exact 2N for clarity)
+    method === :fft && return _precompute_fft(nx, ny, hs, components)
+    kernels = Dict{InfluenceComponent,Any}()
+    for comp in components
+        kernels[comp] = build_pohrt_operator(hs, nx, ny, comp; method=method, kwargs...)
+    end
+    return (; nx, ny, Mx=2nx, My=2ny, kernels, hs, method)
+end
+
+function _precompute_fft(nx, ny, hs, components)
     Mx, My = 2nx, 2ny
     kernels = Dict{InfluenceComponent,Matrix{ComplexF64}}()
     scratch = zeros(Float64, Mx, My)
     for comp in components
         fill!(scratch, 0)
         K = influence_kernel(comp, nx, ny, hs)
-        # place kernel with origin at (1,1) using circular wrap
         _embed_kernel!(scratch, K, nx, ny)
         kernels[comp] = rfft(scratch)
     end
-    return (; nx, ny, Mx, My, kernels, hs)
+    return (; nx, ny, Mx, My, kernels, hs, method=:fft)
 end
 
 function _embed_kernel!(dest::AbstractMatrix, K::AbstractMatrix, nx, ny)
@@ -282,8 +357,8 @@ end
 """
     fc_forward(stress, comp, prep) -> deflection
 
-``u = \\mathcal{FC}_{ab}(b)`` via FFT convolution using precomputed kernels
-from [`precompute_kernels`](@ref).
+``u = \\mathcal{FC}_{ab}(b)`` using the operators in [`precompute_kernels`](@ref)
+(FFT convolution, H-matrix, or FMM).
 """
 function fc_forward(stress::AbstractMatrix{<:Real}, comp::InfluenceComponent, prep)
     nx, ny = prep.nx, prep.ny
@@ -299,9 +374,16 @@ function fc_forward!(
     comp::InfluenceComponent,
     prep,
 )
-    nx, ny, Mx, My = prep.nx, prep.ny, prep.Mx, prep.My
     haskey(prep.kernels, comp) || error("kernel $comp not precomputed")
-    # pad stress
+    if get(prep, :method, :fft) === :fft
+        return _fc_forward_fft!(u, stress, comp, prep)
+    end
+    mul!(vec(u), prep.kernels[comp], vec(stress))
+    return u
+end
+
+function _fc_forward_fft!(u, stress, comp, prep)
+    nx, ny, Mx, My = prep.nx, prep.ny, prep.Mx, prep.My
     pad = zeros(Float64, Mx, My)
     @inbounds for j in 1:ny, i in 1:nx
         pad[i, j] = stress[i, j]
@@ -315,16 +397,48 @@ function fc_forward!(
     return u
 end
 
-"""Apply several components and accumulate (e.g. full 3×3 coupling)."""
-function fc_forward_coupled(stresses::NamedTuple, comps::Vector{Pair{Symbol,InfluenceComponent}}, prep)
+"""
+    fc_displacements(px, py, pn, prep) -> (ux, uy, uz)
+
+Coupled ``u = A p`` (thesis eq. 2.24) via nine FFT convolutions.
+Missing kernels in `prep` are skipped (treated as zero).
+"""
+function fc_displacements(
+    px::AbstractMatrix{<:Real},
+    py::AbstractMatrix{<:Real},
+    pn::AbstractMatrix{<:Real},
+    prep,
+)
     nx, ny = prep.nx, prep.ny
-    u = zeros(Float64, nx, ny)
-    tmp = similar(u)
-    for (skey, comp) in comps
-        s = stresses[skey]
-        fc_forward!(tmp, s, comp, prep)
-        u .+= tmp
-    end
+    ux = zeros(Float64, nx, ny)
+    uy = zeros(Float64, nx, ny)
+    uz = zeros(Float64, nx, ny)
+    fc_displacements!(ux, uy, uz, px, py, pn, prep)
+    return ux, uy, uz
+end
+
+function fc_displacements!(
+    ux::AbstractMatrix{<:Real},
+    uy::AbstractMatrix{<:Real},
+    uz::AbstractMatrix{<:Real},
+    px::AbstractMatrix{<:Real},
+    py::AbstractMatrix{<:Real},
+    pn::AbstractMatrix{<:Real},
+    prep;
+    tmp::Union{Nothing,AbstractMatrix}=nothing,
+)
+    buf = tmp === nothing ? zeros(Float64, prep.nx, prep.ny) : tmp
+    fill!(ux, 0); fill!(uy, 0); fill!(uz, 0)
+    _acc!(ux, px, Kxx, prep, buf); _acc!(ux, py, Kxy, prep, buf); _acc!(ux, pn, Kxz, prep, buf)
+    _acc!(uy, px, Kyx, prep, buf); _acc!(uy, py, Kyy, prep, buf); _acc!(uy, pn, Kyz, prep, buf)
+    _acc!(uz, px, Kzx, prep, buf); _acc!(uz, py, Kzy, prep, buf); _acc!(uz, pn, Kzz, prep, buf)
+    return ux, uy, uz
+end
+
+function _acc!(u, stress, comp, prep, tmp)
+    haskey(prep.kernels, comp) || return u
+    fc_forward!(tmp, stress, comp, prep)
+    u .+= tmp
     return u
 end
 
@@ -572,33 +686,46 @@ function solve_partial_slip(
 end
 
 # =============================================================================
-# Analytical references (Hertz / Mindlin helpers)
+# Analytical Hertz (sphere on flat)
 # =============================================================================
 
-"""Hertz half-width for cylinder is 2D; here sphere on flat: ``a = (3 F R / 4 E*)^{1/3}``."""
-function hertz_halfwidth(F, R, hs::ElasticHalfSpace)
-    Estar = contact_modulus(hs)
-    return (3 * F * R / (4 * Estar))^(1 / 3)
+"""Hertz sphere from approach ``δ``: ``a=√(Rδ)``, ``P=4/3 E* √R δ^{3/2}``."""
+function hertz_sphere(R, δ, Estar)
+    a = sqrt(R * δ)
+    P = (4 / 3) * Estar * sqrt(R) * δ^(3 / 2)
+    p0 = (3 / 2) * P / (π * a^2)
+    return (; a, P, p0, δ, Estar)
 end
 
-"""Hertz pressure distribution on grid centred at origin."""
+"""Hertz sphere from load ``P``: ``a = (3 P R / 4 E*)^{1/3}``."""
+function hertz_sphere_load(R, P, Estar)
+    a = (3 * P * R / (4 * Estar))^(1 / 3)
+    δ = a^2 / R
+    p0 = (3 / 2) * P / (π * a^2)
+    return (; a, δ, p0, P, Estar)
+end
+
+"""Hertz contact radius of a sphere on this half-space."""
+hertz_halfwidth(F, R, hs::ElasticHalfSpace) = hertz_sphere_load(R, F, contact_modulus(hs)).a
+
+"""Hertz pressure on a grid centred at the origin. Returns `(p, a, p0)`."""
 function hertz_pressure(F, R, hs::ElasticHalfSpace, x::AbstractVector, y::AbstractVector)
-    a = hertz_halfwidth(F, R, hs)
-    Estar = contact_modulus(hs)
-    p0 = (6 * F * Estar^2 / (π^3 * R^2))^(1 / 3)
-    nx, ny = length(x), length(y)
-    p = zeros(Float64, nx, ny)
-    @inbounds for j in 1:ny, i in 1:nx
-        ρ2 = (x[i]^2 + y[j]^2) / a^2
-        if ρ2 < 1
-            p[i, j] = p0 * sqrt(1 - ρ2)
+    hz = hertz_sphere_load(R, F, contact_modulus(hs))
+    p = zeros(Float64, length(x), length(y))
+    a2 = hz.a^2
+    @inbounds for j in eachindex(y), i in eachindex(x)
+        ρ2 = x[i]^2 + y[j]^2
+        if ρ2 < a2
+            p[i, j] = hz.p0 * sqrt(1 - ρ2 / a2)
         end
     end
-    return p, a, p0
+    return p, hz.a, hz.p0
 end
 
 function Base.show(io::IO, hs::ElasticHalfSpace)
-    print(io, "ElasticHalfSpace(G=$(hs.G), ν=$(hs.ν), hx=$(hs.hx), hy=$(hs.hy))")
+    print(io, "ElasticHalfSpace(G=$(hs.G), ν=$(hs.ν), K=$(hs.K), hx=$(hs.hx), hy=$(hs.hy))")
 end
+
+include("ContactHalfSpaceAccel.jl")
 
 end # module

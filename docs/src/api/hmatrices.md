@@ -1,122 +1,71 @@
-# Hierarchical matrices (`HMatrices`)
+# H-matrices
 
-Module: `BEM.HMatrices` (reexported by `BEM`).
+Vendored hierarchical matrices. Load with `using BEM.HMatrices`.
+`assemble!(dad; method=:hmatrix)` stores a `ColWeightedOp` wrapping
+an `HMatrix` in `dad.H`.
 
-Rank-structured formats for BEM operators (`H`, `G`, DIBEM masses, half-space
-kernels). See also the research plan
-[`_research/hmatrices_improvement_plan.md`](../../_research/hmatrices_improvement_plan.md).
+Tensor kernels (`SMatrix{p,p}`, e.g. Kelvin): assemble
+`assemble_hmatrix(K, tree, tree)` on the **point** tree (entries stay
+`SMatrix`). `assemble_h2(K, tree)` is block NNCA — point skeletons, apply
+size `(p n)×(p n)`. `assemble_h2(K, rowtree, coltree)` is rectangular
+(`n_row × n_col`); share a root `container` for equal-size boxes.
+`lu(A::NNCAMatrix)` is nested H² LR (H2Lib `lrdecomp_h2matrix`) via
+`h2node(A)` — couplings stay nested. `method=:hmatrix` expands to H-LU.
+Matvecs take `Vector{SVector{p}}` or a flat length-`p n` vector.
 
-## Formats
-
-| Type | Assemble | Typical use |
-|------|----------|-------------|
-| `HMatrix` | `assemble_hmatrix` | General BEM `H`/`G`, ACA far blocks |
-| `H2Matrix` | `assemble_h2` | Nested bases, large smooth kernels |
-| `HSSMatrix` / `HBSMatrix` | `assemble_hss` / `assemble_hbs` | DIBEM / 1D-like clusters |
-| `HODLRMatrix` | `assemble_hodlr` | Weak admissibility |
-| `BLRMatrix` | `assemble_blr` | Flat tiles + LU |
-
-## Assembly
+GPU apply (assembly stays on the host):
 
 ```julia
-pts = # Vector{SVector}
-K = KernelMatrix((x,y) -> ..., pts, pts)
-tree = ClusterTree(pts, PrincipalComponentSplitter(; nmax=32))
-H  = assemble_hmatrix(K, tree, tree; adm=StrongAdmissibilityStd(; eta=2),
-                      comp=PartialACA(; rtol=1e-6))
-H2 = assemble_h2(K, tree; rtol=1e-6, far_method=:aca, alpha=0.5)
-
-# recursive H2Lib-style block tree (sons / uniform / dense)
-root = h2_repackage(H2)   # -> H2Node with pack.U nested bases
-y2 = root * x             # same matvec as flat H2 (verification)
-# low-rank update G ← G + X*Y' (H2Lib rkupdate MVP)
-h2_rkupdate!(root, X, Y; rtol=1e-6)   # X,Y are n×k in tree-local order
+using CUDA
+H = assemble_hmatrix(K, tree, tree; device=:cuda)   # or gpu(H; device=:cuda)
+A = assemble_h2(K, tree; device=:cuda)
+y = H * x                 # host x: permute on CPU, copy, apply, copy back
+yd = H * CuArray(x)       # whole matvec on the GPU (permute + kernels)
+mul!(yd, H, xd)           # keep xd/yd as CuArray across GMRES iterations
+# each leaf GEMV is one thread per output row (coloring still serializes
+# H-matrix leaves that share a row cluster)
 ```
 
-## Algebra
+`device=:cpu` runs the same kernels on the KernelAbstractions CPU backend.
 
-```julia
-y = H * x
-Y = H * X   # multi-RHS (blocked leaf GEMM / H² level sweeps)
+[`ilut`](@ref) is Saad ILUT, including on the H² near field via [`near_sparse`](@ref).
 
-# structured product (classic H)
-hmul!(C, A, B, 1, 0, PartialACA(; rtol=1e-6))
+[`assemble_hss`](@ref) builds a weak nested HSS matrix on a **binary**
+[`PrincipalComponentSplitter`](@ref) tree by FLAM-style nested ID
+(`method=:id`) or partial ACA (`method=:aca`) against neighbors + proxy
+(not SVD of `A(t, t^c)`). `assemble_hss(K, rowtree, coltree)` is rectangular
+(matvec only). [`ulv`](@ref) is the Chandrasekaran–Gu–Pals ULV inverse and
+requires square HSS from a single tree.
 
-# hierarchical low-rank update: H ← H + X*Y'
-hlru!(H, X, Y; rtol=1e-6)
+Entry-based skeletonization: [`rskelf`](@ref) is weak recursive skeletonization
+(proxy far field). It returns [`RSKELFFactor`](@ref) with `mul!` / `ldiv!`
+(GMRES `Pl`). Use [`circle_proxy`](@ref) in 2D and [`sphere_proxy`](@ref) in 3D.
 
-# compatible-tree add: C ← A + B
-hadd!(C, A, B, 1, 1; rtol=1e-6)
-
-# factors (classic H)
-F = lu(H; rtol=1e-6)
-x = F \ b
-Fc = cholesky(H; ridge=1e-10, rtol=1e-6)
-
-# H² factorization (H2Lib lrdecomp_h2matrix)
-# nested LR on recursive H2Node (true H2Lib recursion on sons):
-Fn = lu(H2; method=:nested)            # -> H2NodeLU
-x  = Fn \ b
-out = lrdecomp_h2matrix(H2; method=:nested)
-# practical path H²→H then H-LU:
-F2 = lu(H2; method=:block, rtol=1e-4)  # -> H2LU
-Hh = h2_to_hmatrix(H2; method=:block)
-
-# GMRES (+ optional hierarchical left precond)
-x, stats = gmres_h(H, b; Pl=F, rtol=1e-8)
-```
-
-`solve_Hmat(dad; Pl=F)` accepts the same optional `Pl` for Laplace H-systems.
-
-## HARA (sampler build)
-
-Build hierarchical matrices from **matvecs only** (black-box operator):
-
-```julia
-S = KernelMatvecSampler(K)
-
-# classic H (blockwise low-rank leaves)
-Hh = hara(S, tree, tree; rtol=1e-3, batch=8)
-
-# nested H² (no proxies / no kernel entries)
-H2h = hara_h2(S, tree; rtol=1e-4, nsample=64, alpha=0.5)
-# or: hara(S, tree; format=:H2, rtol=1e-4)
-
-# product C ≈ A*B from hierarchical applies only (no dense A*B)
-Hc = hara_product(A, B, tree, tree; rtol=1e-3, batch=8)
-# nested H² of a product sampler:
-H2c = hara_h2(FunctionSampler((Y,X)->mul!(Y,A,B*X), n; f_adj! = ...), tree)
-```
-
-| API | Output | Needs |
-|-----|--------|--------|
-| `hara(S, rowtree, coltree)` | `HMatrix` | matvecs |
-| `hara_h2(S, tree)` | `H2Matrix` | matvecs |
-| `assemble_h2(K, tree)` | `H2Matrix` | entries / proxies |
-| `assemble_h2_fmm(A, tree)` / `assemble_h2_fmm(points; kernel=…)` | `H2Matrix` | **FMM matvecs** (HARA) |
-
-```julia
-# FMM → nested H² (large-n path)
-A  = FMM.fmm_laplace2d_matrix(Pmat; eps=1e-6)
-H2 = assemble_h2_fmm(A, tree; rtol=1e-4, nsample=64)
-# or one-shot:
-H2 = assemble_h2_fmm(Pmat; kernel=:laplace2d, scale=-1/(2π))
-# DIBEM:
-DIBEM(dad; method=:h2, hss_method=:fmm)
-```
-
-Demos: `scripts/hara_product_demo.jl`, `scripts/hmat_gmres_precond_demo.jl`.
-
-## H² basis maintenance
-
-```julia
-h2_orthog!(H2)                 # nested QR + project couplings
-h2_compress!(H2; rtol=1e-6)    # recompress far blocks
-```
-
-## Diagnostics
-
-```julia
-compression_ratio(H)   # dense_bytes / hierarchical_bytes (>1 is good)
-maxrank(H2)
+```@docs
+BEM.HMatrices
+BEM.HMatrices.HMatrix
+BEM.HMatrices.NNCAMatrix
+BEM.HMatrices.ClusterTree
+BEM.HMatrices.HyperRectangle
+BEM.HMatrices.RkMatrix
+BEM.HMatrices.PartialACA
+BEM.HMatrices.TSVD
+BEM.HMatrices.assemble_hmatrix
+BEM.HMatrices.assemble_h2
+BEM.HMatrices.ilut
+BEM.HMatrices.ILUTFactor
+BEM.HMatrices.near_sparse
+BEM.HMatrices.rskelf
+BEM.HMatrices.assemble_hss
+BEM.HMatrices.HSSMatrix
+BEM.HMatrices.ulv
+BEM.HMatrices.ULVFactor
+BEM.HMatrices.RSKELFFactor
+BEM.HMatrices.circle_proxy
+BEM.HMatrices.sphere_proxy
+BEM.HMatrices.interpolative_decomp
+BEM.HMatrices.gpu
+BEM.HMatrices.GPUHMatrix
+BEM.HMatrices.GPUNNCAMatrix
+BEM.HMatrices.compression_ratio
 ```

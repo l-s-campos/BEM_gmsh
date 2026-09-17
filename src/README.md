@@ -1,51 +1,68 @@
 # Source layout
 
+`using BEM` is the teaching spine (types, `format2d`, `assemble!`, `solve`,
+`dibem!`). Advanced folders are **submodules** (`BEM.Crack`, `BEM.Contact`,
+`BEM.Plate`, `BEM.Topology`, `BEM.MultiRegion`, `BEM.HMatrices`, `BEM.FMM`).
+There is no `module Laplace`: that name is the problem type.
+
 ```
 src/
   BEM.jl                 # module entry / includes
   Core/                  # shared infrastructure
-    Structures.jl
-    Kernels.jl           # KernelPair, helpers
-    Interpolation.jl
-    Integration.jl       # Newton/NonlinearSolve projection, sinh-transform
-    GmshSession.jl       # refcounted gmsh.initialize/finalize
-    Bezier.jl            # Bernstein basis, Bézier extraction, IGA shapes
-    Input.jl             # Gmsh I/O (format2d/3d; discretization=:iga)
-    Visualization.jl
+    Interpolation.jl     # barycentric Lagrange / Legendre / equispaced
+    Structures.jl        # BEMdata, Problem types, BEMCache
+    LinearSolveUtils.jl  # bem_linsolve
+    Kernels.jl           # KernelPair, StressKernels
+    Integration.jl       # Newton closest-point + sinh + Guiggiani
+    Input.jl             # format2d / format3d + Gmsh session
+    SBM_geom.jl          # SBM parent-element map / L_m
     Radial_Basis_Functions.jl
-    Parallel.jl
-    GeometricProperties.jl  # 2D/3D area-volume-centroid (propgeo)
+    RBF_Extensions.jl    # included from Radial_Basis_Functions.jl
+    Visualization.jl     # plot_geo, export_vtk
+    GeometricProperties.jl
+    Assembly_factored.jl # ColWeightedOp, mixed-BC blocks, BlockHLU
+    DIBEM_common.jl      # RIM, CPD, factored M, cell mass
+    SurfaceDIBEM.jl      # 3-D face integrals: PHS3+poly on parent edges + radial ID
+    Assembly_full.jl     # dense H,G / assemble!
+    Boundary_conditions.jl
+    Solver.jl            # steady solve
+    Analytical.jl        # AnalyticalSolution + catalog
   Laplace/
     Fundamental.jl
-    Orthotropic.jl       # orthotropic conductivity
-    Assembly_full.jl
+    Orthotropic.jl       # anisotropic/orthotropic conductivity (2D+3D)
     Assembly_H.jl
-    Boundary_conditions.jl
-    Solver.jl
-    Domain.jl            # DIBEM
-    Analytical.jl
+    Assembly_GPU.jl      # 2-D Laplace far-field KernelAbstractions kernel
+    DIBEM_GPU.jl         # 2-D Laplace dense DIBEM on GPU (F, D, far RIM)
+    Assembly_galerkin.jl
+    Domain.jl            # DIBEM dense
+    Domain_fast.jl
+    Heterogeneous.jl
+    AnisotropicDIBEM.jl
+    Solver.jl            # Houbolt / heat / wave
+    LocalBEM.jl
+    SBM.jl
+    SBM_DRM.jl
+    ParticularSolution.jl
+    Lubrication.jl       # Reynolds / Guiggiani films, Laplace FS + DIBEM
+    ElrodAdams.jl        # mass-conserving p–θ cavitation (structured FVM)
   Elasticity/
+    Assembly_GPU.jl      # 2-D Kelvin H,G + DIBEM F,D (KernelAbstractions)
     Fundamental.jl
+    Anisotropic3D.jl
+    Domain.jl
+    Domain_fast.jl
+    LocalBEM.jl
     Thermoelasticity.jl
-    Axisymmetric.jl      # axisym FS (elliptic integrals)
+    Axisymmetric.jl
+    StrainStress.jl
+    PlasticKernels.jl
+    Plasticity.jl        # constant-cell von Mises
+    Transient.jl
+    SBM.jl
   Helmholtz/
     Fundamental.jl
-  MultiRegion/
-    SubRegions.jl        # BC types 3 & 4
-  Contact/
-    ContactHalfSpace.jl  # Pohrt–Li 3D surface
-    ContactHalfPlane2D.jl
-    HalfSpaceBEM.jl      # dense/FFT/Hmat/FMM + wear
-  Crack/
-    Crack.jl             # dual BEM + MTS/SED/Paris propagation (unified)
-    DualCore.jl          # dual assembly / Gmsh BC type 5 (included by Crack.jl)
-  Plate/
-    ThinPlate.jl         # isotropic Kirchhoff plate BEM (Shi–Bezine)
-    LargePlate.jl        # von Kármán large deflection + NonlinearSolve
-    Buckling.jl          # plate / thermal buckling (eigenvalue)
-    Shell.jl             # shallow shell (plate + membrane + curvature)
-  Core/GeometricProperties.jl  # 2D/3D area-volume-centroid (propgeo)
-  Laplace/Orthotropic.jl       # orthotropic conductivity Laplace
-  Elasticity/Axisymmetric.jl   # axisym FS (elliptic integrals)
+  Topology/  Crack/  Plate/  MultiRegion/
+  Contact/               # Pohrt–Li, layered, Uzawa, rolling, wheel–rail, Cattaneo, mortar
   Hmat/                  # hierarchical matrices (vendored)
+  FMM/
 ```

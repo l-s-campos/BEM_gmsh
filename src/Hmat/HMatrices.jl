@@ -1,3 +1,12 @@
+"""
+    BEM.HMatrices
+
+Vendored hierarchical matrices: cluster trees, ACA / BLR / NNCA H²,
+and `HMatrix` matvecs used by `assemble!(dad; method=:hmatrix)`.
+
+Load with `using BEM.HMatrices` (not reexported by `using BEM`).
+Trees here are also the spatial index for [`BEM.FMM`](@ref).
+"""
 module HMatrices
 
 # When included as a submodule, pkgdir may be `nothing` — fall back safely.
@@ -11,13 +20,15 @@ end
 
 using StaticArrays
 using LinearAlgebra
+using Random
 using Statistics
 using Printf
 using Distributed
 using Base.Threads
 using SparseArrays
 using Krylov
-using GLMakie
+using KernelAbstractions
+using Plots
 export plot_hmatrix
 
 const AdjOrMat = Union{Matrix, Adjoint{<:Any, <:Matrix}}
@@ -26,7 +37,7 @@ const AdjOrMat = Union{Matrix, Adjoint{<:Any, <:Matrix}}
     abstract type AbstractStructuredMatrix{T} <: AbstractMatrix{T}
 
 Abstract supertype for rank-structured matrices in this package
-(`HMatrix`, `BLRMatrix`, `HODLRMatrix`, `HSSMatrix`/`HBSMatrix`, ...).
+(`HMatrix`, `BLRMatrix`, `NNCAMatrix`, ...).
 """
 abstract type AbstractStructuredMatrix{T} <: AbstractMatrix{T} end
 
@@ -71,39 +82,52 @@ throughout the package.
 """
 use_global_index() = true
 
-include("utils.jl")
-include("hyperrectangle.jl")
-include("clustertree.jl")
-include("splitter.jl")
-include("kernelmatrix.jl")
-include("scalarize.jl")
-include("rkmatrix.jl")
-include("compressor.jl")
-include("hmatrix.jl")
-include("blr.jl")
-include("hodlr.jl")
-include("hss.jl")
-include("h2matrix.jl")
-include("h2_node.jl")
-include("anchornet.jl")
-include("structured.jl")
-include("dhmatrix.jl")
-include("multiplication.jl")
-include("hlru.jl")
-include("hara.jl")
-include("hara_h2.jl")
-include("h2_basis.jl")
-include("h2_factor.jl")
-include("triangular.jl")
-include("lu.jl")
-include("cholesky.jl")
-include("h2_lr.jl")
-include("h2_rkupdate.jl")
-include("precond.jl")
+# tree/ — geometry only (no FMM payload)
+include("tree/utils.jl")
+include("tree/hyperrectangle.jl")
+include("tree/clustertree.jl")
+include("tree/admissibility.jl")
+include("tree/splitter.jl")
+include("tree/interaction_list.jl")
+# formats/ — structured matrix types + kernels
+include("formats/kernelmatrix.jl")
+include("formats/scalarize.jl")
+include("formats/rkmatrix.jl")
+include("compress/compressor.jl")
+include("compress/id.jl")
+include("formats/hmatrix.jl")
+include("formats/blr.jl")
+include("arith/nnca_aca.jl")
+include("formats/nnca.jl")
+include("formats/h2_cheb.jl")
+include("formats/hss.jl")
+include("arith/hss_add.jl")
+include("formats/h2_node.jl")
+include("compress/anchornet.jl")
+include("formats/structured.jl")
+include("formats/dhmatrix.jl")
+# arith/ — matvec, factorizations, updates
+include("arith/multiplication.jl")
+include("arith/hlru.jl")
+include("arith/matvec_sampler.jl")
+include("arith/triangular.jl")
+include("arith/lu.jl")
+include("arith/h2_rkupdate.jl")
+include("arith/h2_lr.jl")
+include("arith/h2lu.jl")
+include("arith/srs.jl")
+include("arith/rskelf.jl")
+include("arith/hss_ulv.jl")
+include("arith/hodlr_lu.jl")
+include("arith/cholesky.jl")
+include("arith/precond.jl")
+include("arith/ilut.jl")
+isfile(joinpath(@__DIR__, "arith", "gpu.jl")) && include("arith/gpu.jl")
 
 export ClusterTree,
     CardinalitySplitter,
     DyadicSplitter,
+    hmatrix_splitter,
     GeometricSplitter,
     GeometricMinimalSplitter,
     PrincipalComponentSplitter,
@@ -114,37 +138,14 @@ export ClusterTree,
     # types
     HMatrix,
     BLRMatrix,
-    HODLRMatrix,
-    HSSMatrix,
-    HSSBasisID,
-    HSSScatteringNode,
-    HBSMatrix,
-    HBSBasisID,
-    HBSScatteringNode,
-    H2Matrix,
-    H2Node,
-    H2Pack,
-    H2BlockKind,
-    H2DenseLeaf,
-    H2UniformLeaf,
-    H2Split,
-    H2BoxAdmissibility,
-    h2_repackage,
-    h2_basis_matrix,
-    h2_nnodes,
-    h2_nleaves,
-    h2_leaves,
-    h2_foreach,
-    isuniform,
-    isdense_h2,
-    isleaf_h2,
-    issplit,
+    NNCAMatrix,
+    GPUHMatrix,
+    GPUNNCAMatrix,
     AnchorNetCompressor,
     DataDrivenLR,
-    ScalarizedMatrix,
-    ExpandedClusterTree,
     KernelMatrix,
     StrongAdmissibilityStd,
+    FMMStrongAdmissibility,
     WeakAdmissibilityStd,
     PartialACA,
     TSVD,
@@ -156,44 +157,55 @@ export ClusterTree,
     maxrank,
     assemble_hmatrix,
     assemble_blr,
-    assemble_hodlr,
-    assemble_hss,
-    assemble_hbs,
     assemble_h2,
-    h2_proxy_entry,
-    h2_proxy_block,
-    h2_orthog!,
-    h2_compress!,
-    h2_to_hmatrix,
-    lrdecomp_h2matrix,
-    lrsolve_h2matrix,
-    choldecomp_h2matrix,
-    H2LU,
+    assemble_nnca,
+    hmatrix,
+    h2node,
+    H2Node,
     H2NodeLU,
-    h2_clone,
-    h2_block_matrix,
-    h2_densify!,
-    lrdecomp_h2node!,
     lrdecomp_h2node,
-    h2_ldiv_left!,
-    h2_rdiv_right!,
-    h2_addmul!,
     h2_rkupdate!,
     h2_rkupdate_nested!,
-    H2ClusterOperator,
     prepare_h2_weights,
-    h2_product_to_global_rk,
-    h2_node_lr_factors,
+    H2ClusterOperator,
+    h2_clone,
+    h2_addmul!,
+    gpu,
+    gpu_wrap,
     hlru!,
     hadd!,
     AbstractMatvecSampler,
     FunctionSampler,
     KernelMatvecSampler,
-    hara,
-    hara_h2,
-    hara_product,
     add_diag_ridge!,
     gmres_h,
+    h2_lu_prec,
+    ilut,
+    ILUTFactor,
+    near_sparse,
+    srs_factor,
+    srs_factor_matvec,
+    SRSFactor,
+    interpolative_decomp,
+    rskelf,
+    RSKELFFactor,
+    assemble_hss,
+    hss_add,
+    assemble_hss_BDC,
+    assemble_hss_schur,
+    assemble_hss_2x2,
+    HSSMatrix,
+    HSSBDC,
+    HSSSchur,
+    HSSBlock2x2,
+    ulv,
+    ULVFactor,
+    hodlr_lu_2x2,
+    hodlr_ulv_2x2,
+    HODLR2x2LU,
+    HODLR2x2ULV,
+    circle_proxy,
+    sphere_proxy,
     assemble_structured,
     anchor_net,
     anchor_net_sample,
@@ -202,13 +214,14 @@ export ClusterTree,
     dd_twosided,
     scalarize,
     descalarize,
-    scalarize_kernel,
-    expand_tree,
     expand_range,
-    assemble_hmatrix_scalarized,
-    apply_scalarized,
     # tree / block introspection (not exporting nodes -- clashes with BEM.nodes)
     leaves,
+    node_id,
+    nnodes,
+    assign_node_ids!,
+    neighbor_il_lists,
+    boxes_touch,
     pivot,
     rowperm,
     colperm,

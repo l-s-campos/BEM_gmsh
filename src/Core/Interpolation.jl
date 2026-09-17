@@ -29,12 +29,14 @@ for name in [:Chebyshev1, :Chebyshev2, :Legendre, :Equispaced]
     @eval $name{T}(N::Integer) where {T} = $name(N, T(-1), T(1))
 end
 
-struct ArbitraryPolynomial{T<:Number,X<:AbstractVector{T},W<:AbstractVector} <: AbstractPolynomial{T}
+struct ArbitraryPolynomial{T<:Number,X<:AbstractVector{T},W<:AbstractVector,D<:AbstractMatrix} <: AbstractPolynomial{T}
     nodes::X
     weights::W
+    Dmat::D
     function ArbitraryPolynomial(nodes::AbstractVector{T}) where {T<:Number}
         _weights = weights(ArbitraryPolynomial{T}, nodes)
-        new{T,typeof(nodes),typeof(_weights)}(nodes, _weights)
+        Dmat = diff_matrix(_weights, collect(float(nodes)), length(nodes) - 1)
+        new{T,typeof(nodes),typeof(_weights),typeof(Dmat)}(nodes, _weights, Dmat)
     end
 end
 
@@ -147,9 +149,7 @@ function interpolation_matrix(poly::AbstractPolynomial{T}, x::Union{Number,Abstr
     w = weights(poly)
     x₀ = nodes(poly)
     N = degree(poly)
-    # M = Matrix{T}(undef, length(x), N+1)
     M = MMatrix{length(x),N + 1,T}(undef)
-    # Eq. (4.2)
     for j = eachindex(x)
         xx = convert(T, x[j])
         Msum = zero(T)
@@ -187,32 +187,8 @@ Return the differentiation matrix at the nodes of the polynomial specified.
 
 Now dy/dx ≈ `D*y` at the nodes of the polynomial.
 """
-function differentiation_matrix(poly::AbstractPolynomial{T}) where {T}
-    # Eqs. (9.4) and (9.5)
-    w = weights(poly)
-    x = nodes(poly)
-    N = degree(poly)
-    # D = Matrix{T}(undef, N+1, N+1)
-    D = MMatrix{N + 1,N + 1,T}(undef)
-
-    for i = Base.OneTo(N + 1)
-        Dsum = zero(T)
-        for j = Base.OneTo(i - 1)
-            temp = (w[j] / w[i]) / (x[i] - x[j])
-            D[i, j] = temp
-            Dsum += temp
-        end
-        for j = i+1:N+1
-            temp = (w[j] / w[i]) / (x[i] - x[j])
-            D[i, j] = temp
-            Dsum += temp
-        end
-        D[i, i] = -Dsum
-    end
-    return D
-end
-
-
+differentiation_matrix(poly::AbstractPolynomial) =
+    diff_matrix(weights(poly), nodes(poly), degree(poly))
 
 function diff_matrix(w::AbstractVector, x::Union{Number,AbstractVector}, N::Integer)
     # w = weights(poly)
@@ -253,70 +229,29 @@ Assumes same order nodes in ξ,η → [-1,1]² reference quad.
 function shapefun2D(poly_x::AbstractPolynomial, poly_y::AbstractPolynomial, x_eval, y_eval)
     L_xi = interpolation_matrix(poly_x, x_eval)
     L_eta = interpolation_matrix(poly_y, y_eval)
-    L = kron(L_eta, L_xi)  # Value: kron(η, ξ)
+    L = kron(L_eta, L_xi)
     N_xi = length(poly_x.nodes)
     N_eta = length(poly_y.nodes)
-
     Dx = kron(Matrix(I, N_eta, N_eta), poly_x.Dmat)
     Dy = kron(poly_y.Dmat, Matrix(I, N_xi, N_xi))
-
-    Lx = L * Dx  # ∂/∂x ∝ kron(η, Dξ Lξ); scale by Jacobian if physical
-    Ly = L * Dy # ∂/∂y ∝ kron(Dη Lη, ξ)
-
+    Lx = L * Dx
+    Ly = L * Dy
     return L, Lx, Ly
 end
 
 
 """
-    shapefun2D(poly_x::Polynomial, poly_y::Polynomial, x_eval, y_eval)
+    shapefun2D(poly, x_eval)
 
-2D tensor-product version: returns interpolation_matrix and gradient matrices.
-- L: interpolation matrix (value)
-- Lx, Ly: ∂/∂x and ∂/∂y gradient matrices at (x_eval, y_eval)
-Assumes same order nodes in ξ,η → [-1,1]² reference quad.
+Square tensor product: `shapefun2D(poly, poly, x_eval, x_eval)`.
 """
 function shapefun2D(poly_x::AbstractPolynomial, x_eval)
     L_xi = interpolation_matrix(poly_x, x_eval)
-    L = kron(L_xi, L_xi)  # Value: kron(η, ξ)
+    L = kron(L_xi, L_xi)
     N_xi = length(poly_x.nodes)
-
     Dx = kron(Matrix(I, N_xi, N_xi), poly_x.Dmat)
     Dy = kron(poly_x.Dmat, Matrix(I, N_xi, N_xi))
-
-    Lx = L * Dx  # ∂/∂x ∝ kron(η, Dξ Lξ); scale by Jacobian if physical
-    Ly = L * Dy # ∂/∂y ∝ kron(Dη Lη, ξ)
-
-    return L, Lx, Ly
-end
-
-
-"""
-    shapefun3d(poly_x::AbstractPolynomial, poly_y::AbstractPolynomial, poly_z::AbstractPolynomial,
-             x_eval, y_eval, z_eval)
-
-3D tensor-product for hexahedron [-1,1]³: interpolation + gradients.
-Node ordering: vec(ζ-slices × η-rows × ξ-cols).
-"""
-function shapefun3d(poly_x::AbstractPolynomial, poly_y::AbstractPolynomial, poly_z::AbstractPolynomial,
-    x_eval, y_eval, z_eval)
-    L_xi = interpolation_matrix(poly_x, x_eval)
-    L_eta = interpolation_matrix(poly_y, y_eval)
-    L_zeta = interpolation_matrix(poly_z, z_eval)
-    L = kron(kron(L_zeta, L_eta), L_xi)  # Value: kron(ζ, η, ξ)
-
-    N_xi = length(poly_x.nodes)
-    N_eta = length(poly_y.nodes)
-    N_zeta = length(poly_z.nodes)
-
-    # Full diff operators at nodes (ref coords)
-    Dx = kron(kron(Matrix(I, N_zeta, N_zeta), Matrix(I, N_eta, N_eta)), poly_x.Dmat)
-    Dy = kron(kron(Matrix(I, N_zeta, N_zeta), poly_y.Dmat), Matrix(I, N_xi, N_xi))
-    Dz = kron(kron(poly_z.Dmat, Matrix(I, N_eta, N_eta)), Matrix(I, N_xi, N_xi))
-
-    # Gradient matrices: eval shape * nodal diff
     Lx = L * Dx
     Ly = L * Dy
-    Lz = L * Dz
-
-    return L, Lx, Ly, Lz
+    return L, Lx, Ly
 end

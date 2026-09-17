@@ -17,20 +17,50 @@ export rbf_neighbors, rbf_laplacian_weights, _rbf_kdtree
 
 struct MQ{T <: Real} <: AbstractRadialBasis
     ε::T
+    C::T
     poly_deg::Int
-    function MQ(ε::T = 1.0; poly_deg::Int = 1) where {T <: Real}
+    paper::Bool
+    function MQ{T}(ε::T, C::T, poly_deg::Int, paper::Bool) where {T <: Real}
         check_poly_deg(poly_deg)
-        ε > 0 || throw(ArgumentError("MQ ε must be > 0"))
-        return new{T}(ε, poly_deg)
+        return new{T}(ε, C, poly_deg, paper)
     end
 end
-(b::MQ)(r2::Number) = sqrt(1 + (b.ε^2) * r2)
-(b::MQ)(x::Point, xᵢ::Point) = b(sqeuclidean(x, xᵢ))
+
+"""
+    MQ(ε=1.0; poly_deg=1)
+    MQ(; C=0.01, poly_deg=1)
+
+Multiquadric.
+
+- `MQ(ε)`: ``φ = √(1+(ε r)²)``
+- `MQ(; C)`: ``φ = √(r²+C²)`` (Samaan & Rashed 2007; typical `C=0.01`)
+"""
+function MQ(ε::T = 1.0; poly_deg::Int = 1,
+        C::Union{Nothing,Real} = nothing) where {T <: Real}
+    if C === nothing
+        ε > 0 || throw(ArgumentError("MQ ε must be > 0"))
+        return MQ{T}(ε, zero(ε), poly_deg, false)
+    else
+        Cc = float(C)
+        Cc > 0 || throw(ArgumentError("MQ C must be > 0"))
+        TT = typeof(Cc)
+        return MQ{TT}(one(TT), Cc, poly_deg, true)
+    end
+end
+(b::MQ)(r::Number) = b.paper ? sqrt(float(r)^2 + b.C^2) : sqrt(1 + (b.ε * float(r))^2)
+(b::MQ)(x::Point, xᵢ::Point) = b(norm(x - xᵢ))
 function ∂(b::MQ, dim::Int, x::Point, xᵢ::Point)
-    r2 = sqeuclidean(x, xᵢ)
-    return (b.ε^2) * (x[dim] - xᵢ[dim]) / sqrt(1 + b.ε^2 * r2)
+    dx = x[dim] - xᵢ[dim]
+    r2 = norm(x - xᵢ)^2
+    if b.paper
+        return dx / sqrt(r2 + b.C^2)
+    else
+        return (b.ε^2) * dx / sqrt(1 + b.ε^2 * r2)
+    end
 end
 poly_deg(b::MQ) = b.poly_deg
+print_basis(b::MQ) = b.paper ? "Multiquadric √(r²+C²), C=$(b.C)" :
+    "Multiquadric √(1+(ε r)²), ε=$(b.ε)"
 
 abstract type AbstractWendland <: AbstractRadialBasis end
 
@@ -43,16 +73,16 @@ struct WendlandC2{T <: Real} <: AbstractWendland
         return new{T}(δ, poly_deg)
     end
 end
-function (b::WendlandC2)(r2::Number)
-    r = sqrt(max(r2, 0)) / b.δ
-    r >= 1 && return zero(float(r2))
-    s = 1 - r
-    return s^4 * (4r + 1)
+function (b::WendlandC2)(r::Number)
+    ρ = float(r) / b.δ
+    ρ >= 1 && return zero(float(r))
+    s = 1 - ρ
+    return s^4 * (4ρ + 1)
 end
-(b::WendlandC2)(x::Point, xᵢ::Point) = b(sqeuclidean(x, xᵢ))
+(b::WendlandC2)(x::Point, xᵢ::Point) = b(norm(x - xᵢ))
 function ∂(b::WendlandC2, dim::Int, x::Point, xᵢ::Point)
     dx = x[dim] - xᵢ[dim]
-    rr = euclidean(x, xᵢ)
+    rr = norm(x - xᵢ)
     r = rr / b.δ
     r >= 1 && return 0.0
     dφdr = -20 * r * (1 - r)^3
@@ -69,15 +99,15 @@ struct WendlandC4{T <: Real} <: AbstractWendland
         return new{T}(δ, poly_deg)
     end
 end
-function (b::WendlandC4)(r2::Number)
-    r = sqrt(max(r2, 0)) / b.δ
-    r >= 1 && return zero(float(r2))
-    return (1 - r)^6 * (3 + 18r + 35 * r^2)
+function (b::WendlandC4)(r::Number)
+    ρ = float(r) / b.δ
+    ρ >= 1 && return zero(float(r))
+    return (1 - ρ)^6 * (3 + 18ρ + 35 * ρ^2)
 end
-(b::WendlandC4)(x::Point, xᵢ::Point) = b(sqeuclidean(x, xᵢ))
+(b::WendlandC4)(x::Point, xᵢ::Point) = b(norm(x - xᵢ))
 function ∂(b::WendlandC4, dim::Int, x::Point, xᵢ::Point)
     dx = x[dim] - xᵢ[dim]
-    rr = euclidean(x, xᵢ)
+    rr = norm(x - xᵢ)
     r = rr / b.δ
     r >= 1 - 1e-15 && return 0.0
     dφdr = -56 * r * (1 - r)^5 * (1 + 5r)
@@ -94,20 +124,20 @@ struct WendlandC6{T <: Real} <: AbstractWendland
         return new{T}(δ, poly_deg)
     end
 end
-function (b::WendlandC6)(r2::Number)
-    r = sqrt(max(r2, 0)) / b.δ
-    r >= 1 && return zero(float(r2))
-    return (1 - r)^8 * (1 + 8r + 25r^2 + 32r^3)
+function (b::WendlandC6)(r::Number)
+    ρ = float(r) / b.δ
+    ρ >= 1 && return zero(float(r))
+    return (1 - ρ)^8 * (1 + 8ρ + 25ρ^2 + 32ρ^3)
 end
-(b::WendlandC6)(x::Point, xᵢ::Point) = b(sqeuclidean(x, xᵢ))
+(b::WendlandC6)(x::Point, xᵢ::Point) = b(norm(x - xᵢ))
 function ∂(b::WendlandC6, dim::Int, x::Point, xᵢ::Point)
     dx = x[dim] - xᵢ[dim]
-    rr = euclidean(x, xᵢ)
+    rr = norm(x - xᵢ)
     r = rr / b.δ
     r >= 1 - 1e-15 && return 0.0
     ε = 1e-8
-    φp = b(((r + ε) * b.δ)^2)
-    φm = b((max(r - ε, 0.0) * b.δ)^2)
+    φp = b((r + ε) * b.δ)
+    φm = b(max(r - ε, 0.0) * b.δ)
     dφdr = (φp - φm) / (2ε)
     return dφdr / b.δ * dx / (rr + AVOID_INF)
 end
@@ -161,9 +191,19 @@ function _radial_integral_impl(b::IMQ, R::Real, dim::Int)
     return (ε * R * s - asinh(ε * R)) / (2 * ε^3)
 end
 
-# ---- MQ  φ = √(1+(εr)²) -----------------------------------------------------
+# ---- MQ ---------------------------------------------------------------------
+# Paper form φ = √(r²+C²): 2D uses ∫ ρ √(ρ²+C²) dρ = (1/3)(ρ²+C²)^{3/2}
+# (user / RIM). Scaled Hardy φ = √(1+(ε r)²) is the same with C = 1/ε.
 function _radial_integral_impl(b::MQ, R::Real, dim::Int)
     R = float(R)
+    if b.paper
+        C = float(b.C)
+        C2 = C * C
+        s = sqrt(R * R + C2)
+        dim == 2 && return (s^3 - C^3) / 3
+        # ∫_0^R ρ² √(ρ²+C²) dρ
+        return (R * (2 * R * R + C2) * s - C2 * C2 * log((R + s) / C)) / 8
+    end
     ε = float(b.ε)
     ε2 = ε * ε
     s = sqrt(1 + ε2 * R * R)
@@ -247,15 +287,15 @@ function radial_integral_gauss(basis::AbstractRadialBasis, R::Real; dim::Int = 2
     s = 0.0
     @inbounds for i in 1:n
         ρ = (ξ[i] + 1) / 2 * Rmax
-        s += basis(ρ * ρ) * ρ^(dim - 1) * w[i] * (Rmax / 2)
+        s += basis(ρ) * ρ^(dim - 1) * w[i] * (Rmax / 2)
     end
     return s
 end
 export radial_integral_gauss
 for B in (:IMQ, :Gaussian, :MQ, :WendlandC2, :WendlandC4, :WendlandC6)
     @eval begin
-        int(b::$B, x::Point2D, xᵢ::Point2D) = radial_integral(b, euclidean(x, xᵢ); dim = 2)
-        int(b::$B, x::Point3D, xᵢ::Point3D) = radial_integral(b, euclidean(x, xᵢ); dim = 3)
+        int(b::$B, x::Point2D, xᵢ::Point2D) = radial_integral(b, norm(x - xᵢ); dim = 2)
+        int(b::$B, x::Point3D, xᵢ::Point3D) = radial_integral(b, norm(x - xᵢ); dim = 3)
     end
 end
 
@@ -283,10 +323,20 @@ function _lap_phi(b::Gaussian, r, dim)
     return (-2 * dim * ε2 + 4 * ε2^2 * r^2) * exp(-ε2 * r^2)
 end
 
+function _lap_phi(b::MQ, r, dim)
+    if b.paper
+        s3 = (r * r + b.C^2)^(1.5)
+        return dim == 2 ? (r * r + 2 * b.C^2) / s3 : (2 * r * r + 3 * b.C^2) / s3
+    end
+    ε2 = b.ε^2
+    s3 = (1 + ε2 * r * r)^(1.5)
+    return dim == 2 ? ε2 * (2 + ε2 * r * r) / s3 : ε2 * (3 + 2 * ε2 * r * r) / s3
+end
+
 function _lap_phi(b::AbstractRadialBasis, r, dim)
     ε = 1e-7
     rp, rm = r + ε, max(r - ε, 0.0)
-    φp, φ0, φm = b(rp * rp), b(r * r), b(rm * rm)
+    φp, φ0, φm = b(rp), b(r), b(rm)
     φ′ = (φp - φm) / (rp - rm + 1e-30)
     φ′′ = (φp - 2φ0 + φm) / (ε * ε)
     return φ′′ + (dim - 1) / (r + AVOID_INF) * φ′
@@ -322,6 +372,13 @@ function _lap_part(b::IMQ, r, dim)
 end
 function _lap_part(b::MQ, r, dim)
     dim == 2 || throw(ArgumentError("MQ laplace_particular closed-form in 2D only"))
+    if b.paper
+        C = float(b.C)
+        s = sqrt(r * r + C * C)
+        p = s^3 / 9 + (C * C / 3) * s - (C^3 / 3) * log(C + s)
+        p0 = C^3 * (4 / 9 - log(2C) / 3)
+        return p - p0
+    end
     ε = float(b.ε)
     s = sqrt(1 + ε^2 * r^2)
     return ((2 + ε^2 * r^2) * s - 2 - 3 * log((1 + s) / 2)) / (9 * ε^2)
@@ -423,7 +480,7 @@ function rbf_laplacian_weights(
     A = zeros(m + npoly, m + npoly)
     hh = max(rbf_length_scale(xs), 1e-14)
     @inbounds for j in 1:m, i in 1:m
-        A[i, j] = basis(_scale_r2(sqeuclidean(xs[i], xs[j]), hh))
+        A[i, j] = basis(_scale_r(norm(xs[i] - xs[j]), hh))
     end
     ε = float(ridge) * (tr(view(A, 1:m, 1:m)) / m + 1)
     @inbounds for i in 1:m
@@ -441,7 +498,7 @@ function rbf_laplacian_weights(
     end
     rhs = zeros(m + npoly)
     @inbounds for j in 1:m
-        rhs[j] = laplacian_phi(basis, euclidean(x, xs[j]) / hh; dim = dim) / hh^2
+        rhs[j] = laplacian_phi(basis, norm(x - xs[j]) / hh; dim = dim) / hh^2
     end
     coef = A \ rhs
     w = zeros(length(pts))
@@ -510,11 +567,11 @@ function pu_rbf_eval(pu::PURBF, x::Point, y::AbstractVector{<:Real})
     den = 0.0
     @inbounds for (ic, c) in enumerate(pu.centers)
         R = pu.radii[ic]
-        w = _pu_weight(euclidean(x, c), R)
+        w = _pu_weight(norm(x - c), R)
         w <= 0 && continue
         ids = Int[]
         for j in eachindex(pu.pts)
-            euclidean(pu.pts[j], c) <= R && push!(ids, j)
+            norm(pu.pts[j] - c) <= R && push!(ids, j)
         end
         length(ids) < 3 && continue
         if length(ids) > pu.k_local
@@ -557,7 +614,7 @@ function rational_rbf_fit(
     hh = max(rbf_length_scale(pts), 1e-14)
     A = zeros(n, n)
     @inbounds for j in 1:n, i in 1:j
-        a = basis(_scale_r2(sqeuclidean(pts[i], pts[j]), hh))
+        a = basis(_scale_r(norm(pts[i] - pts[j]), hh))
         A[i, j] = a
         A[j, i] = a
     end
@@ -577,7 +634,7 @@ function rational_rbf_eval(rr::RationalRBF, x::Point)
     p = 0.0
     q = 0.0
     @inbounds for i in eachindex(rr.pts)
-        φ = rr.basis(_scale_r2(sqeuclidean(x, rr.pts[i]), rr.h))
+        φ = rr.basis(_scale_r(norm(x - rr.pts[i]), rr.h))
         p += rr.α[i] * φ
         q += rr.β[i] * φ
     end
@@ -617,7 +674,7 @@ function kansa_poisson(
     @inbounds for i in 1:ni
         xi = interior[i]
         for j in 1:n
-            rij = euclidean(xi, centres[j]) / hh
+            rij = norm(xi - centres[j]) / hh
             A[i, j] = laplacian_phi(basis, rij; dim = dim) / hh^2
         end
         rhs[i] = f isa Function ? float(f(xi)) : float(f[i])
@@ -626,7 +683,7 @@ function kansa_poisson(
         i = ni + k
         xb = boundary[k]
         for j in 1:n
-            A[i, j] = basis(_scale_r2(sqeuclidean(xb, centres[j]), hh))
+            A[i, j] = basis(_scale_r(norm(xb - centres[j]), hh))
         end
         if npoly > 0
             p = mon(xb)
@@ -653,7 +710,7 @@ end
 function kansa_eval(sol, x::Point)
     s = 0.0
     @inbounds for j in eachindex(sol.centres)
-        s += sol.α[j] * sol.basis(_scale_r2(sqeuclidean(x, sol.centres[j]), sol.h))
+        s += sol.α[j] * sol.basis(_scale_r(norm(x - sol.centres[j]), sol.h))
     end
     if !isempty(sol.β) && sol.deg >= 0
         mon = MonomialBasis(length(x), sol.deg)

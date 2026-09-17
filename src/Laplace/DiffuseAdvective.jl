@@ -60,7 +60,7 @@ function build_da_Mprime(dad::BEMdata{<:Laplace}, velocity; rbf=PHS())
     else
         Fnew = zeros(nt, nt)
         @inbounds for j in 1:nt, i in 1:nt
-            Fnew[i, j] = rbf(sqeuclidean(pts[i], pts[j]))
+            Fnew[i, j] = rbf(norm(pts[i] - pts[j]))
         end
         Fnew
     end

@@ -9,9 +9,9 @@
 #
 export thermal_modulus, eval_temperature
 export rbf_gradient_ops, thermal_boundary_load
-export dibem_elasticity!
 export solve_thermoelastic!, stress_thermoelastic
 export analytical_constrained_thermal_stress
+# dibem_elasticity! lives in Elasticity/Domain.jl
 
 # =============================================================================
 # Temperature field
@@ -67,9 +67,9 @@ function rbf_gradient_ops(pts::AbstractVector{<:Point}; rbf=PHS(3; poly_deg=1))
     dFx = zeros(n, n)
     dFy = zeros(n, n)
     @inbounds for j in 1:n, i in 1:n
-        r2 = sqeuclidean(pts[i], pts[j])
-        F[i, j] = rbf(r2)
-        if r2 > 0
+        r = norm(pts[i] - pts[j])
+        F[i, j] = rbf(r)
+        if r > 0
             dFx[i, j] = ∂(rbf, 1, pts[i], pts[j])
             dFy[i, j] = ∂(rbf, 2, pts[i], pts[j])
         end
@@ -132,7 +132,7 @@ end
 Equivalent Neumann load from temperature on the boundary (length `2·dad.nt`).
 Only boundary traction columns of `G` are used; internal block is zero.
 """
-function thermal_boundary_load(dad::BEMdata{<:Elasticity}, θ;
+function thermal_boundary_load(dad::BEMdata{<:Union{Elasticity,AnisotropicElasticity3D}}, θ;
     k̂=thermal_modulus(dad.properties))
     dim = dad.dimension
     n = dad.n
@@ -150,113 +150,7 @@ function thermal_boundary_load(dad::BEMdata{<:Elasticity}, θ;
 end
 
 # =============================================================================
-# Elasticity DIBEM mass matrix M  (Monta_M_RIMd simplified)
-# =============================================================================
-
-"""
-    dibem_elasticity!(dad; npg=10, rbf=PHS(3; poly_deg=1))
-
-Build the DIBEM domain-integral matrix `M` (size `2nt × 2nt`) such that
-`M * b ≈ ∫_Ω U* b dΩ` for a nodal body-force vector `b`.
-Stored in `dad.cache.M`.
-"""
-function dibem_elasticity!(dad::BEMdata{<:Elasticity}; npg=10, rbf=PHS(3; poly_deg=1))
-    dim = dad.dimension
-    @assert dim == 2 "dibem_elasticity! is 2D only"
-    nt = dad.nt
-    pts = all_points(dad)
-    qsi, w = gausslegendre(npg)
-
-    F = zeros(nt, nt)
-    D = zeros(2nt, 2nt)          # U* between nodes
-    M1 = zeros(nt)               # ∫ φ̂ ∂r/∂n dΓ  (scalar RBF potential integral)
-    M2 = zeros(2nt, 2)           # singular diagonal correction from ∫ U*
-
-    @showprogress "DIBEM elasticity F,D" for i in 1:nt
-        pf = pts[i]
-        for j in 1:nt
-            r2 = sqeuclidean(pf, pts[j])
-            F[i, j] = rbf(r2)
-            i == j && continue
-            rvec = pts[j] - pf
-            U, _ = fundamental(dad, rvec, zero(rvec))  # n unused in U
-            D[2i-1:2i, 2j-1:2j] .= U
-        end
-        # boundary integrals of particular solution
-        for elem in dad.elements
-            m_s, m_u = _calc_md_el(dad, elem, pf, qsi, w, rbf)
-            M1[i] += m_s
-            M2[2i-1:2i, :] .+= m_u
-        end
-    end
-
-    aux = M1' / F                         # 1 × nt
-    aux2 = repeat(aux; inner=(1, 2))     # wrong — need block structure
-    # Correct: A_{αβ} = aux_j * D_{αβ} for columns of node j
-    A = zeros(2nt, 2nt)
-    @inbounds for j in 1:nt
-        a = aux[j]
-        A[:, 2j-1] .= a .* D[:, 2j-1]
-        A[:, 2j]   .= a .* D[:, 2j]
-    end
-    for i in 1:nt
-        rows = 2i-1:2i
-        A[rows, rows] .= 0
-        A[rows, rows] .= .-hcat(sum(A[rows, 1:2:end]; dims=2),
-                                 sum(A[rows, 2:2:end]; dims=2)) .+ M2[rows, :]
-    end
-    set_cache!(dad; M=A)
-    return A
-end
-
-"""Scalar radial particular integral ∫_0^R φ(ρ) ρ dρ (2D) via [`radial_integral`](@ref)."""
-function _int_rbf_ρdρ(R, rbf)
-    if rbf isa AbstractRadialBasis
-        return radial_integral(rbf, R; dim = 2)
-    end
-    # legacy fallback PHS3
-    return R^5 / 5
-end
-
-function _calc_md_el(dad, elem, pf, qsi, w, rbf)
-    m_el = 0.0
-    m_el1 = zeros(2, 2)
-    X = dad.Nodes[elem.index]
-    nn = length(elem.index)
-    for (ig, ξ) in enumerate(qsi)
-        # linear/quadratic interpolation on element nodes
-        if nn == 2
-            N = SVector(0.5(1 - ξ), 0.5(1 + ξ))
-            dN = SVector(-0.5, 0.5)
-        elseif nn == 3
-            N = SVector(0.5ξ*(ξ - 1), 1 - ξ^2, 0.5ξ*(ξ + 1))
-            dN = SVector(ξ - 0.5, -2ξ, ξ + 0.5)
-        else
-            # fallback: use precomputed collocation weights at nearest
-            error("element with $nn nodes not supported in DIBEM thermo")
-        end
-        pg = sum(N[k] * X[k] for k in 1:nn)
-        dx = sum(dN[k] * X[k] for k in 1:nn)
-        J = norm(dx)
-        J < 1e-16 && continue
-        n = Point2D(dx[2] / J, -dx[1] / J)
-        rvec = pg - pf
-        R = norm(rvec)
-        R < 1e-14 && continue
-        rndn = dot(n, rvec) / R^2
-        m = _int_rbf_ρdρ(R, rbf)
-        m_el += rndn * m * J * w[ig]
-        # particular of U: use U(pg,pf) * R^2/2 style — Kelvin integrated in ρ
-        U, _ = fundamental(dad, rvec, n)
-        # ∫_0^R U(ρ d) ρ dρ ≈ U * R^2/2  (rough; matches order of intradial_solfund scale)
-        m1 = U .* (R^2 / 2)
-        m_el1 .+= rndn * m1 * J * w[ig]
-    end
-    return m_el, m_el1
-end
-
-# =============================================================================
-# Solve
+# Solve  (DIBEM M from Elasticity/Domain.jl via dibem_elasticity!)
 # =============================================================================
 
 """
@@ -268,10 +162,11 @@ Solve the thermoelastic BEM problem.
 - `θ`: temperature (`Number`, `Vector`, or `(x,y)->θ`). Uses `dad.properties.α`.
 - `bodyforce`: optional mechanical body force `(x,y)->SVector(bx,by)` or nodal `2nt` vector.
 
-Assumes `H_G_full_direct` has already been called. Builds DIBEM `M` only when
-`θ` is non-uniform or `bodyforce ≠ nothing`.
+Assumes `H_G_full_direct` has already been called. Builds DIBEM `M` when
+`θ` is non-uniform or `bodyforce` varies in space. A **constant** body
+force uses the RIM remainder ``ID`` only (`M (1⊗b) = ID b`).
 """
-function solve_thermoelastic!(dad::BEMdata{<:Elasticity};
+function solve_thermoelastic!(dad::BEMdata{<:Union{Elasticity,AnisotropicElasticity3D}};
     θ=0.0, bodyforce=nothing, npg_dibem=10, rbf=PHS(3; poly_deg=1))
 
     has_cache(dad, :H) || error("call H_G_full_direct(dad) first")
@@ -291,20 +186,32 @@ function solve_thermoelastic!(dad::BEMdata{<:Elasticity};
     end
 
     θ_nonuniform = maximum(θv) - minimum(θv) > 1e-14 * (1 + maximum(abs, θv))
+    bn = bodyforce === nothing ? nothing : _eval_bodyforce(dad, bodyforce)
+    const_b = bn !== nothing && _is_constant_nodal(bn, dim)
+    can_id = const_b && (has_cache(dad, :dibem_ID) || dad isa BEMdata{<:Elasticity})
     need_domain = bodyforce !== nothing || (abs(k̂) > 0 && θ_nonuniform)
+    need_M = (abs(k̂) > 0 && θ_nonuniform) || (bodyforce !== nothing && !can_id)
 
     if need_domain
-        has_cache(dad, :M) || dibem_elasticity!(dad; npg=npg_dibem, rbf=rbf)
-        M = dad.M
+        if need_M
+            has_cache(dad, :M) || dibem_elasticity!(dad; npg=npg_dibem, rbf=rbf)
+        elseif can_id && !has_cache(dad, :dibem_ID)
+            _, ID, _ = _dibem_elast_IF_ID(dad, rbf; npg=npg_dibem)
+            set_cache!(dad; dibem_ID=ID, dibem_rbf=rbf)
+        end
         q_dom = zeros(dim * nt)
         if abs(k̂) > 0 && θ_nonuniform
             pts = all_points(dad)
             ops = rbf_gradient_ops(pts; rbf=rbf)
             gθ = stack_grad(ops.Fx, ops.Fy, θv)
-            q_dom .-= M * (k̂ .* gθ)     # -q2  (termoelasticidade.jl)
+            q_dom .-= dad.M * (k̂ .* gθ)     # -q2  (termoelasticidade.jl)
         end
-        if bodyforce !== nothing
-            q_dom .+= M * _eval_bodyforce(dad, bodyforce)   # +qc
+        if bn !== nothing
+            if can_id && has_cache(dad, :dibem_ID)
+                q_dom .+= dad.dibem_ID * bn[1:dim]
+            else
+                q_dom .+= dad.M * bn
+            end
         end
         b .+= q_dom
     end
@@ -319,6 +226,20 @@ function solve_thermoelastic!(dad::BEMdata{<:Elasticity};
     return u
 end
 
+function _is_constant_nodal(bn::AbstractVector, dim::Integer)
+    n = length(bn)
+    dim < 1 && return false
+    n % dim == 0 || return false
+    nt = n ÷ dim
+    nt < 2 && return true
+    @inbounds for i in 2:nt
+        for d in 1:dim
+            bn[dim * (i - 1) + d] == bn[d] || return false
+        end
+    end
+    return true
+end
+
 function _eval_bodyforce(dad, bodyforce)
     dim = dad.dimension
     nt = dad.nt
@@ -329,11 +250,26 @@ function _eval_bodyforce(dad, bodyforce)
     end
     pts = all_points(dad)
     @inbounds for i in 1:nt
-        f = bodyforce(pts[i][1], pts[i][2])
-        bn[dim*(i-1)+1] = f[1]
-        bn[dim*(i-1)+2] = f[2]
+        p = pts[i]
+        f = _call_bodyforce(bodyforce, p)
+        for d in 1:dim
+            bn[dim*(i-1)+d] = f[d]
+        end
     end
     return bn
+end
+
+function _call_bodyforce(f, p::SVector{2})
+    return f(p[1], p[2])
+end
+function _call_bodyforce(f, p::SVector{3})
+    if applicable(f, p)
+        return f(p)
+    elseif applicable(f, p[1], p[2], p[3])
+        return f(p[1], p[2], p[3])
+    else
+        return f(p)
+    end
 end
 
 # =============================================================================

@@ -30,7 +30,8 @@ using ..ContactHalfPlane2D
 export loyola_cattaneo_params, hertz_cylinder_params
 export cattaneo_pressure, cattaneo_shear, mindlin_shear_history, cattaneo_c
 export solve_cattaneo_halfplane, solve_cattaneo_history_halfplane
-export solve_cattaneo_cohesive_halfplane
+export solve_cattaneo_cohesive_halfplane, solve_cattaneo_cohesive_history_halfplane
+export map_mindlin_shear_to_pressure, cohesive_blend_shear
 export contact_halfwidth_from_p, peak_pressure
 
 # =============================================================================
@@ -195,8 +196,8 @@ end
 Force-controlled normal + tangential partial-slip on [`ElasticHalfPlane2D`](@ref).
 
 1. Normal: active-set line contact with cylinder gap ``x²/(2R)`` matched to load `P`
-2. Tangential: stick/slip iteration (Pohrt–Li style) with bisection on rigid slip
-   so that ``∫ τ dx = Q``
+2. Tangential: analytical Cattaneo superposition on the numerical `p`, rescaled
+   so that ``∫ τ dx = Q`` (not a Pohrt–Li stick/slip iteration)
 """
 function solve_cattaneo_halfplane(
     x::AbstractVector,
@@ -307,9 +308,123 @@ function _partial_slip_force(p, contact, Q, f, hp; tol=1e-10, maxiter=80)
 end
 
 """
+    map_mindlin_shear_to_pressure(x, p, contact, f, P, Q_hist; h, tol) -> (; τ, stick, slip, a, p0)
+
+Map analytical Mindlin–Deresiewicz shear along `Q_hist` onto a numerical
+pressure support. Used by every history-aware half-plane path (NTS, cohesive,
+mortar slave).
+
+At unload corners with ``Q=0`` the residual MD shape is kept (not rescaled to 0).
+"""
+function map_mindlin_shear_to_pressure(
+    x::AbstractVector,
+    p::AbstractVector,
+    contact::AbstractVector{Bool},
+    f::Real,
+    P::Real,
+    Q_hist::AbstractVector;
+    h::Real=length(x) > 1 ? abs(x[2] - x[1]) : 1.0,
+    tol=1e-10,
+)
+    n = length(x)
+    a = contact_halfwidth_from_p(x, p)
+    p0 = maximum(p)
+    Q = isempty(Q_hist) ? 0.0 : float(Q_hist[end])
+    q_ana = mindlin_shear_history(x, a, p0, f, P, Q_hist)
+
+    τ = zeros(float(typeof(p0)), n)
+    @inbounds for i in eachindex(x)
+        if contact[i] && p[i] > 0
+            p_ana = p0 * sqrt(max(0.0, 1 - (x[i] / max(a, eps()))^2))
+            τ[i] = p_ana > 1e-14 * p0 ? q_ana[i] * (p[i] / p_ana) : q_ana[i]
+            lim = f * p[i]
+            τ[i] = clamp(τ[i], -lim, lim)
+        end
+    end
+    Ft = sum(τ) * h
+    if abs(Q) > tol && abs(Ft) > tol
+        τ .*= Q / Ft
+        @inbounds for i in eachindex(x)
+            if contact[i]
+                lim = f * p[i]
+                τ[i] = clamp(τ[i], -lim, lim)
+            end
+        end
+        Ft = sum(τ) * h
+        abs(Ft) > tol && (τ .*= Q / Ft)
+    end
+    # Q ≈ 0: keep residual MD shape (no force rescale to zero)
+
+    stick = falses(n)
+    slip = falses(n)
+    @inbounds for i in eachindex(x)
+        if contact[i]
+            if abs(τ[i]) >= f * p[i] - 1e-9 * max(p0, 1.0)
+                slip[i] = true
+            else
+                stick[i] = true
+            end
+        end
+    end
+    return (; τ, stick, slip, a, p0)
+end
+
+"""
+    cohesive_blend_shear(τ, p, contact, η_coh, Q, f; h, tol) -> τ_blended
+
+Blend hard Cattaneo/Mindlin shear toward the local Coulomb limit
+``sign(τ) f p``. On residual unload (``Q≈0``) the local residual sign is
+kept so locked-in shear is not wiped.
+"""
+function cohesive_blend_shear(
+    τ::AbstractVector,
+    p::AbstractVector,
+    contact::AbstractVector{Bool},
+    η_coh::Real,
+    Q::Real,
+    f::Real;
+    h::Real=1.0,
+    tol=1e-10,
+)
+    η = float(η_coh)
+    η <= 0 && return float.(τ)
+    out = float.(τ)
+    p0 = maximum(abs, p)
+    @inbounds for i in eachindex(p)
+        if contact[i] && p[i] > 0
+            s = abs(τ[i]) > tol * max(p0, 1.0) ? sign(τ[i]) :
+                (abs(Q) > tol ? sign(Q) : 0.0)
+            if s == 0
+                out[i] = float(τ[i])
+            else
+                τ_slip = s * f * p[i]
+                out[i] = (1 - η) * float(τ[i]) + η * τ_slip
+                lim = f * p[i]
+                out[i] = clamp(out[i], -lim, lim)
+            end
+        else
+            out[i] = zero(eltype(out))
+        end
+    end
+    Ft = sum(out) * h
+    if abs(Q) > tol && abs(Ft) > tol
+        out .*= Q / Ft
+        @inbounds for i in eachindex(p)
+            if contact[i]
+                lim = f * p[i]
+                out[i] = clamp(out[i], -lim, lim)
+            end
+        end
+        Ft = sum(out) * h
+        abs(Ft) > tol && (out .*= Q / Ft)
+    end
+    return out
+end
+
+"""
     solve_cattaneo_history_halfplane(x, R_eq, f, hp, steps; ...) -> Vector
 
-Run a sequence of `(;P,Q,name)` load steps.
+Run a sequence of `(;P,Q,name)` load steps with Mindlin residual history.
 """
 function solve_cattaneo_history_halfplane(
     x::AbstractVector,
@@ -320,12 +435,6 @@ function solve_cattaneo_history_halfplane(
     tol=1e-10,
     use_mindlin_residual::Bool=true,
 )
-    """
-    Walk load steps. Normal pressure from force-controlled BEM once per `P`.
-    Shear: monotonic Cattaneo on each step, or Mindlin–Deresiewicz residual
-    shape (analytical) mapped onto the numerical pressure when
-    `use_mindlin_residual=true` (needed for unload steps C,E).
-    """
     results = NamedTuple[]
     Q_path = Float64[]
     sol_n = nothing
@@ -339,51 +448,21 @@ function solve_cattaneo_history_halfplane(
         p = copy(sol_n.p)
         F = sum(p) * hp.h
         F > 0 && (p .*= st.P / F)
-        contact = sol_n.contact
-        push!(Q_path, st.Q)
+        contact = copy(sol_n.contact)
+        push!(Q_path, float(st.Q))
 
         hz = hertz_line(st.P, R_eq, hp)
-        a = contact_halfwidth_from_p(x, p)
-        p0 = maximum(p)
         if use_mindlin_residual
-            q_ana = mindlin_shear_history(x, a, p0, f, st.P, Q_path)
-            # map analytical shape onto numerical contact; zero outside
-            τ = zeros(length(x))
-            @inbounds for i in eachindex(x)
-                if contact[i] && p[i] > 0
-                    # scale local Coulomb utilisation from analytical
-                    p_ana = p0 * sqrt(max(0.0, 1 - (x[i] / max(a, eps()))^2))
-                    if p_ana > 1e-14 * p0
-                        τ[i] = q_ana[i] * (p[i] / p_ana)
-                    else
-                        τ[i] = q_ana[i]
-                    end
-                    lim = f * p[i]
-                    τ[i] = clamp(τ[i], -lim, lim)
-                end
-            end
-            Ft = sum(τ) * hp.h
-            if abs(st.Q) > tol && abs(Ft) > tol
-                τ .*= st.Q / Ft
-            elseif abs(st.Q) <= tol
-                # residual shear at Q=0 — keep MD shape, no rescale to 0
-                nothing
-            end
-            stick = copy(contact)
-            slip = falses(length(x))
-            @inbounds for i in eachindex(x)
-                if contact[i] && abs(τ[i]) >= f * p[i] - 1e-9 * max(p0, 1.0)
-                    stick[i] = false
-                    slip[i] = true
-                end
-            end
-            prep = sol_n.prep
-            u_t = fc_forward_2d(τ, prep)
+            sh = map_mindlin_shear_to_pressure(
+                x, p, contact, f, st.P, Q_path; h=hp.h, tol=tol)
+            τ, stick, slip = sh.τ, sh.stick, sh.slip
+            a, p0 = sh.a, sh.p0
+            u_t = fc_forward_2d(τ, sol_n.prep)
             sol = (;
                 x, p, τ, contact, stick, slip, u_t,
                 force_n=sum(p) * hp.h,
                 force_t=sum(τ) * hp.h,
-                a, p0, d=0.0, prep, hz,
+                a, p0, d=0.0, prep=sol_n.prep, hz,
             )
         else
             sol = solve_cattaneo_halfplane(x, R_eq, st.P, st.Q, f, hp; tol=tol)
@@ -398,11 +477,17 @@ end
 # =============================================================================
 
 """
-    solve_cattaneo_cohesive_halfplane(x, R_eq, P, Q, f, hp; kn, kt, ...)
+    solve_cattaneo_cohesive_halfplane(x, R_eq, P, Q, f, hp; η_coh, Q_hist, ...)
 
-Regularised cohesive-style contact: normal penalty on interpenetration plus
-Coulomb friction with tangential penalty (stick) / return mapping (slip).
-Approximates the rigid Cattaneo solution as ``k_n, k_t → ∞``.
+Regularised cohesive-style contact on the half-plane:
+hard (or stiff) normal contact plus a cohesive blend of shear toward the
+Coulomb limit.
+
+# History
+Pass `Q_hist` (vector of tangential loads culminating in `Q`) to include
+Mindlin–Deresiewicz residual shear. Prefer
+[`solve_cattaneo_cohesive_history_halfplane`](@ref) for a full A–E path.
+Without `Q_hist`, the call is monotonic in `Q` (virgin tangential state).
 """
 function solve_cattaneo_cohesive_halfplane(
     x::AbstractVector,
@@ -416,36 +501,37 @@ function solve_cattaneo_cohesive_halfplane(
     tol=1e-10,
     maxiter=100,
     η_coh::Real=1e-3,
+    Q_hist=nothing,
 )
-    # Cohesive-regularised Cattaneo (hard normal + eta blend friction)
     n = length(x)
     h = hp.h
-    # --- normal: stiff cohesive ≡ hard contact ---
+    # normal always from hard half-plane contact at current P
     base = solve_cattaneo_halfplane(x, R_eq, P, Q, f, hp; tol=tol, maxiter=maxiter)
     p = copy(base.p)
-    τ_cat = copy(base.τ)
     contact = copy(base.contact)
 
-    # cohesive blend: residual slip traction leaks into the stick zone
-    sQ = abs(Q) < tol ? 0.0 : sign(Q)
-    τ = copy(τ_cat)
-    if abs(Q) > tol && η_coh > 0
-        @inbounds for i in eachindex(p)
-            if contact[i]
-                τ_slip = sQ * f * p[i]
-                τ[i] = (1 - η_coh) * τ_cat[i] + η_coh * τ_slip
-            end
-        end
-        Ft = sum(τ) * h
-        abs(Ft) > tol && (τ .*= Q / Ft)
+    if Q_hist !== nothing
+        hist = collect(float(q) for q in Q_hist)
+        isempty(hist) && push!(hist, float(Q))
+        abs(hist[end] - float(Q)) > tol && push!(hist, float(Q))
+        sh = map_mindlin_shear_to_pressure(x, p, contact, f, P, hist; h=h, tol=tol)
+        τ0 = sh.τ
+        a = sh.a
+        p0 = sh.p0
+    else
+        τ0 = copy(base.τ)
+        a = base.a
+        p0 = base.p0
     end
+
+    τ = cohesive_blend_shear(τ0, p, contact, η_coh, Q, f; h=h, tol=tol)
 
     stick = falses(n)
     slip = falses(n)
     @inbounds for i in eachindex(p)
         if contact[i]
             lim = f * p[i]
-            if abs(τ[i]) >= (1 - 0.5η_coh) * lim - 1e-9 * max(maximum(p), 1.0)
+            if abs(τ[i]) >= (1 - 0.5 * max(η_coh, 0.0)) * lim - 1e-9 * max(p0, 1.0)
                 slip[i] = true
             else
                 stick[i] = true
@@ -456,12 +542,41 @@ function solve_cattaneo_cohesive_halfplane(
         x, p, τ, contact, stick, slip,
         force_n=sum(p) * h,
         force_t=sum(τ) * h,
-        a=base.a,
-        p0=base.p0,
+        a, p0,
         δ=0.0, d=0.0,
         η_coh,
         base,
+        Q_hist=Q_hist === nothing ? nothing : collect(float(q) for q in Q_hist),
     )
+end
+
+"""
+    solve_cattaneo_cohesive_history_halfplane(x, R_eq, f, hp, steps; η_coh, ...) -> Vector
+
+Walk a Cattaneo–Mindlin load history with the cohesive regularisation at every
+step. Residual Mindlin shear is carried through unload corners (C, E).
+"""
+function solve_cattaneo_cohesive_history_halfplane(
+    x::AbstractVector,
+    R_eq::Real,
+    f::Real,
+    hp::ElasticHalfPlane2D,
+    steps;
+    η_coh::Real=0.05,
+    tol=1e-10,
+    maxiter=100,
+)
+    results = NamedTuple[]
+    Q_path = Float64[]
+    for st in steps
+        push!(Q_path, float(st.Q))
+        sol = solve_cattaneo_cohesive_halfplane(
+            x, R_eq, st.P, st.Q, f, hp;
+            η_coh=η_coh, tol=tol, maxiter=maxiter, Q_hist=copy(Q_path),
+        )
+        push!(results, (; name=st.name, P=st.P, Q=st.Q, sol...))
+    end
+    return results
 end
 
 # =============================================================================

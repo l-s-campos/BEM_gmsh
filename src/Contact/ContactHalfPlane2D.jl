@@ -10,13 +10,14 @@ Sign convention: positive pressure and positive ``u`` point into the solid.
 module ContactHalfPlane2D
 
 using LinearAlgebra
-using Statistics: mean
+using Statistics
 using FFTW
 
 export ElasticHalfPlane2D
 export influence_coeff_2d, influence_kernel_2d, precompute_kernel_2d
 export fc_forward_2d, fc_inverse_2d
-export solve_line_contact, hertz_line
+export solve_line_contact, solve_line_contact_force, solve_line_contact_hertz
+export hertz_line, hertz_line_pressure
 
 """
     ElasticHalfPlane2D(G, ν; h=1.0)
@@ -100,8 +101,12 @@ function fc_forward_2d(p::AbstractVector{<:Real}, prep)
 end
 
 """
-Non-negative least-squares inverse on `mask` with relative log-kernel:
-``(K_{ij}-K_{rj}-K_{ir}+K_{rr}) p_j = u_i - u_r``, ``p ≥ 0``.
+Non-negative inverse on `mask` with mean-removed log-kernel (rank-safe).
+
+Uses projector `P = I - 11ᵀ/m` so that `P K P p = P u`, then `p ← max(p,0)`
+with one active-set sweep. The log kernel has a near-null rigid mode; removing
+the mean makes the system well-posed up to the force level (use
+[`solve_line_contact_force`](@ref) when the load is prescribed).
 """
 function fc_inverse_2d(u::AbstractVector{<:Real}, mask::AbstractVector{Bool}, prep;
     tol=1e-12, maxiter=200, p0=nothing)
@@ -111,35 +116,40 @@ function fc_inverse_2d(u::AbstractVector{<:Real}, mask::AbstractVector{Bool}, pr
     m = length(idx)
     p = zeros(n)
     m == 0 && return p
-    # reference = contact node with largest |u| (≈ centre)
-    r = idx[argmax(abs.(u[idx]))]
-    A = zeros(m, m)
-    b = zeros(m)
-    Krr = influence_coeff_2d(0, hp)
-    @inbounds for (a, i) in enumerate(idx)
-        b[a] = u[i] - u[r]
-        Kir = influence_coeff_2d(i - r, hp)
-        for (c, j) in enumerate(idx)
-            A[a, c] = influence_coeff_2d(i - j, hp) - influence_coeff_2d(r - j, hp) - Kir + Krr
-        end
+
+    K = zeros(m, m)
+    @inbounds for (a, i) in enumerate(idx), (c, j) in enumerate(idx)
+        K[a, c] = influence_coeff_2d(i - j, hp)
     end
-    # projected CG / active-set NNLS
+    # mean-removal projector
+    P = Matrix{Float64}(I, m, m) .- 1 / m
+    A = P * K * P
+    b = P * u[idx]
+
     x = zeros(m)
     if p0 !== nothing
         @inbounds for (a, i) in enumerate(idx)
             x[a] = max(p0[i], 0.0)
         end
+        x .-= mean(x)
     end
     active = trues(m)
     for _ in 1:maxiter
         ia = findall(active)
-        isempty(ia) && break
-        As = A[ia, ia]
-        bs = b[ia]
-        # solve unrestricted on active set (pinv for safety)
-        xs = pinv(As) * bs
+        length(ia) < 2 && break
+        # solve on active set with mean-removal restricted to ia
+        ma = length(ia)
+        Pa = Matrix{Float64}(I, ma, ma) .- 1 / ma
+        Ka = K[ia, ia]
+        Aa = Pa * Ka * Pa
+        ba = Pa * u[idx[ia]]
+        xs = pinv(Aa; rtol=tol) * ba
         x[ia] .= xs
-        # deactivate negatives
+        @inbounds for a in 1:m
+            if !active[a]
+                x[a] = 0.0
+            end
+        end
         done = true
         @inbounds for a in ia
             if x[a] < -tol
@@ -148,8 +158,9 @@ function fc_inverse_2d(u::AbstractVector{<:Real}, mask::AbstractVector{Bool}, pr
                 done = false
             end
         end
-        # check KKT for inactive: residual gradient >= 0
-        res = A * x - b
+        # residual on inactive
+        res = K * x - u[idx]
+        res .-= mean(res[active])  # only meaningful on active
         @inbounds for a in 1:m
             if !active[a] && res[a] < -tol
                 active[a] = true
@@ -232,7 +243,76 @@ function solve_line_contact_hertz(x::AbstractVector, R::Real, F::Real, hp::Elast
     return (; p, u, contact, force=sum(p) * hp.h, hz, prep)
 end
 
-export solve_line_contact_hertz, hertz_line_pressure
+"""
+    solve_line_contact_force(gap0, F, hp; tol=1e-10) -> NamedTuple
+
+Force-controlled frictionless line contact (Polonsky–Keer active-set CG).
+Prescribes normal load `F = ∫ p dx` and returns `(; p, u, contact, force, prep)`.
+
+Works with the Flamant log kernel by using mean-removed gaps on the contact
+set (absolute deflection is defined only up to a constant on a half-plane).
+"""
+function solve_line_contact_force(
+    gap0::AbstractVector{<:Real},
+    F::Real,
+    hp::ElasticHalfPlane2D;
+    tol=1e-10,
+    maxiter=400,
+    p_init=nothing,
+)
+    n = length(gap0)
+    h = hp.h
+    prep = precompute_kernel_2d(n, hp)
+    area = n * h
+    p = p_init === nothing ? fill(float(F) / area, n) : copy(p_init)
+    p .= max.(p, 0.0)
+    s = sum(p) * h
+    s > 0 && (p .*= F / s)
+
+    g = zeros(n)
+    t = zeros(n)
+    for it in 1:maxiter
+        u = fc_forward_2d(p, prep)
+        @. g = gap0 + u
+        Ael = findall(p .> 0)
+        isempty(Ael) && break
+        g .-= minimum(g[Ael])           # rigid shift: min gap on contact = 0
+        ḡ = mean(g[Ael])
+        r = zeros(n)
+        @inbounds for i in Ael
+            r[i] = g[i] - ḡ
+        end
+        # steepest descent / PK search direction
+        t .= r
+        dt = fc_forward_2d(t, prep)
+        dt .-= mean(dt[Ael])
+        num = dot(r[Ael], r[Ael])
+        den = dot(t[Ael], dt[Ael])
+        abs(den) < eps() && break
+        α = num / den
+        @. p = p - α * t
+        @inbounds for i in 1:n
+            p[i] < 0 && (p[i] = 0.0)
+        end
+        # points that penetrate must re-enter contact
+        u = fc_forward_2d(p, prep)
+        @. g = gap0 + u
+        Ael = findall(p .> 0)
+        isempty(Ael) && break
+        g .-= minimum(g[Ael])
+        @inbounds for i in 1:n
+            if p[i] == 0 && g[i] < -tol * max(maximum(abs, g), 1.0)
+                p[i] = eps()
+            end
+        end
+        s = sum(p) * h
+        s > 0 && (p .*= F / s)
+        num < tol^2 * max(F, 1.0)^2 && break
+    end
+    u = fc_forward_2d(p, prep)
+    contact = p .> 0
+    return (; p, u, contact, force=sum(p) * h, prep)
+end
 
 # =============================================================================
 # Hertz line contact (cylinder on flat)

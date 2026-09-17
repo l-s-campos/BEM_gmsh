@@ -4,77 +4,61 @@ Julia package module: **`BEM`**.
 
 > 🌐 **English** · [Português (BR)](pt-br/index.md)
 
-**BEM_gmsh** (`using BEM`) is a Julia package for the **Boundary Element Method**, with:
+**BEM_gmsh** is a Julia toolkit for the **Boundary Element Method**, driven by
+[Gmsh](https://gmsh.info/) meshes:
 
-- 2D/3D **Laplace** (potential / heat conduction) and **linear elasticity**
-- Mesh generation and I/O through **Gmsh**
-- Dense and **hierarchical (H-matrix)** assembly
-- Domain integrals via **DIBEM** (radial basis functions)
-- Steady and **transient** solvers (Houbolt, Method of Lines, 2nd-order ODE)
-- Built-in **analytical solutions** for verification
-- Visualization of geometry and boundary conditions (`plot_geo`)
+- 2D/3D **Laplace** and **linear elasticity**
+- Dense, **H-matrix**, and **FMM** assembly
+- Domain integrals via **DIBEM** / DRM / local BEM / SBM
+- Steady and **transient** solvers (Houbolt, OrdinaryDiffEq, MMM)
+- Dual BEM cracks, contact, plates, topology optimization
+- Built-in **analytical** fields for verification (`rel_error`)
 
-The project is organised with [DrWatson.jl](https://juliadynamics.github.io/DrWatson.jl/stable/) for reproducible paths (`datadir`, `srcdir`, …).
-
-## Install / activate
+## Install
 
 ```julia
 using Pkg
 Pkg.activate("path/to/BEM_gmsh")
-Pkg.instantiate()
+Pkg.instantiate()   # needs the Gmsh system library
 ```
 
-```julia
-using DrWatson
-@quickactivate :BEM
-```
+Julia ≥ 1.10. Package name: **`BEM`**. Repository name: **`BEM_gmsh`**.
 
-## Minimal example
+## 5-minute path
 
 ```julia
-using DrWatson
-@quickactivate :BEM
-include(datadir("Laplace", "Laplace_dad.jl"))
+using BEM
 
-props = Laplace(1.0)
-msh = quadrado(ndiv=20, show=false)          # writes via datadir(...)
-dad = format2d(msh, props)
-
-attach_analytical!(dad, ana_laplace_linear(; direction=SA[1.0, 0.0]))
-
-H_G_full_direct(dad, 20)                     # or H_G_Hmat(dad) for large meshes
+dad = format2d(quadrado(ndiv=20, show=false), Laplace(1.0))
+attach_analytical!(dad, ana_laplace_linear(; direction=SA[1.0, 0.0]))  # T = x
+assemble!(dad, 20)            # or assemble!(dad; method=:hmatrix)
 solve(dad)
 
-println("relative error = ", rel_error(dad))
-plot_geo(dad)
+@show rel_error(dad)
+# plot_geo(dad)
 ```
 
-## Package layout
+**Pipeline:** mesh → `format2d` → `assemble!` → optional `dibem!` → `solve` → `dad.T` / `dad.q`.
 
-```
-src/
-  BEM.jl                 # module entry
-  Structures.jl          # BEMdata, Laplace, Helmholtz, Elasticity, Anisotropic…
-  Fundamental_Solutions.jl  # Kelvin, Lekhnitskii, Helmholtz, hypersingular (Tensorial)
-  Input.jl               # format2d / format3d (Gmsh)
-  Assembly_full.jl       # dense H, G
-  Assembly_H.jl          # H-matrix H, G  (calc_HeG_Hd style)
-  Boundary_conditions.jl
-  Solver.jl              # steady + transient
-  Domain.jl              # DIBEM
-  Analytical.jl          # reference solutions
-  Visualization.jl       # plot_geo, Gmsh export
-  Hmat/                  # hierarchical matrix library
-data/Laplace/            # meshes + generators (datadir)
-scripts/intro.jl         # demo
-test/runtests.jl
-docs/
-```
+## Feature map
+
+| Want… | Start here |
+|-------|------------|
+| Steady Laplace | [`assemble!`](@ref), [`solve`](@ref) |
+| Domain source / Poisson | [`DIBEM`](@ref), `solve_poisson_rbf_bem!`, `solve_local_bem!` |
+| Heat / wave in time | `solve_Houbolt`, `solve_transient_o2`, `solve_mmm!` |
+| Elasticity | `Elasticity`, `solve(dad; frame=:local)` |
+| Cracks / cohesive | `using BEM.Crack` |
+| Contact | `using BEM.Contact` |
+| Topology | `using BEM.Topology` |
+| H-matrices / FMM | `using BEM.HMatrices`, `using BEM.FMM` |
+
+Advanced names are **submodules** — they are not dumped into `using BEM`.
 
 ## Next pages
 
 - [Getting started](getting_started.md)
-- [Recipes](recipes.md)
+- [Recipes](recipes.md) — copy-paste, one per family
 - [Theory notes](theory.md)
-- [Examples](examples.md)
-- API reference under **API**
+- [API](api/structures.md)
+- [Architecture](architecture.md)

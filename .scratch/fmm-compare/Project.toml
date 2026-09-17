@@ -1,0 +1,6 @@
+[deps]
+FMM3D = "1e13804c-f9b7-11ea-0ef0-29f3b1745df8"
+FastMultipole = "ce07d0d3-2b9f-49ba-89eb-12c800257c85"
+
+[sources]
+FastMultipole = {rev = "main", url = "https://github.com/byuflowlab/FastMultipole.jl"}

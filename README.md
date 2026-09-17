@@ -20,51 +20,60 @@ Pkg.instantiate()   # needs Gmsh.jl system library
 
 Julia ≥ 1.10.
 
+Dev-only tools (`Revise`, `Infiltrator`, `BenchmarkTools`) are **not** in the
+default environment — `] add` them in your personal env if you want them.
+Documenter lives in `docs/`. Meshless comparisons (Macchiato / RBF-FD) use
+`scripts/meshless/` rather than the main project.
+
 ## 5-minute path
 
 ```julia
 using BEM
-include(joinpath(@__DIR__, "data", "Laplace", "Laplace_dad.jl"))
 
 dad = format2d(quadrado(ndiv=20, show=false), Laplace(1.0))
 attach_analytical!(dad, ana_laplace_linear(; direction=SA[1.0, 0.0]))  # T = x
-H_G_full_direct(dad, 20)
+assemble!(dad, 20)            # dense; or assemble!(dad; method=:hmatrix)
 solve(dad)
 
 @show rel_error(dad)
-# plot_geo(dad)   # needs Makie backend
+# plot_geo(dad)   # Plots.jl
 ```
 
-**Pipeline:** mesh → `format2d` → `H_G_full_direct` → `solve` → `dad.T` / `dad.q`.
+**Pipeline:** mesh → `format2d` → `assemble!` → `solve` → `dad.T` / `dad.q`.
 
 ## Feature map
 
 | Want… | Start here |
 |-------|------------|
-| Steady Laplace | `solve`, `H_G_full_direct` / `H_G_Hmat` |
-| Domain source / Poisson | `DIBEM`, `solve_poisson_rbf_bem!` |
-| Diffuse–advective (variable v) | `solve_diffuse_advective!`, `scripts/diffuse_advective_exp_mxy.jl` |
+| Steady Laplace | `solve`, `assemble!` / `assemble!(dad; method=:hmatrix)` |
+| Domain source / Poisson | `DIBEM`, `solve_poisson_rbf_bem!`, `solve_local_bem!` |
+| Diffuse–advective (variable v) | `solve_diffuse_advective!`, `scripts/laplace/diffuse_advective_exp_mxy.jl` |
 | Heat / wave in time | `solve_Houbolt`, `solve_transient`, `solve_transient_o2` |
-| Modal transient (MMM) | `solve_mmm!`, `scripts/mmm_membrane_demo.jl` |
-| Elasticity | `Elasticity`, same assembly path |
-| Cracks / cohesive | `BEM.Crack`, `scripts/cohesive_gmsh_modeI.jl` |
-| IGA (Bézier) | `format2d(...; discretization=:iga)` |
-| Contact half-space | `BEM.ContactHalfSpace` |
+| Modal transient (MMM) | `solve_mmm!`, `scripts/transient/mmm_membrane_demo.jl` |
+| Elasticity | `Elasticity`, `solve_local_bem!` (compact Kelvin) |
+| Cracks / cohesive | `BEM.Crack`, `scripts/crack/cohesive_gmsh_modeI.jl` |
+| SBM Laplace (Chen–Gu) | `solve_sbm_laplace`, `scripts/sbm_drm/sbm_vs_bem.jl` |
+| SBM–DRM heat | `solve_sbm_drm`, `scripts/sbm_drm/sbm_drm_vs_dibem.jl` |
+| Contact half-space | `BEM.Contact` (`using BEM.Contact`) — Pohrt–Li, layered, Uzawa wear, rolling, wheel–rail |
+| Topology opt. (heat / elasticity, 2-D + 3-D density) | `BEM.Topology`, `scripts/topology/topology_compare.jl`, `scripts/topology/dibem_simp_3d.jl` |
 
 ## Layout
 
 ```text
 src/
-  BEM.jl           # module entry (includes below)
+  BEM.jl           # teaching spine (types, assemble!, solve)
   Core/            # mesh I/O, elements, RBF, integration
-  Laplace/         # assembly, BC, solvers, DIBEM, diffuse–advective, MMM
-  Elasticity/ Helmholtz/ Crack/ Contact/ Plate/ MultiRegion/
-  Hmat/ FMM/       # hierarchical & multipole accelerators
-data/              # Gmsh .geo/.msh builders + analytics (include as needed)
-scripts/           # runnable demos
-test/              # test_*.jl  (+ runtests.jl)
-docs/              # Documenter (EN + pt-BR) + architecture.md
+  Laplace/ Elasticity/ Helmholtz/
+  Crack/ Contact/ Plate/ MultiRegion/ Topology/   # BEM.<Name>
+  Hmat/ FMM/       # BEM.HMatrices, BEM.FMM
+data/              # Gmsh .geo builders + analytics
+scripts/           # demos by family — see scripts/README.md
+test/
+docs/
 ```
+
+Advanced APIs: `using BEM.Crack`, `BEM.Contact`, `BEM.Plate`, `BEM.Topology`,
+`BEM.MultiRegion`, `BEM.HMatrices`.
 
 Design notes and cleanup plan: [`docs/architecture.md`](docs/architecture.md).
 
@@ -72,11 +81,8 @@ Design notes and cleanup plan: [`docs/architecture.md`](docs/architecture.md).
 
 ```bash
 julia --project=. test/runtests.jl
-julia --project=. test/test_diffuse_advective.jl
-julia --project=. test/test_mmm.jl
-julia --project=. scripts/diffuse_advective_c8e1.jl
-julia --project=. scripts/mmm_membrane_demo.jl
-julia --project=. scripts/wave_propagation.jl
+julia --project=. scripts/laplace/diffuse_advective_exp_mxy.jl
+julia --project=. scripts/transient/mmm_membrane_demo.jl
 ```
 
 ## Documentation

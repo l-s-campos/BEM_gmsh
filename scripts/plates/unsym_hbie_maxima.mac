@@ -1,0 +1,69 @@
+/* unsym_hbie_maxima.mac
+ *
+ * Hsu–Hwu / Useche 8.3.1 traction-BIE kernels.
+ * CBIE already has U = v(ρ), P = constitutive(n)·(v,ρ) from Jordan F(ρ).
+ * HBIE needs source traction of U (W) and n^ξ·∇_ξ P (S, hypersingular).
+ *
+ * ρ = ω·(x−ξ)  ⇒  ∂/∂ξ_k = −ω_k ∂/∂ρ.
+ * F'−J F = ρ^{-2} I  (8.24). Explicit F is in UnsymFSDT._unsym_F! / _unsym_Fd!.
+ *
+ * Run:
+ *   maxima --very-quiet --batch=scripts/plates/unsym_hbie_maxima.mac
+ *
+ * Julia: BEM.Plate.unsym_hbie_kernels  (src/Plate/UnsymFSDT.jl)
+ */
+display2d: false$
+ratprint: false$
+assume(rho > 0, lambda > 0)$
+
+print("======== Jordan F(ρ), β = −3/2  (same as _unsym_F!) ========")$
+beta: -3/2$
+L: log(rho)$
+Lm: -L + beta$
+rL: rho*(1 - L + beta)$
+r2L: rho^2*(3/4 - 1/2*L) + beta*rho^2/2$
+Fdiag: -1/rho$
+
+print("d Lm/dρ =", ratsimp(diff(Lm, rho)))$
+print("d (−1/ρ)/dρ =", ratsimp(diff(Fdiag, rho)))$
+print("d rL/dρ =", ratsimp(diff(rL, rho)), "  (should be Lm)")$
+print("d r2L/dρ =", ratsimp(diff(r2L, rho)))$
+print("d² Lm/dρ² =", ratsimp(diff(Lm, rho, 2)))$
+print("d² (−1/ρ)/dρ² =", ratsimp(diff(Fdiag, rho, 2)))$
+print("d² rL/dρ² =", ratsimp(diff(rL, rho, 2)))$
+print("d² r2L/dρ² =", ratsimp(diff(r2L, rho, 2)))$
+
+print("")$
+print("======== exponential diagonal F99, F1010 (8.41) ========")$
+/* e^{λρ} Ei(−λρ)  and  e^{−λρ} Ei(λρ) */
+assume(x > 0)$
+/* d/dρ [e^{λρ} Ei(−λρ)] = λ e^{λρ} Ei(−λρ) + 1/ρ
+   because d Ei(z)/dz = e^z/z, z=−λρ */
+print("d/dρ [e^{λρ} Ei(−λρ)] = λ e^{λρ} Ei(−λρ) + 1/ρ")$
+print("d/dρ [e^{−λρ} Ei(λρ)]  = −λ e^{−λρ} Ei(λρ) + 1/ρ")$
+print("F9  = −1/ρ − λ e^{λρ} Ei(−λρ)")$
+print("F9' = 1/ρ² − λ² e^{λρ} Ei(−λρ) − λ/ρ")$
+print("F9''= −2/ρ³ − λ³ e^{λρ} Ei(−λρ) − λ²/ρ − λ/ρ²")$
+print("     [d/dρ (λ² e^{λρ} Ei) = λ³ e^{λρ} Ei + λ²/ρ]")$
+print("F10 = −1/ρ + λ e^{−λρ} Ei(λρ)")$
+print("F10'= 1/ρ² − λ² e^{−λρ} Ei(λρ) + λ/ρ")$
+print("F10''= −2/ρ³ + λ³ e^{−λρ} Ei(λρ) − λ²/ρ − λ/ρ²")$
+
+print("")$
+print("======== chain rule (source) ========")$
+print("ρ = ω·(x−ξ),  ∂ρ/∂ξ_k = −ω_k")$
+print("Y = Z F(ρ) c,  Y' = Z F'(ρ) c,  Y'' = Z F''(ρ) c")$
+print("v = Y[1:5], vρ = Y[6:10], vρρ = Y'[6:10]")$
+print("N,M from Ω vρ; Q = At(β + ω w,ρ)")$
+print("P_n  = constitutive(n_field)·(vρ, v)     CBIE H")$
+print("W    = constitutive(n_ξ)·(vρ, v) at swapped (ξ,x)   HBIE G")$
+print("     = P(ξ, x; n_ξ)  (Betti: load at field, traction at source)")$
+print("S    = n_ξ · ∇_ξ P(x, ξ; n_field)")$
+print("     = −(n_ξ·ω) ∂P/∂ρ  per plane-wave θ")$
+print("∂N/∂ρ = A Ω vρρ[1:2] + B Ω vρρ[3:4]")$
+print("∂M/∂ρ = B Ω vρρ[1:2] + D Ω vρρ[3:4]")$
+print("∂Q/∂ρ = At (vρ[3:4] + ω vρρ[5])")$
+print("NOTE: θ-integral of F' is HFP (1/ρ² at ω ⊥ r).")$
+print("      Julia S: Guiggiani interpolant on two π-arcs, pole at ξ=0.")$
+print("DONE")$
+quit()$

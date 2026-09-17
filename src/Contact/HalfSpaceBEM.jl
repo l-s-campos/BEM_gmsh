@@ -1,24 +1,27 @@
 """
     HalfSpaceBEM
 
-2D/3D elastic half-space contact operators with multiple acceleration backends,
-following `calc_halfspace.jl` (legacy BEM.jl) and Pohrt–Li influence kernels.
+Legacy 2D/3D half-space operators with acceleration backends (`:dense`,
+`:fft`, `:hmatrix`, `:fmm`), from `calc_halfspace.jl`.
 
-# Acceleration methods
-| Symbol | Description |
-|--------|-------------|
-| `:dense` | Full influence matrix |
-| `:fft` | Circulant embedding + FFT convolution |
-| `:hmatrix` | Hierarchical ACA (`HMatrices`) |
-| `:fmm` | Fast multipole (`BEM.FMM` / `rfmm2d`) for the log kernel (2D/3D) |
+The coupled 9-kernel Pohrt–Li path (normal *and* tangential, two-body
+combination, Uzawa wear) is [`ContactHalfSpace`](@ref) /
+[`OrthotropicUzawa`](@ref). This module keeps the older log-kernel
+(`E = E/(1-ν²)`) operator and Archard stepper used by the acceleration
+benchmarks.
+
+The 2-D kernel uses ``K = -4/(π E)`` times the panel log integral, i.e.
+twice Flamant if `E` is the combined ``E*``. Do not mix it with
+[`ElasticHalfPlane2D`](@ref) without rescaling.
 
 # Wear
-[`wear_2d`](@ref) / `desgaste_2D` — Archard wear stepping under constant load.
+[`wear_2d`](@ref) / `desgaste_2D` — Archard under constant load. The keyword
+`δ` is the **sliding distance per step**, not the rigid approach.
 """
 module HalfSpaceBEM
 
 using LinearAlgebra
-using Statistics: mean
+using Statistics
 using SparseArrays
 using FFTW
 using StaticArrays
@@ -28,9 +31,10 @@ using NearestNeighbors
 # parent modules (loaded by BEM before this module)
 using ..HMatrices
 using ..FMM
+using ..ContactHalfSpace
 
 export HalfSpace2D, HalfSpace3D
-export build_operator, build_dense, build_fft, build_hmatrix, build_fmm
+export build_operator, build_dense, build_fft, build_hmatrix, build_h2, build_fmm
 export contact_pressure_force, wear_2d, desgaste_2D
 export OpBackend
 
@@ -149,12 +153,19 @@ function build_hmatrix(dad::HalfSpace2D; nmax=32, atol=1e-8, eta=3.0)
     n = length(dad)
     # embed 1-D points as 2-D for the cluster tree
     pts = [SVector(dad.x[i], 0.0) for i in 1:n]
-    splitter = HMatrices.PrincipalComponentSplitter(; nmax=nmax)
+    splitter = HMatrices.hmatrix_splitter(; nmax=nmax)
     clt = ClusterTree(pts, splitter)
     adm = StrongAdmissibilityStd(; eta=eta)
     comp = PartialACA(; atol=atol)
     K = HS2DKernel(dad)
     return assemble_hmatrix(K, clt, clt; adm=adm, comp=comp, threads=false)
+end
+
+function build_h2(dad::HalfSpace2D; nmax=32, rtol=1e-6, kwargs...)
+    n = length(dad)
+    pts = [SVector(dad.x[i], 0.0) for i in 1:n]
+    tree = ClusterTree(pts, HMatrices.hmatrix_splitter(; nmax=nmax); cube=true)
+    return assemble_h2(HS2DKernel(dad), tree; rtol=rtol)
 end
 
 # =============================================================================
@@ -237,19 +248,18 @@ end
 # Unified builder
 # =============================================================================
 
-const OpBackend = Union{Matrix{Float64},FFTOp,HMatrix,FMMOp}
-
 """
     build_operator(dad::HalfSpace2D, method::Symbol; kwargs...)
 
-`method ∈ (:dense, :fft, :hmatrix, :fmm)`.
+`method ∈ (:dense, :fft, :hmatrix, :h2, :fmm)`.
 """
 function build_operator(dad::HalfSpace2D, method::Symbol=:dense; kwargs...)
     method === :dense && return build_dense(dad)
     method === :fft && return build_fft(dad)
     method === :hmatrix && return build_hmatrix(dad; kwargs...)
+    method === :h2 && return build_h2(dad; kwargs...)
     method === :fmm && return build_fmm(dad; kwargs...)
-    throw(ArgumentError("unknown method $method — use :dense, :fft, :hmatrix, :fmm"))
+    throw(ArgumentError("unknown method $method — use :dense, :fft, :hmatrix, :h2, :fmm"))
 end
 
 # generic matvec
@@ -261,6 +271,7 @@ _matvec(K::HMatrix, p) = begin
     mul!(y, K, p)
     y
 end
+_matvec(K::NNCAMatrix, p) = K * p
 
 # =============================================================================
 # Contact pressure (force-controlled, Polonsky–Keer style)
@@ -356,8 +367,8 @@ end
 """
     wear_2d(dad, K, W; k_ar1, k_ar2, δ, nsteps) -> (wear1, wear2, p_hist)
 
-Archard wear under constant load `W`. Each step slides distance `δ` and updates
-gap ``h ← h + k_{ar} p δ`` for each body.
+Archard wear under constant load `W`. Each step slides a distance `δ`
+(not the rigid approach) and updates ``h ← h + k_{ar} p δ`` for each body.
 
 Alias: [`desgaste_2D`](@ref).
 """
@@ -436,29 +447,17 @@ end
 
 Base.length(dad::HalfSpace3D) = length(dad.x)
 
-"""Love kernel for normal displacement under uniform pressure on a rectangle."""
+"""Love kernel for normal displacement under uniform pressure on a rectangle.
+
+Same stencil as [`love_rectangle_F`](@ref) / Pohrt ``K_{zz}``:
+``K = F / (π E*)`` with `dad.E` the contact modulus.
+"""
 function kernel_entry_3d(dad::HalfSpace3D, i::Int, j::Int)
-    # relative offsets in cell units
     ix = ((i - 1) % dad.nx) + 1
     iy = ((i - 1) ÷ dad.nx) + 1
     jx = ((j - 1) % dad.nx) + 1
     jy = ((j - 1) ÷ dad.nx) + 1
-    di = ix - jx
-    dj = iy - jy
-    hx, hy, E = dad.hx, dad.hy, dad.E
-    k = (di + 0.5) * hx
-    m = (dj + 0.5) * hy
-    l = (di - 0.5) * hx
-    n = (dj - 0.5) * hy
-    s(a, b) = sqrt(a * a + b * b)
-    F = (
-        k * log((m + s(k, m)) / (n + s(k, n))) +
-        l * log((n + s(l, n)) / (m + s(l, m))) +
-        m * log((k + s(k, m)) / (l + s(l, m))) +
-        n * log((l + s(l, n)) / (k + s(k, n)))
-    )
-    # (1-ν²)/(π E_young) = 1/(π E*) with E*=E/(1-ν²); Love uses (1-ν)/(2πG)=1/(π E*)
-    return F / (π * E)
+    return love_rectangle_F(ix - jx, iy - jy, dad.hx, dad.hy) / (π * dad.E)
 end
 
 function build_dense(dad::HalfSpace3D)
@@ -482,21 +481,7 @@ function build_fft(dad::HalfSpace3D)
     Mx, My = 2nx, 2ny
     C = zeros(Float64, Mx, My)
     @inbounds for dj in -(ny - 1):(ny - 1), di in -(nx - 1):(nx - 1)
-        # map (di,dj) to kernel between cells
-        i = 1 + max(di, 0) + max(dj, 0) * nx   # dummy — build via relative
-        # direct: K[di,dj] using synthetic indices
-        k = (di + 0.5) * dad.hx
-        m = (dj + 0.5) * dad.hy
-        l = (di - 0.5) * dad.hx
-        n = (dj - 0.5) * dad.hy
-        s(a, b) = sqrt(a * a + b * b)
-        F = (
-            k * log(max(m + s(k, m), eps()) / max(n + s(k, n), eps())) +
-            l * log(max(n + s(l, n), eps()) / max(m + s(l, m), eps())) +
-            m * log(max(k + s(k, m), eps()) / max(l + s(l, m), eps())) +
-            n * log(max(l + s(l, n), eps()) / max(k + s(k, n), eps()))
-        )
-        val = F / (π * dad.E)
+        val = love_rectangle_F(di, dj, dad.hx, dad.hy) / (π * dad.E)
         ii = di >= 0 ? di + 1 : Mx + di + 1
         jj = dj >= 0 ? dj + 1 : My + dj + 1
         C[ii, jj] = val
@@ -515,13 +500,12 @@ end
 
 function build_hmatrix(dad::HalfSpace3D; nmax=32, atol=1e-8, eta=3.0)
     pts = [SVector(p[1], p[2]) for p in dad.x]
-    splitter = HMatrices.PrincipalComponentSplitter(; nmax=nmax)
+    splitter = HMatrices.hmatrix_splitter(; nmax=nmax)
     clt = ClusterTree(pts, splitter)
     adm = StrongAdmissibilityStd(; eta=eta)
     comp = PartialACA(; atol=atol)
     return assemble_hmatrix(HS3DKernel(dad), clt, clt; adm=adm, comp=comp, threads=false)
 end
-
 
 """
 3D half-space FMM via `FMM.lfmm3d` on collocation points (Boussinesq-like 1/r
@@ -572,7 +556,7 @@ function LinearAlgebra.mul!(y::AbstractVector, op::FMMOp3D, p::AbstractVector)
     q = area .* p
     # far: scaled 1/r potential (lfmm3d uses 1/(4πr); half-space ~ 1/(π E r))
     vals = FMM.lfmm3d(op.eps, op.sources; charges=q, pg=1, nmax=op.nmax)
-    fac = 4 / dad.E
+    fac = 4 * π * op.scale   # 4/E: lfmm3d is 1/(4πr), Love is 1/(π E r)
     @inbounds for i in 1:n
         y[i] = fac * vals.pot[i]
     end
@@ -595,36 +579,35 @@ end
 
 
 # include 3D FMM in backend union
-const OpBackend = Union{Matrix{Float64},FFTOp,HMatrix,FMMOp,FMMOp3D}
+const OpBackend = Union{Matrix{Float64},FFTOp,HMatrix,NNCAMatrix,FMMOp,FMMOp3D}
 _matvec(K::FMMOp3D, p) = K * p
+
+function build_h2(dad::HalfSpace3D; nmax=32, rtol=1e-6, kwargs...)
+    pts = [SVector(p[1], p[2]) for p in dad.x]
+    tree = ClusterTree(pts, HMatrices.hmatrix_splitter(; nmax=nmax); cube=true)
+    return assemble_h2(HS3DKernel(dad), tree; rtol=rtol)
+end
 
 function build_operator(dad::HalfSpace3D, method::Symbol=:dense; kwargs...)
     method === :dense && return build_dense(dad)
     method === :fft && return build_fft(dad)
     method === :hmatrix && return build_hmatrix(dad; kwargs...)
+    method === :h2 && return build_h2(dad; kwargs...)
     method === :fmm && return build_fmm(dad; kwargs...)
-    throw(ArgumentError("unknown method $method"))
+    throw(ArgumentError("unknown method $method — use :dense, :fft, :hmatrix, :h2, :fmm"))
 end
 
 function contact_pressure_force(dad::HalfSpace3D, K, W::Real; kwargs...)
-    # reuse 2D algorithm with area weights hx*hy
     n = length(dad)
     area_el = fill(dad.hx * dad.hy, n)
-    # thin wrapper as HalfSpace2D-like
-    fake = (
-        al = area_el,
-        h0 = dad.h0,
-        x = dad.x,
-    )
-    # local copy of algorithm
     area = sum(area_el)
     p = fill(float(W) / area, n)
     h0 = dad.h0
     err_tol = get(kwargs, :err_tol, 1e-8)
     it_max = get(kwargs, :it_max, 200)
     p_min = get(kwargs, :p_min, 0.0)
-    for it in 1:it_max
-        u = K isa AbstractMatrix ? (K * p) : (K * p)
+    for _ in 1:it_max
+        u = K * p
         g = h0 .- u
         Ael = findall(p .> p_min)
         isempty(Ael) && break
@@ -635,7 +618,7 @@ function contact_pressure_force(dad::HalfSpace3D, K, W::Real; kwargs...)
             r[i] = g[i] - ḡ
         end
         t = r
-        dt = K isa AbstractMatrix ? (K * t) : (K * t)
+        dt = K * t
         dt .-= mean(dt[Ael])
         num = dot(r[Ael], r[Ael])
         den = dot(t[Ael], dt[Ael])
@@ -646,7 +629,7 @@ function contact_pressure_force(dad::HalfSpace3D, K, W::Real; kwargs...)
         curW > 0 && (p .*= W / curW)
         num < err_tol && break
     end
-    u = K isa AbstractMatrix ? (K * p) : (K * p)
+    u = K * p
     g = h0 .- u
     return p, g
 end

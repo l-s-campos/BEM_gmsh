@@ -1,0 +1,67 @@
+warning: address range table at offset 0x38a0 has a premature terminator entry at offset 0x4200
+warning: address range table at offset 0x38a0 has a premature terminator entry at offset 0x4260
+[32m[1m  Activating[22m[39m project at `/data/OneDrive/pesquisa/BEM_gmsh`
+[33m[1m┌ [22m[39m[33m[1mWarning: [22m[39mAssignment to `n` in soft scope is ambiguous because a global variable by the same name exists: `n` will be treated as a new local. Disambiguate by using `local n` to suppress this warning or `global n` to assign to the existing global variable.
+[33m[1m└ [22m[39m[90m@ /data/OneDrive/pesquisa/BEM_gmsh/scripts/profile/profile_thinplate_geom.jl:108[39m
+Geometry sampling (n=50000)
+  elem_geom (current)            5973.40 ns/call   alloc 2704 B
+  elem_geom cached poly          5697.57 ns/call   alloc 2480 B
+  elem_geom linear edge            86.05 ns/call   alloc 48 B
+  plate_kernels iso               326.96 ns/call   alloc 128 B
+
+  |Δx|=0.000e+00  |ΔJ|=1.388e-17  |Δn|=0.000e+00  (straight edge)
+
+Hottest Profile frames (assemble_plate! :guiggiani n_el=8)
+ Count  Overhead File                    Line Function
+ =====  ======== ====                    ==== ========
+     1         0 @BEM/…c/Core/Integration.jl 1625 _interp_cascade(fi::Vector{Vector…
+     1         0 none                      ? (::BEM.var"#_interp_cascade##2#_i…
+     1         1 @Base/arraymath.jl       24 *(A::Vector{Float64}, B::Float64)
+     1         0 @BEM/…rc/Plate/ThinPlate.jl  179 plate_kernels(pg::SVector{2, Floa…
+  ...
+   165         0 @Base/generator.jl       48 iterate
+   173         0 @BEM/…rc/Plate/ThinPlate.jl  567 macro expansion
+   173         0 @BEM/…rc/Plate/ThinPlate.jl  365 kwcall(::@NamedTuple{qsi::Vector{…
+   185         0 @BEM/…c/Core/Integration.jl  392 guiggiani_integral
+   185         0 @BEM/…c/Core/Integration.jl  398 #guiggiani_integral#37
+   185         0 @BEM/…c/Core/Integration.jl 1730 _guiggiani_interp
+   222         1 @BEM/…rc/Plate/ThinPlate.jl  549 macro expansion
+   330         1 @BEM/…rc/Plate/ThinPlate.jl  545 macro expansion
+   331         1 @BEM/…rc/Plate/ThinPlate.jl  477 compute_q_el(pf::SVector{2, Float…
+   392         0 @BEM/…rc/Plate/ThinPlate.jl  577 macro expansion
+   409         0 @BEM/…rc/Plate/ThinPlate.jl  465 compute_q_el
+   566         1 @BEM/…rc/Plate/ThinPlate.jl  130 elem_geom(el::Element, ξ::Float64)
+   696       693 @BEM/…Core/Interpolation.jl  152 interpolation_matrix(poly::BEM.Eq…
+   793         2 @BEM/…Core/Interpolation.jl  216 shapefun(poly::BEM.Equispaced{Flo…
+  1203         0 @BEM/…rc/Plate/ThinPlate.jl  533 assemble_plate!(mesh::PlateMesh; …
+  1262         0 @BEM/…ile_thinplate_geom.jl   16 quiet(f::var"#19#20")
+  1262         0 @Base/stream.jl        1484 (::Base.RedirectStdStream)(thunk:…
+  1262         0 @BEM/…ile_thinplate_geom.jl   17 #quiet##0
+  1262         0 @BEM/…ile_thinplate_geom.jl   18 #quiet##2
+  1262         0 @BEM/…ile_thinplate_geom.jl   95 #19
+  1262         0 @BEM/…rc/Plate/ThinPlate.jl  513 assemble_plate!
+  1262         0 @ProgressMeter/src/ProgressMeter.jl 1026 macro expansion
+  1297         0 @Base/Base.jl           355 (::Base.var"#start_profile_listen…
+  1297         0 @Base/Base.jl           335 profile_printing_listener(cond::B…
+  1297         0 @Base/asyncevent.jl     186 _trywait(t::Base.AsyncCondition)
+  1297         0 @Base/condition.jl      136 wait
+  1297         0 @Base/condition.jl      141 wait(c::Base.GenericCondition{Bas…
+  1297         0 @Base/client.jl         577 _start()
+  1297         0 @Base/client.jl         344 exec_options(opts::Base.JLOptions)
+  1297         0 @Base/Base.jl           309 include(mod::Module, _path::Strin…
+  1297         0 @Base/loading.jl       3076 _include(mapexpr::Function, mod::…
+  1297         0 @Base/loading.jl       3016 include_string(mapexpr::typeof(id…
+  1297        30 @Base/boot.jl           489 eval(m::Module, e::Any)
+  9075         0 @Base/task.jl          1196 wait_forever()
+ 10372     10372 @Base/task.jl          1296 wait()
+Total snapshots: 20746. Utilization: 50% across all threads and tasks. Use the `groupby` kwarg to break down by thread and/or task.
+  frames containing elem_geom                9
+  frames containing shapefun                 3
+  frames containing Equispaced               7
+  frames containing interpolation_matrix     7
+  frames containing plate_kernels            5
+  frames containing compute_q_el             16
+  frames containing guiggiani                10
+  frames containing _plate_Nwt               4
+  frames containing assemble_w_row           0
+  frames containing zeros                    0

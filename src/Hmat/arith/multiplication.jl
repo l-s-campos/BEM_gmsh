@@ -1,0 +1,711 @@
+"""
+    hmul!(C::HMatrix,A::HMatrix,B::HMatrix,a,b,compressor)
+
+Similar to `mul!` : compute `C <-- A*B*a + C*b`, where `A,B,C` are hierarchical
+matrices and `compressor` is a function/functor used in the intermediate stages
+of the multiplication to avoid growring the rank of admissible blocks after
+addition is performed.
+"""
+function hmul!(
+        C::T,
+        A::HTypes,
+        B::HTypes,
+        a,
+        b,
+        compressor,
+        bufs_ = nothing,
+        Cflag = 'N',
+    ) where {T <: HMatrix}
+    bufs = if isnothing(bufs_)
+        S = eltype(C)
+        chn = Channel{ACABuffer{S}}(Threads.nthreads())
+        foreach(i -> put!(chn, ACABuffer(S)), 1:Threads.nthreads())
+        chn
+    else
+        bufs_
+    end
+    b == true || rmul!(C, b)
+    dict = IdDict{T, Vector{Tuple{eltype(children(A)), eltype(children(B))}}}()
+    _plan_dict!(dict, C, A, B, Cflag)
+    _hmul!(C, compressor, dict, a, nothing, bufs, Cflag)
+    return C
+end
+
+hmul!(C::HermitianHMatrix, args...) = hmul!(parent(C), args..., C.uplo)
+
+function _plan_dict!(dict, C::T, A::HTypes, B::HTypes, Cflag) where {T <: HMatrix}
+    pairs = get!(dict, C, Tuple{T, T}[])
+    if isleaf(A) || isleaf(B) || isleaf(C)
+        push!(pairs, (A, B))
+    else
+        ni, nj = blocksize(C)
+        _, nk = blocksize(A)
+        A_children = children(A)
+        B_children = children(B)
+        C_children = children(C)
+        for i in 1:ni
+            for j in 1:nj
+                (Cflag == 'U' && (i > j)) && continue
+                (Cflag == 'L' && (j > i)) && continue
+                for k in 1:nk
+                    _plan_dict!(
+                        dict,
+                        C_children[i, j],
+                        A_children[i, k],
+                        B_children[k, j],
+                        i == j ? Cflag : 'N',
+                    )
+                end
+            end
+        end
+    end
+    return dict
+end
+
+function _hmul!(C::HMatrix, compressor, dict, a, R, bufs, Cflag)
+    execute_node!(C, compressor, dict, a, R, bufs)
+    shift = pivot(C) .- 1
+    C_children = children(C)
+    ni, nj = size(C_children)
+    for i in 1:ni
+        for j in 1:nj
+            (Cflag == 'U' && (i > j)) && continue
+            (Cflag == 'L' && (j > i)) && continue
+            chd = C_children[i, j]
+            irange = rowrange(chd) .- shift[1]
+            jrange = colrange(chd) .- shift[2]
+            Rp = data(C)
+            Rv = hasdata(C) ? RkMatrix(Rp.A[irange, :], Rp.B[jrange, :]) : nothing
+            _hmul!(chd, compressor, dict, a, Rv, bufs, i == j ? Cflag : 'N')
+        end
+    end
+    isleaf(C) || (setdata!(C, nothing))
+    return C
+end
+
+# non-recursive execution
+function execute_node!(C::HMatrix, compressor, dict, a, R, bufs)
+    T = typeof(C)
+    S = eltype(C)
+    pairs = get(dict, C, Tuple{T, T}[])
+    isnothing(R) && isempty(pairs) && (return C)
+    if isleaf(C) && !isadmissible(C)
+        d = data(C)::Matrix{S}
+        for (A, B) in pairs
+            _mul_dense!(d, A, B, a)
+        end
+        # isnothing(R) || axpy!(true, R, d)
+        isnothing(R) || mul!(d, R.A, adjoint(R.B), true, true)
+    else
+        L = MulLinearOp{S}(data(C), R, pairs, a)
+        buf = take!(bufs)
+        R = compressor(L, axes(L, 1), axes(L, 2), buf)
+        put!(bufs, buf)
+        setdata!(C, R)
+    end
+    return C
+end
+
+"""
+    struct MulLinearOp{R,T} <: AbstractMatrix{T}
+
+Abstract matrix representing the following linear operator:
+```
+    L = R + P + a * ∑ᵢ Aᵢ * Bᵢ
+```
+where `R` and `P` are of type `RkMatrix{T}`, `Aᵢ,Bᵢ` are of type `HMatrix{R,T}`
+and `a` is scalar multiplier. Calling `compressor(L)` produces a low-rank
+approximation of `L`, where `compressor` is an [`AbstractCompressor`](@ref).
+
+Note: this structure is used to group the operations required when multiplying
+hierarchical matrices so that they can later be executed in a way that minimizes
+recompression of intermediate computations.
+"""
+struct MulLinearOp{T, V, S} <: AbstractMatrix{T}
+    R::Union{RkMatrix{T}, Nothing}
+    P::Union{RkMatrix{T}, Nothing}
+    pairs::Vector{V}
+    multiplier::S
+end
+
+function MulLinearOp{T}(R, P, pairs::Vector{V}, multiplier::S) where {T, V, S}
+    return MulLinearOp{T, V, S}(R, P, pairs, multiplier)
+end
+
+# AbstractMatrix interface
+function Base.size(L::MulLinearOp)
+    isnothing(L.R) || (return size(L.R))
+    isnothing(L.P) || (return size(L.P))
+    isempty(L.pairs) && (return (0, 0))
+    A, B = first(L.pairs)
+    return (size(A, 1), size(B, 2))
+end
+
+function Base.getindex(L::Union{MulLinearOp, Adjoint{<:Any, <:MulLinearOp}}, args...)
+    return error("calling `getindex` of a `MulLinearOp` has been disabled")
+end
+
+function getcol!(col, L::MulLinearOp, j)
+    fill!(col, zero(eltype(col)))
+    m, n = size(L)
+    T = eltype(L)
+    # compute j-th column of ∑ Aᵢ Bᵢ
+    for (A, B) in L.pairs
+        m, k = size(A)
+        k, n = size(B)
+        tmp = zeros(T, k)
+        jg = j + offset(B)[2] # global index on hierarchical matrix B
+        getcol!(tmp, B, jg)
+        _hgemv_recursive!(col, A, tmp, offset(A))
+    end
+    # multiply the columns by a
+    a = L.multiplier
+    rmul!(col, a)
+    # add R and P (if they exist)
+    R = L.R
+    if !isnothing(R)
+        getcol!(col, R, j, Val(true))
+    end
+    P = L.P
+    if !isnothing(P)
+        getcol!(col, P, j, Val(true))
+    end
+    return col
+end
+
+function getblock!(out, L::MulLinearOp, irange, j::Int)
+    @assert irange == 1:size(L, 1)
+    return getcol!(out, L, j)
+end
+
+function getcol!(col, adjL::Adjoint{<:Any, <:MulLinearOp}, j)
+    fill!(col, zero(eltype(col)))
+    L = parent(adjL)
+    T = eltype(L)
+    # compute j-th column of ∑ adjoint(Bᵢ)*adjoint(Aᵢ)
+    for (A, B) in L.pairs
+        At, Bt = adjoint(A), adjoint(B)
+        tmp = zeros(T, size(At, 1))
+        jg = j + offset(At)[2]
+        getcol!(tmp, At, jg)
+        _hgemv_recursive!(col, Bt, tmp, offset(Bt))
+    end
+    # multiply by a
+    a = L.multiplier
+    rmul!(col, conj(a))
+    # add the j-th column of Ct if it has data
+    R = L.R
+    if !isnothing(R)
+        getcol!(col, adjoint(R), j, Val(true))
+    end
+    P = L.P
+    if !isnothing(P)
+        getcol!(col, adjoint(P), j, Val(true))
+    end
+    return col
+end
+
+function getblock!(out, L::Adjoint{<:Any, <:MulLinearOp}, irange, j::Int)
+    @assert irange == 1:size(L, 1)
+    return getcol!(out, L, j)
+end
+
+#=
+Multiplication when the target is a dense matrix. The numbering system in the following
+`_mulxyz` methods use the following convention
+1 --> Matrix (dense)
+2 --> RkMatrix (sparse)
+3 --> HMatrix (hierarchical)
+=#
+
+function _mul_dense!(C::Base.Matrix, A, B, a)
+    Adata = isleaf(A) ? data(A) : A
+    Bdata = isleaf(B) ? data(B) : B
+    return if Adata isa HMatrix || Adata isa AdjointHMatrix
+        if Bdata isa Matrix
+            _mul131!(C, Adata, Bdata, a)
+        elseif Bdata isa RkMatrix
+            _mul132!(C, Adata, Bdata, a)
+        end
+    elseif Adata isa AdjOrMat
+        if Bdata isa Matrix
+            _mul111!(C, Adata, Bdata, a)
+        elseif Bdata isa RkMatrix
+            _mul112!(C, Adata, Bdata, a)
+        elseif Bdata isa HMatrix
+            _mul113!(C, Adata, Bdata, a)
+        end
+    elseif Adata isa RkMatrix || Adata isa AdjointHMatrix
+        if Bdata isa Matrix
+            _mul121!(C, Adata, Bdata, a)
+        elseif Bdata isa RkMatrix
+            _mul122!(C, Adata, Bdata, a)
+        elseif Bdata isa HMatrix
+            _mul123!(C, Adata, Bdata, a)
+        end
+    else
+        error(
+            "invalid types: typeof(A) = $(typeof(Adata)) and typeof(B) = $(typeof(Bdata))",
+        )
+    end
+end
+
+function _mul111!(C, A, B, a)
+    return mul!(C, A, B, a, true)
+end
+
+function _mul112!(
+        C::Union{Matrix, SubArray, Adjoint},
+        M::Union{Matrix, SubArray, Adjoint},
+        R::RkMatrix,
+        a::Number,
+    )
+    buffer = M * R.A
+    _mul111!(C, buffer, R.Bt, a)
+    return C
+end
+
+function _mul113!(
+        C::Union{Matrix, SubArray, Adjoint},
+        M::Union{Matrix, SubArray, Adjoint},
+        H::HMatrix,
+        a::Number,
+    )
+    T = eltype(C)
+    if hasdata(H)
+        mat = data(H)
+        if mat isa Matrix
+            _mul111!(C, M, mat, a)
+        elseif mat isa RkMatrix
+            _mul112!(C, M, mat, a)
+        else
+            error()
+        end
+    end
+    for child in children(H)
+        shift = pivot(H) .- 1
+        irange = rowrange(child) .- shift[1]
+        jrange = colrange(child) .- shift[2]
+        Cview = @views C[:, jrange]
+        Mview = @views M[:, irange]
+        _mul113!(Cview, Mview, child, a)
+    end
+    return C
+end
+
+function _mul121!(
+        C::Union{Matrix, SubArray, Adjoint},
+        R::RkMatrix,
+        M::Union{Matrix, SubArray, Adjoint},
+        a::Number,
+    )
+    buffer = R.Bt * M
+    return _mul111!(C, R.A, buffer, a)
+end
+function _mul121!(
+        C::Union{Matrix, SubArray, Adjoint},
+        adjR::AdjRk,
+        M::Union{Matrix, SubArray, Adjoint},
+        a::Number,
+    )
+    R = parent(adjR)
+    buffer = R.At * M
+    return _mul111!(C, R.B, buffer, a)
+end
+
+function _mul122!(C::Union{Matrix, SubArray, Adjoint}, R::RkMatrix, S::RkMatrix, a::Number)
+    if rank(R) < rank(S)
+        _mul111!(C, R.A, (R.Bt * S.A) * S.Bt, a)
+    else
+        _mul111!(C, R.A * (R.Bt * S.A), S.Bt, a)
+    end
+    return C
+end
+
+function _mul123!(C::Union{Matrix, SubArray, Adjoint}, R::RkMatrix, H::HMatrix, a::Number)
+    T = promote_type(eltype(R), eltype(H))
+    tmp = zeros(T, size(R.Bt, 1), size(H, 2))
+    _mul113!(tmp, R.Bt, H, 1)
+    _mul111!(C, R.A, tmp, a)
+    return C
+end
+
+function _mul131!(
+        C::Union{Matrix, SubArray, Adjoint},
+        H::HTypes,
+        M::Union{Matrix, SubArray, Adjoint},
+        a::Number,
+    )
+    if isleaf(H)
+        mat = data(H)
+        if mat isa AdjOrMat
+            _mul111!(C, mat, M, a)
+        elseif mat isa AdjRkOrRk
+            _mul121!(C, mat, M, a)
+        else
+            error("$(typeof(mat))")
+        end
+    end
+    for child in children(H)
+        shift = pivot(H) .- 1
+        irange = rowrange(child) .- shift[1]
+        jrange = colrange(child) .- shift[2]
+        Cview = view(C, irange, :)
+        Mview = view(M, jrange, :)
+        _mul131!(Cview, child, Mview, a)
+    end
+    return C
+end
+
+function _mul132!(C::Union{Matrix, SubArray, Adjoint}, H::HMatrix, R::RkMatrix, a::Number)
+    T = promote_type(eltype(H), eltype(R))
+    buffer = zeros(T, size(H, 1), size(R.A, 2))
+    _mul131!(buffer, H, R.A, 1)
+    _mul111!(C, buffer, R.Bt, a)
+    return C
+end
+
+############################################################################################
+# Specializations on gemv:
+# The routines below provide specialized version of mul!(C,A,B,a,b) when `A` and
+# `B` are vectors
+############################################################################################
+
+# 1.2.1
+function LinearAlgebra.mul!(
+        y::AbstractVector,
+        R::RkMatrix,
+        x::AbstractVector,
+        a::Number,
+        b::Number,
+    )
+    tmp = R.Bt * x
+    # tmp = mul!(R.buffer, adjoint(R.B), x)
+    return mul!(y, R.A, tmp, a, b)
+end
+
+function LinearAlgebra.mul!(
+        Y::AbstractMatrix,
+        R::RkMatrix,
+        X::AbstractMatrix,
+        a::Number,
+        b::Number,
+    )
+    tmp = R.Bt * X
+    return mul!(Y, R.A, tmp, a, b)
+end
+
+# 1.2.1
+function LinearAlgebra.mul!(
+        y::AbstractVector,
+        adjR::Adjoint{<:Any, <:RkMatrix},
+        x::AbstractVector,
+        a::Number,
+        b::Number,
+    )
+    R = parent(adjR)
+    tmp = R.At * x
+    # tmp = mul!(R.buffer, adjoint(R.A), x)
+    return mul!(y, R.B, tmp, a, b)
+end
+
+# 1.3.1
+"""
+    mul!(y::AbstractVector,H::HMatrix,x::AbstractVector,a,b[;global_index,threads])
+
+Perform `y <-- H*x*a + y*b` in place.
+"""
+function LinearAlgebra.mul!(
+        y::AbstractVector,
+        A::Union{HTypes, HTriangular},
+        x::AbstractVector,
+        a::Number = 1,
+        b::Number = 0;
+        global_index = use_global_index(),
+        threads = use_threads(),
+    )
+    Te = eltype(A)
+    if is_tensor_eltype(Te)
+        if eltype(x) <: Number
+            return _hgemv_tensor_flat!(y, A, x, a, b; global_index=global_index, threads=threads)
+        elseif eltype(x) <: SVector
+            return _hgemv_tensor_svec!(y, A, x, a, b; global_index=global_index, threads=threads)
+        end
+    end
+    # since the HMatrix represents A = inv(Pr)*H*Pc, where Pr and Pc are row and column
+    # permutations, we need first to rewrite C <-- b*C + a*(inv(Pr)*H*Pc)*B as
+    # C <-- inv(Pr)*(b*Pr*C + a*H*(Pc*B)). Following this rewrite, the
+    # multiplication is performed by first defining B <-- Pc*B, and C <--
+    # Pr*C, doing the multiplication with the permuted entries, and then
+    # permuting the result  back C <-- inv(Pr)*C at the end.
+    if global_index
+        # permute input
+        x = x[colperm(A)]
+        y = permute!(y, rowperm(A))
+        rmul!(x, a) # multiply in place since this is a new copy, so does not mutate exterior x
+    elseif a != 1
+        x = a * x # new copy of x since we should not mutate the external x in mul!
+    end
+    iszero(b) ? fill!(y, zero(eltype(y))) : rmul!(y, b)
+    # offset in case A is not indexed starting at (1,1); e.g. A is not the root
+    # of and HMatrix
+    offset = pivot(A) .- 1
+    if threads
+        _hgemv_threads!(y, x, leaves(A), offset)  # threaded implementation
+    else
+        _hgemv_recursive!(y, A, x, offset) # serial implementation
+    end
+    # permute output
+    global_index && invpermute!(y, rowperm(A))
+    return y
+end
+
+"""
+    _hgemv_tensor_flat!(y, H, x, a, b)
+
+Matvec of an H-matrix with `SMatrix{p,q}` entries against a flat node-major
+vector of length `q n`. Leaves apply on expanded index ranges (no
+`Vector{SVector}` in the hot path).
+"""
+function _hgemv_tensor_flat!(
+        y::AbstractVector{T},
+        A,
+        x::AbstractVector{T},
+        a::Number,
+        b::Number;
+        global_index,
+        threads,
+    ) where {T <: Number}
+    Te = eltype(A)
+    p, q = tensor_blocksize(Te)
+    n = size(A, 2)
+    m = size(A, 1)
+    length(x) == q * n && length(y) == p * m || throw(DimensionMismatch(
+        "tensor H matvec: y=$(length(y)) x=$(length(x)); expected $(p * m)×$(q * n)"))
+    xt = global_index ? _nnca_permute_in(x, colperm(A), q) : (a == 1 ? x : a .* x)
+    if global_index && a != 1
+        xt = a .* xt
+    end
+    offset = pivot(A) .- 1
+    if global_index
+        yt = iszero(b) ? zeros(T, p * m) : rmul!(_nnca_permute_in(y, rowperm(A), p), b)
+        _hgemv_tensor_apply!(yt, A, xt, offset, p, q, threads)
+        _nnca_permute_out!(y, yt, rowperm(A), p, 0)
+    else
+        iszero(b) ? fill!(y, zero(T)) : rmul!(y, b)
+        _hgemv_tensor_apply!(y, A, xt, offset, p, q, threads)
+    end
+    return y
+end
+
+function _hgemv_tensor_svec!(
+        y::AbstractVector{SVector{p, T}},
+        A,
+        x::AbstractVector{SVector{q, T}},
+        a::Number,
+        b::Number;
+        global_index,
+        threads,
+    ) where {p, q, T}
+    xf = scalarize(x)
+    yf = iszero(b) ? Vector{T}(undef, p * length(y)) : scalarize(y)
+    mul!(yf, A, xf, a, b; global_index=global_index, threads=threads)
+    y .= descalarize(yf, SVector{p, T})
+    return y
+end
+
+function _hgemv_tensor_apply!(y, A, x, offset, p, q, threads)
+    if threads && Threads.nthreads() > 1
+        _hgemv_tensor_threads!(y, x, leaves(A), offset, p, q)
+    else
+        _hgemv_tensor_recursive!(y, A, x, offset, p, q)
+    end
+    return y
+end
+
+function _hgemv_tensor_recursive!(y, A, x, offset, p, q)
+    if isleaf(A)
+        ir = expand_range(rowrange(A) .- offset[1], p)
+        jr = expand_range(colrange(A) .- offset[2], q)
+        mul!(view(y, ir), data(A), view(x, jr), 1, 1)
+    else
+        for block in children(A)
+            _hgemv_tensor_recursive!(y, block, x, offset, p, q)
+        end
+    end
+    return y
+end
+
+function _hgemv_tensor_threads!(C, B, leaves_, offset, p, q)
+    acc = Threads.Atomic{Int}(1)
+    lck = ReentrantLock()
+    np = Threads.nthreads()
+    nl = length(leaves_)
+    @sync for _ in 1:np
+        Threads.@spawn begin
+            buf = zero(C)
+            while true
+                i = Threads.atomic_add!(acc, 1)
+                i > nl && break
+                leaf = leaves_[i]
+                ir = expand_range(rowrange(leaf) .- offset[1], p)
+                jr = expand_range(colrange(leaf) .- offset[2], q)
+                mul!(view(buf, ir), data(leaf), view(B, jr), 1, 1)
+            end
+            @lock lck begin
+                axpy!(true, buf, C)
+            end
+        end
+    end
+    return C
+end
+
+function Base.:*(A::Union{HTypes, HTriangular}, x::AbstractVector)
+    Te = eltype(A)
+    if is_tensor_eltype(Te)
+        p, q = tensor_blocksize(Te)
+        ST = eltype(Te)
+        if eltype(x) <: Number
+            length(x) == q * size(A, 2) || throw(DimensionMismatch(
+                "tensor H*: length $(length(x)) vs $(q * size(A, 2))"))
+            y = Vector{ST}(undef, p * size(A, 1))
+            return mul!(y, A, x)
+        elseif eltype(x) <: SVector{q}
+            length(x) == size(A, 2) || throw(DimensionMismatch())
+            y = Vector{SVector{p, ST}}(undef, size(A, 1))
+            return mul!(y, A, x)
+        end
+    end
+    y = similar(x, promote_type(eltype(A), eltype(x)), size(A, 1))
+    return mul!(y, A, x)
+end
+
+"""
+    mul!(Y, H, X, a, b; global_index, threads)
+
+Multi-RHS apply: `Y ← a*H*X + b*Y` with `X,Y` matrices (blocked leaf GEMM).
+"""
+function LinearAlgebra.mul!(
+        Y::AbstractMatrix,
+        A::Union{HTypes, HTriangular},
+        X::AbstractMatrix,
+        a::Number = 1,
+        b::Number = 0;
+        global_index = use_global_index(),
+        threads = use_threads(),
+    )
+    size(Y, 2) == size(X, 2) || throw(DimensionMismatch("size(Y,2) != size(X,2)"))
+    size(Y, 1) == size(A, 1) || throw(DimensionMismatch("size(Y,1) != size(A,1)"))
+    size(X, 1) == size(A, 2) || throw(DimensionMismatch("size(X,1) != size(A,2)"))
+
+    # single RHS → specialized vector path
+    if size(X, 2) == 1
+        mul!(view(Y, :, 1), A, view(X, :, 1), a, b; global_index=global_index, threads=threads)
+        return Y
+    end
+
+    if global_index
+        Xp = Matrix(X[colperm(A), :])
+        rmul!(Xp, a)
+        Yp = Matrix(Y[rowperm(A), :])
+        iszero(b) ? fill!(Yp, zero(eltype(Yp))) : rmul!(Yp, b)
+    else
+        Xp = a == 1 ? X : a * X
+        Yp = Y
+        iszero(b) ? fill!(Yp, zero(eltype(Yp))) : rmul!(Yp, b)
+    end
+
+    offset = pivot(A) .- 1
+    # multi-RHS: recursive blocked GEMM (thread path optional)
+    if threads && size(Xp, 2) == 1 && Yp isa AbstractVector
+        _hgemv_threads!(Yp, Xp, leaves(A), offset)
+    else
+        _hgemv_recursive!(Yp, A, Xp, offset)
+    end
+
+    if global_index
+        invp = invperm(rowperm(A))
+        Y[:, :] .= Yp[invp, :]
+    end
+    return Y
+end
+
+"""
+    _hgemv_recursive!(C,A,B,offset)
+
+Internal function used to compute `C[I] <-- C[I] + A*B[J]` where `I =
+rowrange(A) - offset[1]` and `J = colrange(A) - offset[2]`.
+
+Works for `B` / `C` vectors **or** multi-RHS matrices (blocked GEMM at leaves).
+"""
+function _hgemv_recursive!(C::AbstractVecOrMat, A::HTypes, B::AbstractVecOrMat, offset)
+    if isleaf(A)
+        irange = rowrange(A) .- offset[1]
+        jrange = colrange(A) .- offset[2]
+        d = data(A)
+        if C isa AbstractVector
+            mul!(view(C, irange), d, view(B, jrange), 1, 1)
+        else
+            mul!(view(C, irange, :), d, view(B, jrange, :), 1, 1)
+        end
+    else
+        for block in children(A)
+            _hgemv_recursive!(C, block, B, offset)
+        end
+    end
+    return C
+end
+
+function _hgemv_threads!(C::AbstractVecOrMat, B::AbstractVecOrMat, leaves_, offset)
+    acc = Threads.Atomic{Int}(1)
+    lck = ReentrantLock()
+    np = Threads.nthreads()
+    nl = length(leaves_)
+    multi = C isa AbstractMatrix
+    @sync for _ in 1:np
+        Threads.@spawn begin
+            buf = multi ? zeros(eltype(C), size(C, 1), size(C, 2)) : zero(C)
+            while true
+                i = Threads.atomic_add!(acc, 1)
+                i > nl && break
+                leaf = leaves_[i]
+                irange = rowrange(leaf) .- offset[1]
+                jrange = colrange(leaf) .- offset[2]
+                if multi
+                    mul!(view(buf, irange, :), data(leaf), view(B, jrange, :), 1, 1)
+                else
+                    mul!(view(buf, irange), data(leaf), view(B, jrange), 1, 1)
+                end
+            end
+            @lock lck begin
+                if multi
+                    C .+= buf
+                else
+                    axpy!(true, buf, C)
+                end
+            end
+        end
+    end
+    return C
+end
+
+function LinearAlgebra.rmul!(R::RkMatrix, b::Number)
+    m, n = size(R)
+    if m > n
+        rmul!(R.B, conj(b))
+    else
+        rmul!(R.A, b)
+    end
+    return R
+end
+
+function LinearAlgebra.rmul!(H::HMatrix, b::Number)
+    b == true && (return H) # short circuit. If inlined, rmul!(H,true) --> no-op
+    if hasdata(H)
+        rmul!(data(H), b)
+    end
+    for child in children(H)
+        rmul!(child, b)
+    end
+    return H
+end

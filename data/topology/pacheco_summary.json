@@ -1,0 +1,9 @@
+{
+  "note": "Pacheco inward-normal BEM topology opt vs thesis ΔA. ne=12, degree=1, nucleate_every=4.",
+  "problems": [
+    {"id": 1, "name": "inverted-V", "A0": 1.0, "Ap": 0.5, "A_final": 0.5013, "J_over_J0": 0.596, "holes": 0, "comment": "V/arch connecting two bottom hot patches to the top cold patch; matches thesis connectivity."},
+    {"id": 2, "name": "asymmetric", "A0": 1.0, "Ap": 0.8, "A_final": 0.815, "J_over_J0": 0.945, "holes": 1, "comment": "Thesis also nucleates a hole; remaining frame still connects the four Dirichlet corners."},
+    {"id": 3, "name": "bridge", "A0": 0.447, "Ap": 0.290, "A_final": 0.285, "J_over_J0": 0.796, "holes": 0, "comment": "Arc notch preserved; beam-like conductor between the two short verticals."},
+    {"id": 4, "name": "cross", "A0": 1.0, "Ap": 0.6, "A_final": 0.619, "J_over_J0": 0.831, "holes": 1, "comment": "Mid-side Dirichlet patches kept; corners recede. Center hole is DT iso-cut (thesis cross is usually four arms)."}
+  ]
+}

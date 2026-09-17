@@ -1,17 +1,30 @@
-# Half-space contact BEM (Pohrt & Li 2014)
+# Contact
 
-Implementation of
+`using BEM.Contact`. Half-space (Pohrt–Li), layered/anisotropic Fourier
+compliance, Uzawa wear, rolling, planar wheel–rail, 2-D half-plane,
+Cattaneo–Mindlin, mortar.
+
+Multibody frictional contact on `BEMdata` is [`BEM.MultiRegion`](@ref).
+
+```@docs
+BEM.Contact
+BEM.Contact.ElasticHalfSpace
+BEM.Contact.combined_halfspace
+BEM.Contact.solve_normal_contact
+BEM.Contact.build_pohrt_operator
+BEM.Contact.loyola_cattaneo_params
+BEM.Contact.cattaneo_pressure
+BEM.Contact.cattaneo_shear
+```
+
+## Pohrt–Li half-space
 
 > R. Pohrt & Q. Li, *Complete Boundary Element Formulation for Normal and
 > Tangential Contact Problems*, Physical Mesomechanics **17** (2014) 334–340.
 > DOI: [10.1134/S1029959914040109](https://doi.org/10.1134/S1029959914040109)
 
-Module: `BEM.ContactHalfSpace` (reexported by `BEM`).
-
-## Physics
-
-Elastic half-space, surface only, **uniform rectangular grid**.
-Surface stresses ``(τ_x, τ_y, p)`` map to surface displacements ``(u_x, u_y, u_z)``
+Elastic half-space, surface only, **uniform rectangular grid**. Surface
+stresses ``(τ_x, τ_y, p)`` map to surface displacements ``(u_x, u_y, u_z)``
 through nine influence operators obtained by integrating Boussinesq/Cerruti
 kernels over flat rectangular patches (Love-type closed forms).
 
@@ -21,193 +34,125 @@ Sign convention: positive ``p`` and ``u_z`` point **into** the solid.
 u_a^{ij} = \sum_{i'j'} K_{ab}^{ij,i'j'}\, b_b^{i'j'}
 ```
 
-## Influence coefficients
-
 ```julia
+using BEM.Contact
 hs = ElasticHalfSpace(G, ν; hx=1.0, hy=1.0)
 K = influence_coeff(Kzz, di, dj, hs)   # relative offset (i-i', j-j')
-```
-
-Components: `Kxx Kxy Kxz Kyx Kyy Kyz Kzx Kzy Kzz` (`InfluenceComponent` enum).
-
-## FFT convolution
-
-```julia
+# two-body Kalker combination (Juliá Lerma / Paper 1 eq. 6)
+hs2 = combined_halfspace(G_A, ν_A, G_B, ν_B; hx=1.0, hy=1.0)
 prep = precompute_kernels(nx, ny, hs; components=(Kzz, Kxx))
-u = fc_forward(p, Kzz, prep)           # u = FC(p)
-```
-
-Complexity ``O(N^2 \log N)`` per evaluation on an ``N\times N`` grid.
-
-## Inverse (CG)
-
-```julia
-σ = fc_inverse(u_target, mask, Kzz, prep; tol=1e-8)
-```
-
-Polonsky–Keer / Pohrt–Li conjugate gradients restricted to `mask`.
-
-## Frictionless normal contact
-
-```julia
+u = fc_forward(p, Kzz, prep)
+ux, uy, uz = fc_displacements(px, py, pn, prep)
 sol = solve_normal_contact(gap0, δ, hs)
-# sol.p, sol.u, sol.contact, sol.force
+ps = solve_partial_slip(sol.p, sol.contact, d, μ, hs)
+# same solvers with H-matrix / H² / FMM (Kzz) matvecs
+prepH = precompute_kernels(nx, ny, hs; components=(Kzz,), method=:hmatrix)
+prep2 = precompute_kernels(nx, ny, hs; components=(Kzz,), method=:h2)
+prepF = precompute_kernels(nx, ny, hs; components=(Kzz,), method=:fmm)
 ```
 
-## Coulomb partial slip
+Uniform grids stay on `:fft` (exact circulant embedding). `:hmatrix`
+compresses the flattened Love/Cerruti matrix with the same `assemble_hmatrix`
+path as Laplace DIBEM. `:fmm` (`Kzz`) uses that Laplace 3-D FMM
+(`fmm_laplace3d_matrix`, octree plan) as the far `1/r` field, scaled by
+`4A/E*`, then replaces a near stencil with Love `influence_coeff` — the
+same split as `HalfSpaceBEM` `lfmm3d` + exact near panels. H / H² already
+assemble Love, so they match FFT without that correction.
 
-```julia
-ps = solve_partial_slip(sol.p, sol.contact, d, μ; hs)
-# ps.τ, ps.stick, ps.slip, ps.force_t
-```
-
-Starts from full stick, transfers points that exceed ``|τ|=μ p`` into slip,
-iterates until the stick/slip partition is stable (paper §5). Decoupled
-normal/tangential response (exact at ``ν=1/2``).
+Identical materials give coupling `K = 0`. `Kxz`/`Kyz` use principal-value
+`atan(y/x)` (not `atan2`) so the kernels stay odd.
 
 ## 2D line contact (Flamant / Hertz cylinder)
 
 ```julia
 hp = ElasticHalfPlane2D(G, ν; h=hx)
 sol = solve_line_contact(gap0, δ, hp)
-hz  = hertz_line(F, R, hp)          # a, p0 analytical
+hz  = hertz_line(F, R, hp)
 ```
 
-Demo: `scripts/hertz_line_2d.jl`.
+Demo: `scripts/contact/hertz_line_2d.jl`.
 
-## Multi-region interfaces (BC type 3)
+## Layered / anisotropic half-space (Bagault et al. 2013)
 
-Gmsh physical name `"3;0"` marks an interface. After loading each subregion:
+Fourier-domain surface compliance of a coated anisotropic solid, same FFT
+contact solver as Pohrt. Stroh eigenvalues in each layer, propagator through
+the coating, radiation condition in the substrate. Isotropic materials are
+sent to Stroh as cubic with Coulomb modulus ±1 % (Bagault §4.1).
 
 ```julia
-prob = MultiRegionProblem([dadL, dadR])
-pair_interfaces!(prob)              # nearest-neighbour pairing
-assemble_multiregion(prob)
-solve_multiregion!(prob)            # T continuous, q_a + q_b = 0
+hs = isotropic_halfspace(E, ν; hx, hy)
+hs = isotropic_coated(Ec, νc, Zc, Es, νs; hx, hy)
+C  = orthotropic_C(E1, E2, E3, ν12, ν13, ν23, G12, G13, G23)
+hs = homogeneous(rotate_C_about_x(C, θm); hx, hy)
+prep = precompute_kernels(nx, ny, hs; components=(Kzz,))
+sol  = solve_normal_contact(gap0, δ, hs; prep=prep)
 ```
 
-## Frictional contact (BC type 4)
+Reference: C. Bagault, D. Nélias, M.C. Baietto, T.C. Ovaert, *Int. J. Solids
+Struct.* **50** (2013) 743–754. Paper figures:
+`scripts/julia_lerma/bagault_paper.jl`. Gates: `test/test_layered_aniso.jl`.
 
-Gmsh physical name `"4;μ"` (scalar) or `"4;μ;4;μ"` (elasticity) — value slot
-holds the friction coefficient.
+## Orthotropic contact + wear (Juliá Lerma 2025 Ch. 2)
 
-### Pairing: NTN vs NTS
+Uzawa / Alart–Curnier on the same FFT operator: elliptic Coulomb `(μ1, μ2, β)`,
+orthotropic Archard wear `(i1, i2)`, optional load control on `δ`.
 
 ```julia
-pair_contacts!(prob; method=:ntn)   # node-to-node (nearest neighbour)
-pair_contacts!(prob; method=:nts, slave_reg=1, master_reg=2)  # node-to-segment
-# pair.state: 1=open, 2=slip, 3=stick
-# NTS fills pair.master_nodes, ξ, N1, N2 for linear master segments
+hs = combined_halfspace(G, ν, G, ν; hx, hy)
+grid = make_grid(x, y, hs, sphere_gap(x, y, R))
+prep = precompute_kernels(nx, ny, hs)
+st = init_state(grid)
+law = OrthotropicLaw(μ1, μ2, i1, i2, β)   # β in radians
+solve_contact_step!(st, grid, prep, law, δ, gx_o, gy_o)
+P, Qx, Qy = contact_resultants(st, hs)
+σ = subsurface_stress(0.0, 0.0, z, st.ptx, st.pty, st.pn, x, y, hs, ν)
 ```
 
-### Multibody elasticity (penalty NTN / NTS)
+Rolling: `solve_rolling_step!(st, grid, prep, law, RollingKinematics(V, ξx, ξy, φ), δ)`.
+Wear is the circumferential groove ``∫ |p_n| ‖s‖_i dx / V`` (Paper 3 eqs. 16, 33).
+
+Load control: `set_approach_for_load!` (Hertz ``P ∝ δ^{3/2}``) for fresh
+spherical contact; `match_load!` (Sneddon ``2 E^* a``) after wear / punches;
+`rolling_match_load!` for rolling.
+
+Notes: `_research/julia_lerma_2025/`. Demos: `scripts/julia_lerma/`.
+Gates: `test/test_julia_lerma_contact.jl`, `test/test_julia_lerma_convergence.jl`.
+
+## Wheel–rail (Vollebregt CONTACT module 1, D=2)
+
+Planar wheel–rail in front of the Pohrt–Uzawa rolling solver. SIMPACK
+`.prr/.prw` and slice catalogues `.slcw` live in `data/contact/vollebregt/`.
 
 ```julia
-include(datadir("elastico", "two_blocks_contact.jl"))
-props = Elasticity(100.0, 0.3, 1.0; plane_strain=true)
-prob = load_two_blocks_contact(props; gap=0.02,
-                               ndiv_bot=8, ndiv_top=5)  # non-matching → NTS
-# close the joint by rigid approach δ > gap (penalty NTN or NTS)
-# frame=:local (default) — Leonardo §4.7 (n,t) BEM; contact as (t_n, t_t)
-solve_multibody_elasticity_contact!(prob; method=:nts, frame=:local,
-                                    kn=5e3, kt=2e3, δ=0.035,
-                                    slave_reg=1, master_reg=2)
-# pair.tn, pair.tt — slave normal/tangential tractions
-# pair.state: 1=open, 2=slip, 3=stick
-# dad.u_local, dad.traction_local available on each region
+rail = read_rail_profile(joinpath(vollebregt_data_dir(), "MBench_UIC60_v3.prr"))
+wheel = read_wheel_profile(joinpath(vollebregt_data_dir(), "MBench_S1002_v3.prw"))
+res = solve_wheel_rail(TrackGeom(), WheelsetGeom(z=0.1981, vs=2000.0), rail, wheel;
+                       side=:left)
 ```
 
-### Multibody elasticity — Contato active-set / SSN / ALM
+Demo: `scripts/julia_lerma/wheel_rail_mbench.jl`. Gates: `test/test_wheel_rail.jl`.
 
-Coupled multi-region system in local ``(n,t)`` (`aplica_contato_com_atrito_multicorpos`
-layout). Inner solvers share the same unknowns
-``(u_{\mathrm{mix}}, t_n^1,t_t^1,t_n^2,t_t^2)``:
+## Legacy half-space operators (`HalfSpaceBEM`)
 
-| `solver` | Method | Notes |
-|----------|--------|-------|
-| `:activeset` (default) | Contato verify → ``A,b`` → ``x=A\\b`` | frozen open/stick/±slip |
-| `:ssn` | Alart–Curnier NCF + Newton | superlinear; same KKT as ALM |
-| `:alm` | Uzawa augmented Lagrangian | multiplier projection + BIE with fixed ``t`` |
-
-ALM update (open-positive gap ``g_n``, ``λ=-t``):
-
-```math
-λ_n ← Π_{ℝ_+}(λ_n - r_n g_n),\qquad
-λ_t ← Π_{|·|≤μ λ_n}(λ_t - r_t g_t),
-```
-
-then ``t^1=-λ``, ``t^2=-R\\t^1``, and each region solves
-``A x_{\mathrm{mix}} = b + G_c t``.
-
-**Prefer load stepping** for large approach:
+Log-kernel stack (`E = E/(1-ν²)`). Coupled Pohrt–Li 9-kernel contact is
+`ContactHalfSpace` + `OrthotropicUzawa`. The 2-D kernel here is ``-4/(π E)``
+(twice Flamant if `E` is combined ``E*``). `wear_2d`'s `δ` is sliding distance.
 
 ```julia
-# outer loop on δ, warm-start x (recommended)
-solve_contact_friction_stepped!(prob; δ_end=0.035, nsteps=10, tol=1e-8)
-# semi-smooth Newton (Alart–Curnier); rn,rt default ∼ 10E/L
-solve_contact_friction_stepped!(prob; δ_end=0.035, nsteps=10,
-                                 solver=:ssn, tol=1e-8)
-# Uzawa ALM (optional under-relaxation / r growth)
-solve_contact_friction_stepped!(prob; δ_end=0.035, nsteps=10,
-                                 solver=:alm, alm_omega=0.7, r_grow=1.2)
-# pair.state: 1=open, ±2=slip, 3=stick; pair.tn, pair.tt from solution
-# history: dad.contact_δ_hist, dad.contact_tn_hist
-
-# single shot (less robust for large δ)
-solve_contact_friction!(prob; δ=0.035)
-solve_contact_friction!(prob; δ=0.035, solver=:ssn)
-solve_contact_friction!(prob; δ=0.035, solver=:alm)
-```
-
-Compare active-set, SSN, ALM, and penalty at the same ``δ_end`` / mesh.
-
-## Half-space operators with acceleration (`HalfSpaceBEM`)
-
-```julia
-dad = HalfSpace2D(-1, 1, N; E=Estar)   # E = E/(1-ν²)
-K = build_operator(dad, :fft)          # :dense | :fft | :hmatrix | :fmm
+dad = HalfSpace2D(-1, 1, N; E=Estar)
+K = build_operator(dad, :fft)          # :dense | :fft | :hmatrix | :h2 | :fmm
 p, g = contact_pressure_force(dad, K, W)
-w1, w2, ph = wear_2d(dad, K, W; k_ar1=1e-13, δ=1e-5, nsteps=100)  # desgaste_2D
 ```
 
 ## Cattaneo–Mindlin (Loyola 2022 §9.3.1)
 
-Two elastically similar cylinders under constant normal load ``P`` and cyclic
-tangential load ``Q`` (partial slip). Parameters from Table 9.19:
-
 ```julia
 par = loyola_cattaneo_params(; Q_over_fP=0.5)
-# par.a ≈ 1.186 mm, par.p0 ≈ 698 MPa, load_steps A…E
-```
-
-| Model | API |
-|-------|-----|
-| Analytical Hertz + Cattaneo / Mindlin–Deresiewicz | `cattaneo_pressure`, `cattaneo_shear`, `mindlin_shear_history` |
-| Half-space NTS (Flamant BEM) | `solve_cattaneo_halfplane` |
-| Cohesive penalty + Coulomb | `solve_cattaneo_cohesive_halfplane` |
-| Mortar STS (non-matching grids) | `solve_cattaneo_mortar_halfplane` |
-
-```julia
 G = par.E_eq * (1 - par.ν) / 2
 x = range(-3par.a, 3par.a; length=201) |> collect
 hp = ElasticHalfPlane2D(G, par.ν; h=x[2]-x[1])
-sol = solve_cattaneo_halfplane(x, par.R_eq, par.P, par.Qmax, par.f, hp)
+hist = solve_cattaneo_history_halfplane(x, par.R_eq, par.f, hp, par.load_steps)
 ```
 
-Mortar builds dual-ish ``D`` and projection ``M`` so master tractions satisfy
-``M t_m = D t_s`` (weak action–reaction), addressing the coarse-mesh contact
-half-width issue noted in the thesis (node-to-node → segment-to-segment).
-
-## Demos
-
-```bash
-julia --project=. scripts/contact_pohrt_li.jl              # 3D surface Hertz + partial slip
-julia --project=. scripts/hertz_line_2d.jl                 # 2D Flamant vs Hertz cylinder
-julia --project=. scripts/cattaneo_mindlin_compare.jl     # Loyola Cattaneo–Mindlin 4 models
-julia --project=. scripts/multibody_contact_ntn_nts.jl    # two-block elasticity NTN vs NTS
-julia --project=. scripts/two_regions_interface.jl         # multi-region type-3
-julia --project=. scripts/compare_contact_acceleration.jl # paper figures (PDF)
-```
-
-Paper draft: `OneDrive/artigos/escritos/2026/BEM-wear/main.tex`.
-Thesis: `OneDrive/banca/221/2022-Fernando_Loyola.pdf`.
+Demos: `scripts/contact/cattaneo_mindlin_compare.jl`,
+`scripts/contact/contact_pohrt_li.jl`, `scripts/contact/hertz_line_2d.jl`.

@@ -1,8 +1,8 @@
-# Center crack — Gmsh (BC type 5) + format2d discontinuous + dual BEM
+# Center crack — Gmsh (BC type 5) + format2d discontinuous + dual BEM on BEMdata
 using DrWatson
 @quickactivate :BEM
+using BEM.Crack
 using .Crack
-include(datadir("elastico", "iso", "center_crack.jl"))
 
 println("="^60)
 println(" Example: center crack Feddersen KI (Gmsh type-5 + dual BEM)")
@@ -11,20 +11,16 @@ println("="^60)
 W, H, a, σ = 5.0, 10.0, 1.0, 1.0
 E, ν = 3000.0, 0.2
 
-msh = mesh_center_crack(; W=W, H=H, a=a, ndiv_b=8, ndiv_h=12, ndiv_crack=12,
-    σ=σ, ordem=2, show=false)
-dad = format2d(msh, Elasticity(E, ν, 1.0; plane_strain=true); tipo=2, pontointerno=false)
+dad = dual_elasticity_problem(; W=W, H=H, a=a, E=E, ν=ν, σ=σ,
+    ndiv_b=8, ndiv_h=12, ndiv_crack=12, ordem=2, nome="center_crack")
 println(dad)
-println("  crack DOFs (type 5): ", count(==(Crack.CRACK_BC), dad.BC))
+println("  crack DOFs (type 5 rewritten): ", count(i -> dad.eq_type[i] in (2, 3), 1:dad.n))
 
-mesh = dual_mesh_from_bemdata(dad)
-# RBM pins
-BEM.Crack._pin_plate_rbm!(mesh; W=W, H=H)
-assemble_dual!(mesh; npg=10)
-solve_dual!(mesh)
+assemble_dual!(dad; npg=10, threaded=false)
+solve_dual!(dad; threaded=false)
 
-KI_L, KII_L = sif_cod_dual(mesh, mesh.tip_nodes[1])
-KI_R, KII_R = sif_cod_dual(mesh, mesh.tip_nodes[2])
+KI_L, KII_L = sif_cod_dual(dad, dad.tip_nodes[1])
+KI_R, KII_R = sif_cod_dual(dad, dad.tip_nodes[2])
 KIana = analytical_KI_center_crack(σ, a; W=W)
 KIn = 0.5 * (abs(KI_L) + abs(KI_R))
 err = abs(KIn - KIana) / KIana

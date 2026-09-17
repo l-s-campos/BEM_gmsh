@@ -1,3 +1,5 @@
+using DrWatson: datadir
+
 # Two rectangular subregions sharing a vertical interface (type-3 BC)
 # Left:  [0,0.5]×[0,1], Right: [0.5,1]×[0,1]
 # Exterior: left wall Dirichlet 0, right wall Dirichlet 1, top/bottom insulated
@@ -64,13 +66,37 @@ function mesh_two_regions(; ndiv=8, nome="two_regions", show=false)
 end
 
 """
+Piecewise-linear exact temperature for two perfectly bonded slabs:
+
+- left ``[0, xif]`` conductivity `kL`, right ``[xif, 1]`` conductivity `kR`
+- ``T(0)=0``, ``T(1)=1``, insulated top/bottom (1-D conduction)
+
+```
+Tif = kR xif / (kL (1-xif) + kR xif)
+T(x) = Tif (x/xif)                          x ≤ xif
+     = Tif + (1-Tif) (x-xif)/(1-xif)        x ≥ xif
+```
+"""
+function ana_two_layer_T(x, kL, kR; xif=0.5)
+    Tif = kR * xif / (kL * (1 - xif) + kR * xif)
+    return x <= xif + 1e-14 ? Tif * (x / xif) :
+           Tif + (1 - Tif) * (x - xif) / (1 - xif)
+end
+
+"""
 Build two BEMdata regions from a single two-region mesh by selecting elements
 whose midpoint lies in x≤0.5 (left) or x≥0.5 (right).
+
+Pass two [`Laplace`](@ref) properties for a contrast interface; a single
+`props` is used on both sides.
 """
-function load_two_regions(msh, props::Laplace; ndiv_hint=8)
+load_two_regions(msh, props::Laplace; ndiv_hint=8) =
+    load_two_regions(msh, props, props; ndiv_hint=ndiv_hint)
+
+function load_two_regions(msh, propsL::Laplace, propsR::Laplace; ndiv_hint=8)
     # Load full boundary once, then split elements by region.
     # Interface (BC type 3) is assigned by outward normal: +x → left region, −x → right.
-    dad_all = format2d(msh, props; pontointerno=false)
+    dad_all = format2d(msh, propsL; pontointerno=false)
     left_elems = Element[]
     right_elems = Element[]
     for e in dad_all.elements
@@ -89,7 +115,7 @@ function load_two_regions(msh, props::Laplace; ndiv_hint=8)
             push!(right_elems, e)
         end
     end
-    function _subset(elems, name)
+    function _subset(elems, name, props)
         # renumber nodes compactly
         old = sort(unique(vcat([e.index for e in elems]...)))
         map_n = Dict(old[i] => i for i in eachindex(old))
@@ -104,9 +130,9 @@ function load_two_regions(msh, props::Laplace; ndiv_hint=8)
         end
         n = length(Nodes)
         return BEMdata(name, 2, new_elems, dad_all.element_type, dad_all.elem_weight,
-                       Nodes, Normal, Point2D[], props, BC, BV, n, 0, n, BEMCache())
+                       Nodes, Normal, props, BC, BV, n, 0, n, BEMCache())
     end
-    dadL = _subset(left_elems, "left")
-    dadR = _subset(right_elems, "right")
+    dadL = _subset(left_elems, "left", propsL)
+    dadR = _subset(right_elems, "right", propsR)
     return MultiRegionProblem([dadL, dadR]; name="two_regions")
 end

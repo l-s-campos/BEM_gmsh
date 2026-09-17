@@ -1,0 +1,50 @@
+empirical t ~ N^α  (last up to 4 points, ≥3 required)
+generated 2026-09-03T20:29:03.210
+
+2D volume
+method          geom       α_asm    α_mv
+full            volume      1.87    2.64
+hmatrix         volume      1.76    1.54
+h2_proxy_aca    volume      0.91    1.23
+h2_nca          volume      0.93    1.30
+h2_nnca         volume      1.27    1.32
+h2_proxy_dense  volume      0.92    1.32
+h2_hara         volume      3.65    1.82
+h2_fmm          volume      2.78    1.74
+fmm             volume      0.90    0.85
+
+2D boundary
+method          geom       α_asm    α_mv
+full            boundary    1.87    2.85
+hmatrix         boundary    1.12    1.28
+h2_proxy_aca    boundary    1.63    1.13
+h2_nca          boundary    0.99    1.09
+h2_nnca         boundary    1.04    0.74
+h2_proxy_dense  boundary    1.05    1.12
+h2_hara         boundary    3.23    1.36
+h2_fmm          boundary    1.80    1.46
+fmm             boundary    0.87    0.74
+
+3D volume
+method          geom       α_asm    α_mv
+full            volume      2.02    2.88
+hmatrix         volume      1.62    1.63
+h2_proxy_aca    volume      0.80    1.45
+h2_nca          volume      1.38    1.56
+h2_nnca         volume      1.50    1.48
+h2_proxy_dense  volume      1.10    1.73
+h2_hara         volume       NaN     NaN
+fmm             volume      0.99    1.41
+
+3D boundary
+method          geom       α_asm    α_mv
+full            boundary    1.98    2.63
+hmatrix         boundary    1.53    1.45
+h2_proxy_aca    boundary    0.93    1.05
+h2_nca          boundary    0.89    1.00
+h2_nnca         boundary    1.29    1.02
+h2_proxy_dense  boundary    0.68    1.08
+h2_hara         boundary     NaN     NaN
+h2_fmm          boundary     NaN     NaN
+fmm             boundary    0.69    1.01
+

@@ -10,13 +10,26 @@ using StaticArrays: MMatrix, MArray
 
 2D Kelvin fundamental solution (plane strain / mapped plane stress).
 
-Uses [`Tensorial.Mat`](@ref) for the displacement (`U`) and traction (`T`)
+Uses `Tensorial.Mat` for the displacement (`U`) and traction (`T`)
 tensors. Legacy: `calsolfund` for `elastico`.
 """
+function fundamental_U(props::Elasticity, r::SVector{2})
+    ν = effective_nu(props)
+    μ = props.mu
+    R2 = _R2(r)
+    R = sqrt(R2)
+    dr = _to_vec(r) / R
+    prod1 = 4π * (1 - ν)
+    prod2 = (3 - 4ν) * log(1 / R)
+    base = 2 * prod1 * μ
+    return (prod2 * _I2 + _otimes(dr, dr)) / base
+end
+
 function fundamental(props::Elasticity, r::SVector{2}, n::SVector{2})
     ν = effective_nu(props)
     μ = props.mu
-    R = _R(r)
+    R2 = _R2(r)
+    R = sqrt(R2)
     dr = _to_vec(r) / R
     n̂ = _to_vec(n)
     drdn = _dot(dr, n̂)
@@ -49,10 +62,20 @@ end
 """
 3D Kelvin fundamental solution.
 """
-function fundamental(props::Elasticity, r::SVector{3}, n::SVector{3})
+function fundamental_U(props::Elasticity, r::SVector{3})
     ν = props.nu
     μ = props.mu
     R = _R(r)
+    dr = _to_vec(r) / R
+    cU = 1 / (16π * μ * (1 - ν) * R)
+    return cU * ((3 - 4ν) * _I3 + _otimes(dr, dr))
+end
+
+function fundamental(props::Elasticity, r::SVector{3}, n::SVector{3})
+    ν = props.nu
+    μ = props.mu
+    R2 = _R2(r)
+    R = sqrt(R2)
     dr = _to_vec(r) / R
     n̂ = _to_vec(n)
     drdn = _dot(dr, n̂)
@@ -133,8 +156,106 @@ function fundamental_stress(props::Elasticity, r::SVector{2}, n::SVector{2})
     return StressKernels(DT, ST)
 end
 
+"""
+3-D Kelvin stress kernels `D`, `S` (Aliabadi / Kane):
+
+```math
+σ_{ij}(x) = D_{kij}(r,n)\\,t_k - S_{kij}(r,n)\\,u_k
+```
+"""
+function fundamental_stress(props::Elasticity, r::SVector{3}, n::SVector{3})
+    ν = props.nu
+    μ = props.mu
+    R = _R(r)
+    dr = _to_vec(r) / R
+    n̂ = _to_vec(n)
+    drdn = _dot(dr, n̂)
+    fat1 = 8π * (1 - ν)
+    fat2 = 1 - 2ν
+    D = MArray{Tuple{3,3,3},Float64}(undef)
+    S = MArray{Tuple{3,3,3},Float64}(undef)
+    @inbounds for k in 1:3, i in 1:3, j in 1:3
+        δki = i == k ? 1.0 : 0.0
+        δkj = j == k ? 1.0 : 0.0
+        δij = i == j ? 1.0 : 0.0
+        d1 = fat2 * (δki * dr[j] + δkj * dr[i] - δij * dr[k])
+        d2 = 3 * dr[i] * dr[j] * dr[k]
+        D[k, i, j] = (d1 + d2) / (fat1 * R^2)
+
+        t1 = 3 * drdn * (fat2 * δij * dr[k] + ν * (δki * dr[j] + δkj * dr[i]) -
+                         5 * dr[i] * dr[j] * dr[k])
+        t2 = 3ν * (n̂[i] * dr[j] * dr[k] + n̂[j] * dr[i] * dr[k])
+        t3 = fat2 * (3 * n̂[k] * dr[i] * dr[j] + n̂[j] * δki + n̂[i] * δkj) -
+             (1 - 4ν) * n̂[k] * δij
+        S[k, i, j] = (t1 + t2 + t3) * μ / (4π * (1 - ν) * R^3)
+    end
+    @inbounds for k in 1:3
+        D[k, 2, 1] = D[k, 1, 2]
+        D[k, 3, 1] = D[k, 1, 3]
+        D[k, 3, 2] = D[k, 2, 3]
+        S[k, 2, 1] = S[k, 1, 2]
+        S[k, 3, 1] = S[k, 1, 3]
+        S[k, 3, 2] = S[k, 2, 3]
+    end
+    DT = Tensor{Tuple{3,3,3},Float64}(Tuple(D))
+    ST = Tensor{Tuple{3,3,3},Float64}(Tuple(S))
+    return StressKernels(DT, ST)
+end
+
 fundamental_stress(dad::BEMdata{<:Elasticity}, r, n) =
     fundamental_stress(dad.properties, r, n)
+
+"""
+    fundamental_hyper(props::Elasticity, r, n, nf) -> KernelPair
+
+2D Kelvin traction BIE kernels: contract the stress tensors `D,S` with the
+**collocation** normal `nf`.
+
+```math
+U^h_{ik} = n^ξ_j D_{kij},\\qquad T^h_{ik} = n^ξ_j S_{kij}
+```
+
+Same contraction as Dual BEM (`kelvin_DS` → `n_ξ · {D,S}`). Guiggiani orders
+for this pair are `(-1, -2)`.
+"""
+function fundamental_hyper(props::Elasticity, r::SVector{2}, n::SVector{2}, nf::SVector{2})
+    sk = fundamental_stress(props, r, n)
+    D, S = sk.D, sk.S
+    n1, n2 = nf[1], nf[2]
+    u11 = n1 * D[1, 1, 1] + n2 * D[1, 1, 2]
+    u12 = n1 * D[2, 1, 1] + n2 * D[2, 1, 2]
+    u21 = n1 * D[1, 2, 1] + n2 * D[1, 2, 2]
+    u22 = n1 * D[2, 2, 1] + n2 * D[2, 2, 2]
+    t11 = n1 * S[1, 1, 1] + n2 * S[1, 1, 2]
+    t12 = n1 * S[2, 1, 1] + n2 * S[2, 1, 2]
+    t21 = n1 * S[1, 2, 1] + n2 * S[1, 2, 2]
+    t22 = n1 * S[2, 2, 1] + n2 * S[2, 2, 2]
+    return KernelPair(@Mat([u11 u12; u21 u22]), @Mat([t11 t12; t21 t22]))
+end
+
+function fundamental_hyper(dad::BEMdata{<:Elasticity}, r, n, nf)
+    kp = fundamental_hyper(dad.properties, r, n, nf)
+    return _to_smat(kp.U), _to_smat(kp.T)
+end
+
+"""3-D Kelvin traction BIE: ``U^h_{ik}=n^ξ_j D_{kij}``, ``T^h_{ik}=n^ξ_j S_{kij}``."""
+function fundamental_hyper(props::Elasticity, r::SVector{3}, n::SVector{3}, nf::SVector{3})
+    sk = fundamental_stress(props, r, n)
+    D, S = sk.D, sk.S
+    Uh = zeros(MMatrix{3,3,Float64})
+    Th = zeros(MMatrix{3,3,Float64})
+    @inbounds for i in 1:3, k in 1:3
+        u = 0.0
+        t = 0.0
+        for j in 1:3
+            u += nf[j] * D[k, i, j]
+            t += nf[j] * S[k, i, j]
+        end
+        Uh[i, k] = u
+        Th[i, k] = t
+    end
+    return KernelPair(Mat{3,3}(Tuple(Uh)), Mat{3,3}(Tuple(Th)))
+end
 
 # =============================================================================
 # Gradients of U and T  (∂/∂x, ∂/∂y of the Kelvin kernels)
@@ -203,6 +324,57 @@ fundamental_grad(dad::BEMdata{<:Elasticity}, r, n) =
 # =============================================================================
 
 """
+    lekhnitskii_engineering(E1, E2, G12, ν12; η12_1=0, η12_2=0, plane_strain=false, kwargs...)
+
+Full 2-D anisotropic compliance from engineering constants (Ting / Lekhnitskii):
+
+```math
+D_{11}=1/E_1,\\; D_{22}=1/E_2,\\; D_{12}=-ν_{12}/E_1,\\;
+D_{66}=1/G_{12},\\; D_{16}=η_{12,1}/E_1,\\; D_{26}=η_{12,2}/E_2.
+```
+
+`ν12` is ``-ε_2/ε_1`` under uniaxial ``σ_1`` (the large Poisson). Cordeiro
+2015 writes it as ``ν_{yx}=0.344``; EABE 2020 Table 1 as ``ν_{21}=0.334``.
+``D_{12}=-ν_{12}/E_1``. Literal ``-ν_{yx}/E_y`` is not positive definite.
+
+Plane strain (`plane_strain=true`) uses ``D^*_{ij}=D_{ij}-D_{i3}D_{j3}/D_{33}``
+with optional `E3` (default `E2`). Listed `ν31`,`ν32` are taken as
+``ν_{13},ν_{23}`` so ``D_{13}=-ν_{31}/E_1``, ``D_{23}=-ν_{32}/E_2``
+(Cordeiro EPD: ``ν_{zx}=0.40``, ``ν_{zy}=0.25``, ``η_{xy,z}=0.50``).
+"""
+function lekhnitskii_engineering(
+        E1::Real, E2::Real, G12::Real, ν12::Real;
+        η12_1::Real=0, η12_2::Real=0,
+        plane_strain::Bool=false,
+        E3::Real=E2, ν31::Real=0, ν32::Real=0, η12_3::Real=0,
+    )
+    T = float(promote_type(typeof(E1), typeof(E2), typeof(G12), typeof(ν12)))
+    D11 = T(1) / T(E1)
+    D22 = T(1) / T(E2)
+    D12 = -T(ν12) / T(E1)
+    D66 = T(1) / T(G12)
+    D16 = T(η12_1) / T(E1)
+    D26 = T(η12_2) / T(E2)
+    D = @SMatrix [
+        D11 D12 D16
+        D12 D22 D26
+        D16 D26 D66
+    ]
+    if plane_strain
+        # D13=-ν13/E1=-ν31/E3. Cordeiro lists ν31,ν32 without E3; using
+        # −ν31/E3 with E3=E2 makes D* indefinite (νzx=0.40, Ey=10 GPa).
+        # Take the listed values as ν13, ν23 (Maxwell on Ex, Ey).
+        D33 = T(1) / T(E3)
+        D13 = -T(ν31) / T(E1)
+        D23 = -T(ν32) / T(E2)
+        D36 = T(η12_3) / T(E3)
+        v3 = SVector{3,T}(D13, D23, D36)
+        D = D - (v3 * v3') / D33
+    end
+    return lekhnitskii_params(inv(D))
+end
+
+"""
     lekhnitskii_params(E1, E2, G12, ν12; θ_deg=0) -> LekhnitskiiParams
 
 Build Lekhnitskii complex parameters from orthotropic engineering constants
@@ -242,15 +414,15 @@ function lekhnitskii_params(C::AbstractMatrix)
     a11, a12, a16 = compliance[1, 1], compliance[1, 2], compliance[1, 3]
     a22, a26, a66 = compliance[2, 2], compliance[2, 3], compliance[3, 3]
 
-    # characteristic polynomial a22 μ⁴ - 2 a26 μ³ + (2a12+a66) μ² - 2 a16 μ + a11 = 0
-    # roots via companion / Polynomials-free quartic through eigen of companion matrix
-    # p(μ) = a22 μ^4 + b μ^3 + c μ^2 + d μ + e
-    b = -2a26
+    # Lekhnitskii / Cordeiro eq. (10), z = x₁ + μ x₂:
+    #   a11 μ⁴ − 2 a16 μ³ + (2 a12 + a66) μ² − 2 a26 μ + a22 = 0
+    # The swapped quartic a22 μ⁴ + ⋯ + a11 is the reciprocal polynomial
+    # (roots 1/μ). It coincides with this one only when a11 = a22 (isotropy).
+    b = -2a16
     c = 2a12 + a66
-    d = -2a16
-    e = a11
-    # companion matrix of a22 μ^4 + b μ^3 + c μ^2 + d μ + e
-    a = a22
+    d = -2a26
+    e = a22
+    a = a11
     companion = @SMatrix [
         0        0        0       -e/a
         1        0        0       -d/a
@@ -296,6 +468,26 @@ function lekhnitskii_params(C::AbstractMatrix)
         -1     -1
     ]
     return LekhnitskiiParams{T}(mi, A, q, g, C)
+end
+
+"""
+    lekhnitskii_rotate(p::LekhnitskiiParams, α) -> LekhnitskiiParams
+
+Rebuild Lekhnitskii parameters in axes rotated by `α` (new ``x_1`` at angle
+`α` from the current ``x_1``). Roots satisfy
+``μ'=(μ\\cosα-\\sinα)/(\\cosα+μ\\sinα)``.
+"""
+function lekhnitskii_rotate(p::LekhnitskiiParams, α::Real)
+    abs(α) < 1e-15 && return p
+    m, n = cos(α), sin(α)
+    Rot = @SMatrix [
+        m^2   n^2    2m*n
+        n^2   m^2   -2m*n
+       -m*n   m*n    m^2-n^2
+    ]
+    Ctip = Rot * p.C * transpose(Rot)
+    Ctip = (Ctip + transpose(Ctip)) / 2
+    return lekhnitskii_params(Ctip)
 end
 
 """
@@ -384,6 +576,35 @@ function fundamental_stress(
         Tensor{Tuple{2,2,2},Float64}(Tuple(D)),
         Tensor{Tuple{2,2,2},Float64}(Tuple(S)),
     )
+end
+
+"""
+    fundamental_hyper(props::AnisotropicElasticity, y, x, n, nf) -> KernelPair
+
+Traction BIE kernels: ``U^h_{ik}=n^ξ_j D_{kij}``, ``T^h_{ik}=n^ξ_j S_{kij}``
+(Cordeiro & Leonel 2020). Guiggiani orders `(-1, -2)`.
+"""
+function fundamental_hyper(
+        props::AnisotropicElasticity,
+        y::SVector{2}, x::SVector{2}, n::SVector{2}, nf::SVector{2},
+    )
+    sk = fundamental_stress(props, y, x, n)
+    D, S = sk.D, sk.S
+    n1, n2 = nf[1], nf[2]
+    u11 = n1 * D[1, 1, 1] + n2 * D[1, 1, 2]
+    u12 = n1 * D[2, 1, 1] + n2 * D[2, 1, 2]
+    u21 = n1 * D[1, 2, 1] + n2 * D[1, 2, 2]
+    u22 = n1 * D[2, 2, 1] + n2 * D[2, 2, 2]
+    t11 = n1 * S[1, 1, 1] + n2 * S[1, 1, 2]
+    t12 = n1 * S[2, 1, 1] + n2 * S[2, 1, 2]
+    t21 = n1 * S[1, 2, 1] + n2 * S[1, 2, 2]
+    t22 = n1 * S[2, 2, 1] + n2 * S[2, 2, 2]
+    return KernelPair(@Mat([u11 u12; u21 u22]), @Mat([t11 t12; t21 t22]))
+end
+
+function fundamental_hyper(dad::BEMdata{<:AnisotropicElasticity}, r, n, nf)
+    kp = fundamental_hyper(dad.properties, r, zero(r), n, nf)
+    return _to_smat(kp.U), _to_smat(kp.T)
 end
 
 # =============================================================================

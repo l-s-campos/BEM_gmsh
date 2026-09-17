@@ -1,0 +1,144 @@
+/* fsdt_radial_maxima.mac
+ *
+ * Radial primitives for FSDT RIM / DIBEM:
+ *   F_ij(R, e) = ∫_0^R U*_ij(ρ e) ρ dρ
+ *
+ * Isotropic: Vander Weeën / Reissner (MATLAB kernelsHGC).
+ * Anisotropic: Wang plane-wave φ (MATLAB KernelP), then θ-quadrature.
+ *
+ * Run:
+ *   maxima --very-quiet --batch=scripts/plates/fsdt_radial_maxima.mac
+ *
+ * Julia ports: BEM.Plate._reissner_Fρ, _wang_Fρ  (src/Plate/FSDT.jl)
+ */
+display2d: false$
+ratprint: false$
+assume(z > 0, p > 0, rho > 0, s > 0, R > 0, lambda > 0)$
+
+print("======== 1. Bessel identities (Reissner Az, Bz) ========")$
+K0: bessel_k(0, z)$
+K1: bessel_k(1, z)$
+/* recurrence K2 = K0 + 2 K1/z  ⇒  d/dz (z K1) = -z K0 */
+d_zK1: ratsimp(diff(z*K1, z))$
+print("d/dz (z K1) expanded =", expand(d_zK1))$
+print("use K2 = K0 + 2 K1/z:")$
+print("  d/dz (z K1) + z K0  (should be 0 after recurrence) — applied by hand")$
+print("∫ z K0 dz = -z K1")$
+print("∫ K1 dz = -K0")$
+
+Az: K0 + 2/z*(K1 - 1/z)$
+Bz: K0 + 1/z*(K1 - 1/z)$
+/* Az z = z K0 + 2 K1 - 2/z ;  Bz z = z K0 + K1 - 1/z */
+FAz: -z*K1 - 2*K0 - 2*log(z)$
+FBz: -z*K1 - K0 - log(z)$
+print("d FAz/dz - Az*z =", ratsimp(diff(FAz, z) - Az*z))$
+print("d FBz/dz - Bz*z =", ratsimp(diff(FBz, z) - Bz*z))$
+
+print("small-z: K0 ~ -log(z/2)-%gamma,  z K1 → 1")$
+print("  FAz(0+) = -1 - 2 log 2 + 2 %gamma")$
+print("  FBz(0+) = -1 - log 2 + %gamma")$
+print("∫_0^Z Az z dz = FAz(Z) - FAz(0+)")$
+print("  = -Z K1(Z) - 2 K0(Z) - 2 log Z + 1 + 2 log 2 - 2 %gamma")$
+print("∫_0^Z Bz z dz = FBz(Z) - FBz(0+)")$
+print("  = -Z K1(Z) - K0(Z) - log Z + 1 + log 2 - %gamma")$
+
+print("elementary:")$
+print("∫ z log z dz =", integrate(z*log(z), z))$
+print("∫ z^2 log z dz =", integrate(z^2*log(z), z))$
+print("∫ z^3 log z dz =", integrate(z^3*log(z), z))$
+print("∫ z^n dz at 0 vanishes for n>=1; z^2 log z → 0")$
+
+print("")$
+print("Reissner U, z=λρ, ρ dρ = z dz / λ², n1=DRx, n2=DRy constant on the ray:")$
+print("k2=8 π D, om=1-ν")$
+print("U11 = 1/(k2 om) * (8 Bz - om (2 log z - 1) - (8 Az + 2 om) n1^2)")$
+print("F11 = 1/(k2 om λ²) * (8 IBz - 8 n1^2 IAz + om(1-2 n1^2) Z²/2")$
+print("                     - 2 om (Z²/2 log Z - Z²/4))")$
+print("U12 = -1/(k2 om) (8 Az + 2 om) n1 n2")$
+print("F12 = -n1 n2 /(k2 om λ²) * (8 IAz + om Z²)")$
+print("U13 = 1/k2 (2 log z - 1) (z/λ) n1")$
+print("F13 = n1/(k2 λ³) * ((2/3) Z³ log Z - (5/9) Z³)")$
+print("U33 = 1/(k2 om λ²) (om z² (log z - 1) - 8 log z)")$
+print("F33 = 1/(k2 om λ⁴) * (om (Z⁴/4 log Z - Z⁴/16 - Z⁴/4)")$
+print("                     - 8 (Z²/2 log Z - Z²/4))")$
+print("F31=-F13, F32=-F23, F22 like F11 with n2.")$
+
+print("")$
+print("======== 2. Wang φ (KernelP) ========")$
+A0: exp(s)*expintegral_e(1,s) - exp(-s)*expintegral_ei(s)$
+A1: exp(s)*expintegral_e(1,s) + exp(-s)*expintegral_ei(s)$
+/* ∫ s e^s E1 ds and ∫ s e^{-s} Ei ds by parts */
+JsE1: (s-1)*exp(s)*expintegral_e(1,s) - log(s) + s$
+JsEi: -(s+1)*exp(-s)*expintegral_ei(s) + log(s) + s$
+print("d/ds JsE1 - s e^s E1 =", ratsimp(diff(JsE1,s) - s*exp(s)*expintegral_e(1,s)))$
+print("d/ds JsEi - s e^{-s} Ei =", ratsimp(diff(JsEi,s) - s*exp(-s)*expintegral_ei(s)))$
+
+/* ∫ A0 ρ dρ, s=p ρ, ρ dρ = s ds / p² */
+IA0: (1/p^2) * (JsE1 - ( -(s+1)*exp(-s)*expintegral_ei(s) + log(s) + s ))$
+IA0: ratsimp((1/p^2)*((s-1)*exp(s)*expintegral_e(1,s) + (s+1)*exp(-s)*expintegral_ei(s) - 2*log(s)))$
+IA1: ratsimp((1/p^2)*((s-1)*exp(s)*expintegral_e(1,s) - (s+1)*exp(-s)*expintegral_ei(s) + 2*s))$
+print("IA0 = ∫ A0 ρ dρ = (1/p²)[(s-1) e^s E1 + (s+1) e^{-s} Ei - 2 log s]")$
+print("IA1 = ∫ A1 ρ dρ = (1/p²)[(s-1) e^s E1 - (s+1) e^{-s} Ei + 2 s]")$
+
+/* φ = Cf * phi0,  phi0 = p² ρ² log ρ + 2 log ρ + 3 + A0 */
+/* d1 = 2 p² ρ log ρ + p² ρ + p A1 */
+/* d2 = 2 p² log ρ + 3 p² + p² A0 */
+/* d3 = p³ A1,  d4 = p⁴ A0 */
+Iphi0: p^2*(rho^4/4*log(rho) - rho^4/16) + 2*(rho^2/2*log(rho) - rho^2/4) + 3*rho^2/2
+       + (1/p^2)*((s-1)*exp(s)*expintegral_e(1,s) + (s+1)*exp(-s)*expintegral_ei(s) - 2*log(s))$
+Id1u: 2*p^2*(rho^3/3*log(rho) - rho^3/9) + p^2*rho^3/3
+      + (1/p)*((s-1)*exp(s)*expintegral_e(1,s) - (s+1)*exp(-s)*expintegral_ei(s) + 2*s)$
+Id2u: p^2*rho^2*log(rho) - p^2*rho^2/2 + 3*p^2*rho^2/2
+      + ((s-1)*exp(s)*expintegral_e(1,s) + (s+1)*exp(-s)*expintegral_ei(s) - 2*log(s))$
+Id3u: p*((s-1)*exp(s)*expintegral_e(1,s) - (s+1)*exp(-s)*expintegral_ei(s) + 2*s)$
+Id4u: p^2*((s-1)*exp(s)*expintegral_e(1,s) + (s+1)*exp(-s)*expintegral_ei(s) - 2*log(s))$
+
+/* substitute s=p*rho for differentiation vs rho */
+Iphi0s: subst(s=p*rho, Iphi0)$
+Id1s: subst(s=p*rho, Id1u)$
+Id2s: subst(s=p*rho, Id2u)$
+Id3s: subst(s=p*rho, Id3u)$
+Id4s: subst(s=p*rho, Id4u)$
+phi0: p^2*rho^2*log(rho) + 2*log(rho) + 3 + subst(s=p*rho, A0)$
+d1: 2*p^2*rho*log(rho) + p^2*rho + p*subst(s=p*rho, A1)$
+d2: 2*p^2*log(rho) + 3*p^2 + p^2*subst(s=p*rho, A0)$
+d3: p^3*subst(s=p*rho, A1)$
+d4: p^4*subst(s=p*rho, A0)$
+print("d Iphi0 / dρ - φ0 ρ  (expect 0):", ratsimp(diff(Iphi0s, rho) - phi0*rho))$
+print("d Id1 / dρ - d1 ρ:", ratsimp(diff(Id1s, rho) - d1*rho))$
+print("d Id2 / dρ - d2 ρ:", ratsimp(diff(Id2s, rho) - d2*rho))$
+print("d Id3 / dρ - d3 ρ:", ratsimp(diff(Id3s, rho) - d3*rho))$
+print("d Id4 / dρ - d4 ρ:", ratsimp(diff(Id4s, rho) - d4*rho))$
+
+print("")$
+print("small-s expansions of the expint groups (s=p ρ):")$
+E1s: -%gamma - log(s) + s - s^2/4 + s^3/18$
+Eis:  %gamma + log(s) + s + s^2/4 + s^3/18$
+es: 1 + s + s^2/2 + s^3/6$
+ems: 1 - s + s^2/2 - s^3/6$
+G0: (s-1)*es*E1s + (s+1)*ems*Eis - 2*log(s)$
+G1: (s-1)*es*E1s - (s+1)*ems*Eis + 2*s$
+print("G0 = (s-1)e^s E1 + (s+1)e^{-s} Ei - 2 log s  →", taylor(G0, s, 0, 1))$
+print("G1 = (s-1)e^s E1 - (s+1)e^{-s} Ei + 2 s     →", taylor(G1, s, 0, 1))$
+print("I_n(0+):")$
+print("  ∫d4 ρ : Cf * p² * G0  →  Cf p² * 2 %gamma")$
+print("  ∫d3 ρ : Cf * p  * G1  →  0")$
+print("  ∫d2 ρ : Cf * (p² ρ² log ρ + p² ρ² + G0) → Cf * 2 %gamma")$
+print("  ∫d1 ρ : → 0")$
+print("  ∫φ  ρ : Cf * (p² ρ⁴/4 log ρ + ρ² log ρ + ρ² - p² ρ⁴/16 + G0/p²)")$
+print("          → Cf * 2 %gamma / p²")$
+
+print("")$
+print("Wang Ũ (θ-fixed) uses d0=φ, d1..d4; F̃ = same combo with ∫ d_n ρ dρ.")$
+print("Then F = θ-quadrature of F̃ (same Telles two-quadrant rule as KernelP).")$
+
+print("")$
+print("======== 3. RBF radial (DIBEM IF) ========")$
+print("∫_0^R ρ dρ = R^2/2          (φ=1)")$
+print("∫_0^R ρ² dρ = R^3/3         (φ=r)")$
+print("∫_0^R (1+ρ) ρ dρ = R^2/2 + R^3/3")$
+print("∫_0^R (1-ρ) ρ dρ = R^2/2 - R^3/3   (MATLAB laminate F)")$
+print("∫_0^R (r - λ² r³/9) ρ dρ  is not a function of R only unless the")$
+print("  RBF centre is the source; DIBEM uses φ(|x-x_j|) RIM from each ξ.")$
+print("done.")$
+quit()$

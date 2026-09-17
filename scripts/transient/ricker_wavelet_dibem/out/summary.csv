@@ -1,0 +1,2 @@
+solver,ndiv,n,ni,nt,dx,nneg,ok,maxabs,nmodes,omega1,t_asm,t_sol,recv_dibem_mean,recv_trixi_mean,dibem_0_4_0_0_,trixi_0_4_0_0_,dibem_vs_trixi_0_4_0_0_,dibem_0_7_0_0_,trixi_0_7_0_0_,dibem_vs_trixi_0_7_0_0_,dibem_0_5_0_5_,trixi_0_5_0_5_,dibem_vs_trixi_0_5_0_5_
+newmark,64,504,3969,4473,4.76190476e-02,-1,1,1.16816166e-01,0,NaN,11.6723,54.3429,5.35906928e-04,2.29393720e-04,4.63884005e-04,2.71287633e-04,2.31284038e-04,6.12142485e-04,2.90323741e-04,2.09008399e-03,5.31694295e-04,1.26569787e-04,1.15203516e-03

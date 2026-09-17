@@ -1,11 +1,15 @@
 # Analytical solutions
 
-_See source docstrings in `src/` (HTML `@docs` disabled in lightweight build)._
+Attach a field with [`attach_analytical!`](@ref) then [`rel_error`](@ref)
+(primal) / [`rel_error_flux`](@ref) (flux or traction; use this when all
+BCs are Dirichlet).
 
-Typical verification pattern:
-
-```julia
-attach_analytical!(dad, ana_laplace_linear(; direction=SA[1.0, 0.0]))
-solve(dad)
-err = rel_error(dad)
+```@docs
+AnalyticalSolution
+attach_analytical!
+apply_analytical_bc!
+rel_error
+rel_error_flux
+ana_laplace_linear
+ana_elasticity_patch
 ```

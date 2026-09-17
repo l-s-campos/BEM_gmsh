@@ -1,9 +1,12 @@
 # Visualization
 
-_See source docstrings in `src/` (HTML `@docs` disabled in lightweight build)._
+Geometry, BC glyphs, and H-matrix block plots use **Plots.jl** (GR).
+Field contours go through Gmsh / VTK.
 
-`plot_geo` draws:
+```@docs
+plot_geo
+export_results_to_gmsh
+export_vtk
+```
 
-- element edges and collocation / internal nodes
-- **Dirichlet** dofs as inward triangles (color = prescribed value)
-- **Neumann** dofs as arrows (length scaled to `arrow_scale`)
+`plot_hmatrix` lives in `BEM.HMatrices` (`using BEM.HMatrices: plot_hmatrix`).

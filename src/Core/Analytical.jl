@@ -1,7 +1,8 @@
 export AnalyticalSolution, analytical, attach_analytical!, apply_analytical_bc!, rel_error
-export ana_laplace_linear, ana_laplace_quadratic
+export analytical_flux, rel_error_flux
+export ana_laplace_linear, ana_laplace_quadratic, ana_aniso_quadratic, ana_aniso_poisson_sin, ana_poisson_r2
 export ana_heat_1d, ana_heat_insulated_sides, ana_heat_dirichlet_square
-export ana_elasticity_patch
+export ana_elasticity_patch, ana_aniso3d_patch
 export ana_potencial1d, ana_quarto_circ, ana_moulton, ana_laquini1, ana_laquini2, ana_laquini3
 # Wave-propagation analytics/meshes: data/Laplace/wave_propagation.jl (include from scripts)
 
@@ -49,11 +50,12 @@ function analytical(dad::BEMdata; t=0.0)
     return _eval_ana_points(ana, pts, dad; t=t)
 end
 
-function _eval_ana_points(ana::AnalyticalSolution, pts, dad::BEMdata{<:Laplace}; t=0.0)
+function _eval_ana_points(ana::AnalyticalSolution, pts, dad::BEMdata{<:LaplaceLike}; t=0.0)
     return [float(ana.u(p; t=t)) for p in pts]
 end
 
-function _eval_ana_points(ana::AnalyticalSolution, pts, dad::BEMdata{<:Elasticity}; t=0.0)
+function _eval_ana_points(ana::AnalyticalSolution, pts,
+        dad::BEMdata{<:Union{Elasticity,AnisotropicElasticity,AnisotropicElasticity3D}}; t=0.0)
     dim = dad.dimension
     out = zeros(dim * length(pts))
     for (i, p) in enumerate(pts)
@@ -79,7 +81,7 @@ end
 Overwrite `dad.BC` / `dad.BV` with Dirichlet data from the analytical primary
 field. Useful for patch tests.
 """
-function apply_analytical_bc!(dad::BEMdata{<:Laplace}, ana::AnalyticalSolution)
+function apply_analytical_bc!(dad::BEMdata{<:LaplaceLike}, ana::AnalyticalSolution)
     for i in 1:dad.n
         dad.BC[i] = 0
         dad.BV[i] = float(ana.u(dad.Nodes[i]))
@@ -88,7 +90,8 @@ function apply_analytical_bc!(dad::BEMdata{<:Laplace}, ana::AnalyticalSolution)
     return dad
 end
 
-function apply_analytical_bc!(dad::BEMdata{<:Elasticity}, ana::AnalyticalSolution)
+function apply_analytical_bc!(dad::BEMdata{<:Union{Elasticity,AnisotropicElasticity,AnisotropicElasticity3D}},
+        ana::AnalyticalSolution)
     dim = dad.dimension
     for i in 1:dad.n
         ui = ana.u(dad.Nodes[i])
@@ -108,7 +111,7 @@ Dirichlet everywhere except on `neumann_nodes`, where flux/traction from
 `ana.q` is imposed.
 """
 function apply_analytical_bc!(
-    dad::BEMdata{<:Laplace},
+    dad::BEMdata{<:LaplaceLike},
     ana::AnalyticalSolution,
     neumann_nodes::AbstractVector{Int},
 )
@@ -120,6 +123,32 @@ function apply_analytical_bc!(
         else
             dad.BC[i] = 0
             dad.BV[i] = float(ana.u(dad.Nodes[i]))
+        end
+    end
+    attach_analytical!(dad, ana)
+    return dad
+end
+
+function apply_analytical_bc!(
+    dad::BEMdata{<:Union{Elasticity,AnisotropicElasticity,AnisotropicElasticity3D}},
+    ana::AnalyticalSolution,
+    neumann_nodes::AbstractVector{Int},
+)
+    dim = dad.dimension
+    neuset = Set(neumann_nodes)
+    for i in 1:dad.n
+        if i in neuset && ana.q !== nothing
+            ti = ana.q(dad.Nodes[i], dad.Normal[i])
+            for d in 1:dim
+                dad.BC[dim*(i-1)+d] = 1
+                dad.BV[dim*(i-1)+d] = float(ti[d])
+            end
+        else
+            ui = ana.u(dad.Nodes[i])
+            for d in 1:dim
+                dad.BC[dim*(i-1)+d] = 0
+                dad.BV[dim*(i-1)+d] = float(ui[d])
+            end
         end
     end
     attach_analytical!(dad, ana)
@@ -153,26 +182,115 @@ function ana_laplace_linear(; direction=SA[1.0, 0.0], k=1.0)
 end
 
 """
-    ana_laplace_quadratic()
+    ana_laplace_quadratic(; k=1.0, dim=2)
 
-Quadratic harmonic field ``T = x^2 - y^2`` in 2D.
+Quadratic harmonic field. 2-D: ``T = x^2 - y^2``. 3-D: ``T = x^2 + y^2 - 2z^2``.
 """
-function ana_laplace_quadratic(; k=1.0)
+function ana_laplace_quadratic(; k=1.0, dim::Integer=2)
+    dim == 2 || dim == 3 || throw(ArgumentError("dim must be 2 or 3"))
+    if dim == 3
+        u = (x; t=0.0) -> begin
+            p = _as_sv(x, 3)
+            p[1]^2 + p[2]^2 - 2 * p[3]^2
+        end
+        q = (x, n; t=0.0) -> begin
+            p = _as_sv(x, 3)
+            m = _as_sv(n, 3)
+            -k * (2p[1] * m[1] + 2p[2] * m[2] - 4p[3] * m[3])
+        end
+        desc = "T = x² + y² − 2z² (harmonic), q=-k ∂T/∂n"
+    else
+        u = (x; t=0.0) -> begin
+            p = _as_sv(x, 2)
+            p[1]^2 - p[2]^2
+        end
+        q = (x, n; t=0.0) -> begin
+            p = _as_sv(x, 2)
+            m = _as_sv(n, 2)
+            -k * (2p[1] * m[1] - 2p[2] * m[2])
+        end
+        desc = "T = x² - y² (harmonic), q=-k ∂T/∂n"
+    end
+    return AnalyticalSolution("laplace_quadratic", u; q=q, description=desc)
+end
+
+"""
+    ana_aniso_quadratic(K)
+
+``u = x^2/K_{11} - y^2/K_{22}`` for diagonal ``K``. Satisfies
+``∇·(K∇u)=0``. Package flux ``q=-n·K∇u``.
+"""
+function ana_aniso_quadratic(K::AbstractMatrix)
+    size(K, 1) == 2 && size(K, 2) == 2 || throw(ArgumentError("K must be 2×2"))
+    kx, ky = float(K[1, 1]), float(K[2, 2])
+    abs(K[1, 2]) + abs(K[2, 1]) < 1e-12 * (1 + abs(kx) + abs(ky)) ||
+        throw(ArgumentError("ana_aniso_quadratic needs diagonal K"))
     u = (x; t=0.0) -> begin
         p = _as_sv(x, 2)
-        p[1]^2 - p[2]^2
+        p[1]^2 / kx - p[2]^2 / ky
     end
-    # ∂T/∂n = 2x n_x - 2y n_y ; q = -k ∂T/∂n
     q = (x, n; t=0.0) -> begin
         p = _as_sv(x, 2)
         m = _as_sv(n, 2)
-        -k * (2p[1] * m[1] - 2p[2] * m[2])
+        -(2p[1] * m[1] - 2p[2] * m[2])
+    end
+    return AnalyticalSolution("aniso_quadratic", u; q=q,
+        description="u=x²/kx − y²/ky, ∇·(K∇u)=0, q=-n·K∇u")
+end
+
+"""
+    ana_aniso_poisson_sin(K; ω=π) -> (ana, b)
+
+Manufactured 2D anisotropic Poisson field
+``u=\\sin(ω x)\\sin(ω y)`` on a diagonal ``K=\\mathrm{diag}(k_x,k_y)``.
+
+``∇·(K∇u)=-ω^2(k_x+k_y)u``, so the package source in
+``∇·(K∇u)=-b`` is ``b=ω^2(k_x+k_y)u``. Flux ``q=-n·K∇u``.
+"""
+function ana_aniso_poisson_sin(K::AbstractMatrix; ω::Real=π)
+    size(K, 1) == 2 && size(K, 2) == 2 || throw(ArgumentError("K must be 2×2"))
+    kx, ky = float(K[1, 1]), float(K[2, 2])
+    abs(K[1, 2]) + abs(K[2, 1]) < 1e-12 * (1 + abs(kx) + abs(ky)) ||
+        throw(ArgumentError("ana_aniso_poisson_sin needs diagonal K"))
+    ωf = float(ω)
+    s = ωf^2 * (kx + ky)
+    u = (x; t=0.0) -> begin
+        p = _as_sv(x, 2)
+        sin(ωf * p[1]) * sin(ωf * p[2])
+    end
+    q = (x, n; t=0.0) -> begin
+        p = _as_sv(x, 2)
+        m = _as_sv(n, 2)
+        -(kx * ωf * cos(ωf * p[1]) * sin(ωf * p[2]) * m[1] +
+          ky * ωf * sin(ωf * p[1]) * cos(ωf * p[2]) * m[2])
+    end
+    b = (x) -> s * sin(ωf * x[1]) * sin(ωf * x[2])
+    ana = AnalyticalSolution("aniso_poisson_sin", u; q=q,
+        description="u=sin(ωx)sin(ωy), ∇·(K∇u)=-ω²(kx+ky)u, q=-n·K∇u")
+    return ana, b
+end
+
+"""
+    ana_poisson_r2(; k=1.0, dim=3)
+
+``u = |x|²``, ``∇²u = 2d``, flux ``q = -k ∂u/∂n = -2k x·n``.
+"""
+function ana_poisson_r2(; k=1.0, dim::Integer=3)
+    dim == 2 || dim == 3 || throw(ArgumentError("dim must be 2 or 3"))
+    u = (x; t=0.0) -> begin
+        p = _as_sv(x, dim)
+        float(sum(abs2, p))
+    end
+    q = (x, n; t=0.0) -> begin
+        p = _as_sv(x, dim)
+        m = _as_sv(n, dim)
+        -2 * k * dot(p, m)
     end
     return AnalyticalSolution(
-        "laplace_quadratic",
+        "poisson_r2",
         u;
         q=q,
-        description="T = x² - y² (harmonic), q=-k ∂T/∂n",
+        description="u = |x|² (∇²u = $(2dim)), q=-2k x·n",
     )
 end
 
@@ -417,31 +535,77 @@ end
 # ===========================================================================
 
 """
-    ana_elasticity_patch(; E=1.0, ν=0.3, εxx=0.01, εyy=0.0, εxy=0.0)
+    ana_elasticity_patch(; E=1.0, ν=0.3, εxx=0.01, εyy=0.0, εzz=0.0,
+                           εxy=0.0, εyz=0.0, εxz=0.0, dim=2)
 
-Uniform strain patch test: ``u = ε · x``. Exact for linear elasticity.
+Uniform strain patch: ``u = ε · x``. Exact for linear elasticity.
+
+`dim=2` is plane strain (existing tests). `dim=3` uses 3-D Hooke with the
+same Lamé pair as `Elasticity(..., plane_strain=true)` (true ``ν``).
 """
-function ana_elasticity_patch(; E=1.0, ν=0.3, εxx=0.01, εyy=0.0, εxy=0.0)
-    u = (x; t=0.0) -> begin
-        p = _as_sv(x, 2)
-        SA[εxx * p[1] + εxy * p[2], εxy * p[1] + εyy * p[2]]
-    end
-    # Hooke plane strain traction from constant stress
+function ana_elasticity_patch(; E=1.0, ν=0.3, εxx=0.01, εyy=0.0, εzz=0.0,
+        εxy=0.0, εyz=0.0, εxz=0.0, dim::Integer=2)
+    dim == 2 || dim == 3 || throw(ArgumentError("dim must be 2 or 3"))
     μ = E / (2(1 + ν))
     λ = E * ν / ((1 + ν) * (1 - 2ν))
-    σxx = λ * (εxx + εyy) + 2μ * εxx
-    σyy = λ * (εxx + εyy) + 2μ * εyy
-    σxy = 2μ * εxy
-    q = (x, n; t=0.0) -> begin
-        m = _as_sv(n, 2)
-        SA[σxx * m[1] + σxy * m[2], σxy * m[1] + σyy * m[2]]
+    if dim == 3
+        εkk = εxx + εyy + εzz
+        σxx = λ * εkk + 2μ * εxx
+        σyy = λ * εkk + 2μ * εyy
+        σzz = λ * εkk + 2μ * εzz
+        σxy = 2μ * εxy
+        σyz = 2μ * εyz
+        σxz = 2μ * εxz
+        u = (x; t=0.0) -> begin
+            p = _as_sv(x, 3)
+            SA[εxx * p[1] + εxy * p[2] + εxz * p[3],
+               εxy * p[1] + εyy * p[2] + εyz * p[3],
+               εxz * p[1] + εyz * p[2] + εzz * p[3]]
+        end
+        q = (x, n; t=0.0) -> begin
+            m = _as_sv(n, 3)
+            SA[σxx * m[1] + σxy * m[2] + σxz * m[3],
+               σxy * m[1] + σyy * m[2] + σyz * m[3],
+               σxz * m[1] + σyz * m[2] + σzz * m[3]]
+        end
+        desc = "Uniform strain patch (3D)"
+    else
+        u = (x; t=0.0) -> begin
+            p = _as_sv(x, 2)
+            SA[εxx * p[1] + εxy * p[2], εxy * p[1] + εyy * p[2]]
+        end
+        σxx = λ * (εxx + εyy) + 2μ * εxx
+        σyy = λ * (εxx + εyy) + 2μ * εyy
+        σxy = 2μ * εxy
+        q = (x, n; t=0.0) -> begin
+            m = _as_sv(n, 2)
+            SA[σxx * m[1] + σxy * m[2], σxy * m[1] + σyy * m[2]]
+        end
+        desc = "Uniform strain patch (plane strain)"
     end
-    return AnalyticalSolution(
-        "elasticity_patch",
-        u;
-        q=q,
-        description="Uniform strain patch (plane strain)",
-    )
+    return AnalyticalSolution("elasticity_patch", u; q=q, description=desc)
+end
+
+"""Uniform-strain patch for a 3D anisotropic solid: ``u = ε · x``, ``t = σ n``."""
+function ana_aniso3d_patch(props::AnisotropicElasticity3D;
+        εxx=0.01, εyy=0.0, εzz=0.0, εxy=0.0, εyz=0.0, εxz=0.0)
+    εv = SVector{6,Float64}(εxx, εyy, εzz, 2εyz, 2εxz, 2εxy)
+    σv = props.C * εv
+    σxx, σyy, σzz, σyz, σxz, σxy = Tuple(σv)
+    u = (x; t=0.0) -> begin
+        p = _as_sv(x, 3)
+        SA[εxx * p[1] + εxy * p[2] + εxz * p[3],
+           εxy * p[1] + εyy * p[2] + εyz * p[3],
+           εxz * p[1] + εyz * p[2] + εzz * p[3]]
+    end
+    q = (x, n; t=0.0) -> begin
+        m = _as_sv(n, 3)
+        SA[σxx * m[1] + σxy * m[2] + σxz * m[3],
+           σxy * m[1] + σyy * m[2] + σyz * m[3],
+           σxz * m[1] + σyz * m[2] + σzz * m[3]]
+    end
+    return AnalyticalSolution("aniso3d_patch", u; q=q,
+        description="Uniform strain patch (3D anisotropic)")
 end
 
 """
@@ -462,6 +626,55 @@ function rel_error(dad::BEMdata; t=0.0)
     n = min(length(Tnum), length(Tana))
     num = norm(@view(Tnum[1:n]) .- @view(Tana[1:n]))
     den = norm(@view(Tana[1:n]))
+    return den > 0 ? num / den : num
+end
+
+"""
+    analytical_flux(dad; t=0.0) -> Vector
+
+Boundary flux / traction from the attached analytical `q(x, n)`.
+Length `n` (Laplace) or `dimension*n` (elasticity).
+"""
+function analytical_flux(dad::BEMdata; t=0.0)
+    has_cache(dad, :analytical) ||
+        error("No analytical solution attached. Use attach_analytical!(dad, ana).")
+    ana = dad.analytical
+    ana.q === nothing && error("analytical solution has no flux/traction `q`")
+    return _eval_ana_flux(ana, dad; t=t)
+end
+
+function _eval_ana_flux(ana::AnalyticalSolution, dad::BEMdata{<:LaplaceLike}; t=0.0)
+    return [float(ana.q(dad.Nodes[i], dad.Normal[i]; t=t)) for i in 1:dad.n]
+end
+
+function _eval_ana_flux(ana::AnalyticalSolution, dad::BEMdata{<:Union{Elasticity,AnisotropicElasticity,AnisotropicElasticity3D}}; t=0.0)
+    dim = dad.dimension
+    out = zeros(dim * dad.n)
+    for i in 1:dad.n
+        ti = ana.q(dad.Nodes[i], dad.Normal[i]; t=t)
+        out[dim*(i-1)+1:dim*i] .= ti
+    end
+    return out
+end
+
+"""
+    rel_error_flux(dad; t=0.0) -> Float64
+
+Relative L2 error on the dual field (Laplace `dad.q`, elasticity `dad.traction`)
+versus analytical `q`. Use this for all-Dirichlet patch tests: the primal is
+prescribed, so [`rel_error`](@ref) is identically zero.
+"""
+function rel_error_flux(dad::BEMdata; t=0.0)
+    qana = analytical_flux(dad; t=t)
+    qnum = if dad isa BEMdata{<:Union{Elasticity,AnisotropicElasticity,AnisotropicElasticity3D}}
+        has_cache(dad, :traction) ? dad.traction : error("no :traction — call solve first")
+    else
+        has_cache(dad, :q) || error("no :q — call solve first")
+        dad.q isa AbstractMatrix ? dad.q[:, end] : dad.q
+    end
+    n = min(length(qnum), length(qana))
+    num = norm(@view(qnum[1:n]) .- @view(qana[1:n]))
+    den = norm(@view(qana[1:n]))
     return den > 0 ? num / den : num
 end
 

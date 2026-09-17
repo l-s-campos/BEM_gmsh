@@ -1,30 +1,49 @@
-# BEM.FMM
+# FMM (vendored into BEM)
 
-Vendored pure-Julia FMM (from `D:/fmm/FMM2D`), loaded as submodule `BEM.FMM`.
+Fast multipole **kernels and matvecs** only.
 
-## Entry point
+## Shared with HMatrices
 
-On Windows, the module file is **`mod_FMM.jl`** (not `FMM.jl`) because the
-filesystem is case-insensitive and would collide with `fmm_core.jl`.
+| Concern | Owner |
+|---------|--------|
+| `ClusterTree`, splitters, `HyperRectangle`, admissibility | **HMatrices** |
+| Multipole expansions, plans, physics kernels | **FMM** |
+| `FMMKernelMatrix`, `KelvinFMMMatrix`, `KelvinFMMMatrix3D` | **FMM** (`operators/`) |
 
 ```julia
-# from BEM.jl
-include("FMM/mod_FMM.jl")
-@reexport using .FMM
+tree = ClusterTree(pts, hmatrix_splitter(; nmax=40); cube=true)  # FMM3D/H² octree
+A = fmm_laplace2d_matrix(P; tree=tree)          # plan adopts tree
+plan = build_laplace2d_plan(P; tree=tree)
+rfmm2d(1e-8, P; charges=x, pg=1, plan=plan)    # reuse plan
 ```
 
-## Sync from upstream
+Laplace apply is threaded (`Threads.@threads` over target boxes, including M2L).
+Run Julia with `-t auto`. Default tree is the H² cubic octree / quadtree
+(`DyadicSplitter(tight=false); cube=true`). 2D expansions match Flatiron FMM2D
+(`l2d*`). 3D uses FMM3D-style dual-tree lists and spherical-harmonic translations
+(`l3dterms` order, FMM3D `Y_n^m` packing). Same-size octree M2L is a
+Sommerfeld plane-wave shift; mixed-size pairs stay equivalent-sphere. 2D leaf size follows
+Flatiron `lndiv2d`. 3D leaf size follows Flatiron `lndiv` (`200` at `1e-8`);
+pass a smaller `nmax=` for a deeper octree or `p=` to cut the expansion order.
 
-```bash
-# from repo root
-rm -rf src/FMM
-mkdir -p src/FMM
-cp -r /path/to/fmm/FMM2D/src/* src/FMM/
-mv src/FMM/fmm.jl src/FMM/fmm_core.jl
-# restore mod_FMM.jl entry (see git)
+## Layout
+
+```
+FMM/
+  mod_FMM.jl
+  core/                 expansions, dual-tree engine, Laplace-2D plan
+  kernels/              Laplace3D, Helmholtz, Stokes, Yukawa, Cauchy, KIFMM, Body
+  operators/            FMMKernelMatrix, Kelvin
 ```
 
-## Contact half-space
+HMatrices layout (sibling module):
 
-`HalfSpaceBEM.build_fmm` uses `FMM.rfmm2d` (2D) / `FMM.lfmm3d` (3D) with
-exact near-field panel corrections.
+```
+Hmat/
+  tree/       ClusterTree, splitters, boxes, admissibility
+  compress/   ACA, AnchorNet
+  formats/    H, BLR, NNCA, KernelMatrix
+  arith/      mul, LU, precond
+```
+
+**Do not** hang FMM expansions or interaction lists on `ClusterTree` — use `Laplace2DFMMPlan` / `build_laplace3d_plan`.

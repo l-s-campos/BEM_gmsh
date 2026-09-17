@@ -1,16 +1,32 @@
 export applyBC, applyBC!
+export applyBC_blocks
 
 # =============================================================================
 # Laplace — dense
 # =============================================================================
 
-function applyBC(dad::BEMdata{<:Union{Laplace,OrthotropicLaplace}})
+"""
+    applyBC(dad; blocks=false, M=nothing, κ2=0)
+
+Build the mixed BC linear system on `dad`.
+
+# Keywords
+- `blocks=false` — classical column-swap on dense `H,G` (legacy).
+- `blocks=true`  — pack unknowns as `x = [T_u; q_q]` from BC blocks
+  [`build_block_mixed_system`](@ref). Prefer for hierarchical / FMM `H,G`
+  (whole subblocks exchanged). Optional domain mass `M` with shift `κ2`
+  builds `(H+κ²M)`-style blocks without densifying.
+"""
+function applyBC(dad::BEMdata{<:LaplaceLike};
+                 blocks::Bool=false, M=nothing, κ2::Real=0.0)
     H = dad.H
     G = dad.G
 
-    # hierarchical or factored (ColWeightedOp) — matrix-free mixed BC
-    if H isa HMatrices.HMatrix || H isa ColWeightedOp
-        return applyBC_Hmat(dad)
+    # structured operators always use the block (or legacy matrix-free) path
+    structured = H isa HMatrices.HMatrix || H isa ColWeightedOp ||
+                 H isa BlockMixedOperator
+    if blocks || structured
+        return applyBC_blocks(dad; M=M, κ2=κ2)
     end
 
     if has_cache(dad, :A) && has_cache(dad, :B) && has_cache(dad, :b)
@@ -35,7 +51,7 @@ function applyBC(dad::BEMdata{<:Union{Laplace,OrthotropicLaplace}})
     return nothing
 end
 
-function applyBC(dad::BEMdata{<:Union{Laplace,OrthotropicLaplace}}, A, B, b)
+function applyBC(dad::BEMdata{<:LaplaceLike}, A, B, b)
     n = dad.n
     for bc in 1:n
         if dad.BC[bc] == 0  # Dirichlet: unknown is q
@@ -59,17 +75,31 @@ function applyBC(dad::BEMdata{<:Union{Laplace,OrthotropicLaplace}}, A, B, b)
 end
 
 # =============================================================================
-# Laplace — H-matrix (matrix-free mixed operator)
+# Laplace — block-partitioned mixed BC (Hmat / FMM / optional dense)
 # =============================================================================
 
-function applyBC_Hmat(dad::BEMdata{<:Laplace})
+"""
+    applyBC_blocks(dad; M=nothing, κ2=0)
+
+Partition `H,G` (and optional `M`) into BC blocks and build
+
+```
+A = [Huu+κ²Muu  −Guq;  Hqu+κ²Mqu  −Gqq] ,   x = [T_u; q_q]
+```
+
+Caches `A`, `b`, `bc_idx`, `hg_blocks` on `dad`.
+"""
+function applyBC_blocks(dad::BEMdata{<:LaplaceLike};
+                        M=nothing, κ2::Real=0.0)
     H = dad.H
     G = dad.G
-    A = MixedBCOperator(H, G, dad.BC, dad.n, dad.nt)
-    b = mixed_bc_rhs(H, G, dad)
-    set_cache!(dad; A, b)
+    Mop = M === nothing ? (has_cache(dad, :M) && κ2 != 0 ? dad.M : nothing) : M
+    sys = build_block_mixed_system(H, G, dad; M=Mop, κ2=κ2)
+    set_cache!(dad; A=sys.A, b=sys.b, bc_idx=sys.idx, hg_blocks=sys.blocks)
     return nothing
 end
+
+applyBC!(dad::BEMdata{<:LaplaceLike}; kwargs...) = applyBC(dad; kwargs...)
 
 # =============================================================================
 # Elasticity — dense
@@ -83,7 +113,8 @@ Build mixed BC system for elasticity.
 - `frame=:global` — classical (x, y) DOFs
 - `frame=:local` — nodal (n, t) DOFs (Leonardo §4.7); see [`applyBC_local!`](@ref)
 """
-function applyBC(dad::BEMdata{<:Elasticity}; frame::Symbol=:global, p=nothing)
+function applyBC(dad::BEMdata{<:Union{Elasticity,AnisotropicElasticity,AnisotropicElasticity3D}};
+        frame::Symbol=:global, p=nothing)
     if frame === :local
         return applyBC_local!(dad; p=p)
     elseif frame !== :global
@@ -115,9 +146,10 @@ function applyBC(dad::BEMdata{<:Elasticity}; frame::Symbol=:global, p=nothing)
     return nothing
 end
 
-applyBC!(dad::BEMdata{<:Elasticity}; kwargs...) = applyBC(dad; kwargs...)
+applyBC!(dad::BEMdata{<:Union{Elasticity,AnisotropicElasticity,AnisotropicElasticity3D}}; kwargs...) =
+    applyBC(dad; kwargs...)
 
-function applyBC(dad::BEMdata{<:Elasticity}, A, B, b)
+function applyBC(dad::BEMdata{<:Union{Elasticity,AnisotropicElasticity,AnisotropicElasticity3D}}, A, B, b)
     dim = dad.dimension
     n = dad.n
     ndof_b = dim * n

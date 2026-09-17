@@ -12,16 +12,14 @@ using Pkg
 Pkg.activate(".")
 Pkg.instantiate()
 
-using DrWatson
-@quickactivate :BEM
-include(datadir("Laplace", "Laplace_dad.jl"))
+using BEM
 
 props = Laplace(1.0)
 msh = quadrado(ndiv=20, show=false)
 dad = format2d(msh, props)
 
 attach_analytical!(dad, ana_laplace_linear(; direction=SA[1.0, 0.0]))  # T=x, q=-k∂T/∂n
-H_G_full_direct(dad, 20)    # ou H_G_Hmat(dad) para problemas grandes
+assemble!(dad, 20)    # ou assemble!(dad; method=:hmatrix) para problemas grandes
 solve(dad)
 
 @show rel_error(dad)
@@ -41,14 +39,14 @@ plot_geo(dad)
 | Soluções analíticas + `rel_error` | ✅ |
 | Contato half-space / desgaste | ✅ |
 | Propagação de ondas escalar | ✅ `wave_propagation.jl` |
-| `plot_geo` / `plot_hmatrix` (Makie) | ✅ |
+| `plot_geo` / `export_vtk` (Plots.jl) | ✅ |
 | I/O Gmsh via `datadir` | ✅ |
 
 ## Testes
 
 ```bash
 julia --project=. test/runtests.jl
-julia --project=. test/test_wave_propagation.jl
+julia --project=. test/runtests.jl
 ```
 
 ## Documentação

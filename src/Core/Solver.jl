@@ -1,21 +1,59 @@
 # Steady BEM solvers (Laplace + Elasticity). Transient drivers: Laplace/Solver.jl
 
 export solve, solve_Hmat, split_sol!, split_sol
-export reduced_heat_system, heat_rhs, heat_rhs!
-export reduced_wave_system, wave_rhs, wave_rhs!
 # solve_local exported from Elasticity/LocalFrame.jl
+# reduced_heat_system / reduced_wave_system live in Laplace/Solver.jl
 
 # =============================================================================
 # Steady Laplace
 # =============================================================================
 
-function solve(dad::BEMdata{<:Union{Laplace,OrthotropicLaplace}})
-    applyBC(dad)
+"""
+    solve(dad::BEMdata; kwargs...)
+
+Apply mixed BCs (`applyBC`) and solve ``A x = b``.
+
+For Laplace, stores the full field in `dad.T` / `dad.q`. Dense systems use
+`bem_linsolve`; hierarchical / mixed operators use GMRES (`solve_Hmat`).
+`factor=:ulv` uses HODLR LU of the mixed 2×2 with HSS on all four tiles
+and ULV on `Huu` and the Schur of `-Gqq`.
+
+For elasticity, `frame=:global` (default) uses Cartesian BCs; `frame=:local`
+uses nodal ``(n,t)`` components ([`solve_local`](@ref)).
+"""
+function solve(dad::BEMdata{<:LaplaceLike};
+               blocks::Bool=false, M=nothing, κ2::Real=0.0,
+               factor::Symbol=:auto)
+    applyBC(dad; blocks=blocks, M=M, κ2=κ2)
     A = dad.A
     b = dad.b
-    if A isa MixedBCOperator || A isa HMatrices.HMatrix
+
+    # BC blocks → HSS+ULV on square diagonals, or one-level H-LU
+    if A isa BlockMixedOperator && factor === :ulv
+        F = factor_block_ulv(A, dad.collocation)
+        x = F \ b
+        Tfull, qfull = scatter_block_sol!(dad, x, dad.bc_idx)
+        set_cache!(dad; T=Tfull, q=qfull, block_ulv=F)
+        return dad.T
+    end
+    if A isa BlockMixedOperator && factor !== :gmres
+        try
+            F = factor_block_hlu(A)
+            x = F \ b
+            Tfull, qfull = scatter_block_sol!(dad, x, dad.bc_idx)
+            set_cache!(dad; T=Tfull, q=qfull, block_lu=F)
+            return dad.T
+        catch e
+            e isa ArgumentError || rethrow()
+            # fall through to GMRES
+        end
+    end
+
+    # Hierarchical / matrix-free → iterative
+    if A isa BlockMixedOperator || A isa HMatrices.HMatrix
         return solve_Hmat(dad)
     end
+
     x = bem_linsolve(A, b)
     Tfull = zeros(eltype(x), dad.nt)
     qfull = zeros(eltype(x), dad.n)
@@ -25,25 +63,29 @@ function solve(dad::BEMdata{<:Union{Laplace,OrthotropicLaplace}})
     return dad.T
 end
 
-function solve_Hmat(dad::BEMdata{<:Laplace}; Pl=nothing, atol=1e-10, rtol=1e-8, itmax=0)
+function solve_Hmat(dad::BEMdata{<:LaplaceLike}; Pl=nothing, atol=1e-10, rtol=1e-8, itmax=0)
     A = dad.A
     b = dad.b
     itm = itmax > 0 ? Int(itmax) : max(4 * size(A, 1), 200)
-    # Prefer hierarchical precond path when available (`gmres_h`); plain GMRES otherwise.
     if Pl !== nothing || isdefined(HMatrices, :gmres_h)
         x, stats = HMatrices.gmres_h(A, b; Pl=Pl, atol=atol, rtol=rtol, itmax=itm)
     else
         x, stats = Krylov.gmres(A, b; atol=atol, rtol=rtol, itmax=itm)
     end
-    Tfull = zeros(dad.nt)
-    qfull = zeros(dad.n)
-    Tfull[1:length(x)] .= x
-    split_sol!(dad, Tfull, qfull)
+
+    if A isa BlockMixedOperator && has_cache(dad, :bc_idx)
+        Tfull, qfull = scatter_block_sol!(dad, x, dad.bc_idx)
+    else
+        Tfull = zeros(eltype(x), dad.nt)
+        qfull = zeros(eltype(x), dad.n)
+        Tfull[1:length(x)] .= x
+        split_sol!(dad, Tfull, qfull)
+    end
     set_cache!(dad; T=Tfull, q=qfull, gmres_stats=stats)
     return dad.T
 end
 
-function split_sol!(dad::BEMdata{<:Union{Laplace,OrthotropicLaplace}}, T, q)
+function split_sol!(dad::BEMdata{<:LaplaceLike}, T, q)
     @inbounds for bc in eachindex(dad.BC)
         if dad.BC[bc] == 0
             q[bc] = T[bc]
@@ -69,7 +111,8 @@ Steady elasticity solve.
 - `frame = :local` — BCs in nodal (n, t) components (Leonardo 2026 §4.7);
   see [`solve_local`](@ref)
 """
-function solve(dad::BEMdata{<:Elasticity}; frame::Symbol=:global, p=nothing)
+function solve(dad::BEMdata{<:Union{Elasticity,AnisotropicElasticity,AnisotropicElasticity3D}};
+        frame::Symbol=:global, p=nothing)
     if frame === :local
         return solve_local(dad; p=p)
     elseif frame !== :global
@@ -87,7 +130,7 @@ function solve(dad::BEMdata{<:Elasticity}; frame::Symbol=:global, p=nothing)
     return u
 end
 
-function split_sol!(dad::BEMdata{<:Elasticity}, x, u, traction)
+function split_sol!(dad::BEMdata{<:Union{Elasticity,AnisotropicElasticity,AnisotropicElasticity3D}}, x, u, traction)
     BC = dad.BC
     BV = dad.BV
     @inbounds for dof in eachindex(BC)
@@ -102,72 +145,3 @@ function split_sol!(dad::BEMdata{<:Elasticity}, x, u, traction)
     return nothing
 end
 
-# =============================================================================
-# AD-compatible reduced systems (pure linear algebra, Dual-friendly)
-# =============================================================================
-
-"""
-    reduced_heat_system(A, M, b, BC, ni) -> (; B, f, unknown, known)
-
-Build the first-order reduced ODE
-``\\dot u = B u + f`` after static condensation of Dirichlet dofs.
-"""
-function reduced_heat_system(A, M, b, BC::AbstractVector{<:Integer}, ni::Integer)
-    BCT = vcat(BC, ones(eltype(BC), ni))
-    unknown = BCT .== 1
-    known = BCT .== 0
-    A00 = A[known, known]
-    A01 = A[known, unknown]
-    A10 = A[unknown, known]
-    A11 = A[unknown, unknown]
-    M01 = M[known, unknown]
-    M11 = M[unknown, unknown]
-    A1 = A10 / A00
-    Mred = M11 - A1 * M01
-    B = bem_linsolve(Mred, A11 - A1 * A01)
-    f = bem_linsolve(Mred, b[unknown] - A1 * b[known])
-    return (; B, f, unknown, known, BCT)
-end
-
-"""Out-of-place RHS for AD / DiffEq (first-order heat)."""
-heat_rhs(u, p, t) = p.B * u .+ p.f
-
-"""In-place RHS (non-AD solvers)."""
-function heat_rhs!(du, u, p, t)
-    mul!(du, p.B, u)
-    du .+= p.f
-    return nothing
-end
-
-"""
-    reduced_wave_system(A, M, b, BC, ni) -> (; B, f, unknown, known)
-
-Second-order reduced form ``\\ddot u = B u + f``.
-"""
-function reduced_wave_system(A, M, b, BC::AbstractVector{<:Integer}, ni::Integer)
-    BCT = vcat(BC, ones(eltype(BC), ni))
-    unknown = BCT .== 1
-    known = BCT .== 0
-    A00 = A[known, known]
-    A01 = A[known, unknown]
-    A10 = A[unknown, known]
-    A11 = A[unknown, unknown]
-    M01 = M[known, unknown]
-    M11 = M[unknown, unknown]
-    A1 = A10 / A00
-    Mred = M11 - A1 * M01
-    B = bem_linsolve(Mred, -(A11 - A1 * A01))
-    f = bem_linsolve(Mred, b[unknown] - A1 * b[known])
-    return (; B, f, unknown, known, BCT)
-end
-
-wave_rhs(u, p, t) = p.B * u .+ p.f
-function wave_rhs!(ddu, du, u, p, t)
-    if hasproperty(p, :B)
-        mul!(ddu, p.B, u)
-        ddu .+= p.f
-    else
-        wave_full_rhs!(ddu, du, u, p, t)
-    end
-    return nothing
-end

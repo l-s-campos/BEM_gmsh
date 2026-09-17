@@ -190,6 +190,8 @@ function _square_mesh_bc(;
     nome="square",
     Lx=1.0,
     Ly=1.0,
+    x0=0.0,
+    y0=0.0,
     ndiv=16,
     ordem=1,
     show=false,
@@ -202,10 +204,10 @@ function _square_mesh_bc(;
     gmsh.option.setNumber("General.Terminal", 0)
     gmsh.model.add(nome)
     lc = 0.1
-    p1 = gmsh.model.geo.addPoint(0.0, 0.0, 0.0, lc)
-    p2 = gmsh.model.geo.addPoint(Lx, 0.0, 0.0, lc)
-    p3 = gmsh.model.geo.addPoint(Lx, Ly, 0.0, lc)
-    p4 = gmsh.model.geo.addPoint(0.0, Ly, 0.0, lc)
+    p1 = gmsh.model.geo.addPoint(x0, y0, 0.0, lc)
+    p2 = gmsh.model.geo.addPoint(x0 + Lx, y0, 0.0, lc)
+    p3 = gmsh.model.geo.addPoint(x0 + Lx, y0 + Ly, 0.0, lc)
+    p4 = gmsh.model.geo.addPoint(x0, y0 + Ly, 0.0, lc)
     l1 = gmsh.model.geo.addLine(p1, p2)  # bottom
     l2 = gmsh.model.geo.addLine(p2, p3)  # right
     l3 = gmsh.model.geo.addLine(p3, p4)  # top

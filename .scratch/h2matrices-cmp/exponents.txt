@@ -1,0 +1,35 @@
+empirical t ~ N^α
+generated 2026-09-03T21:11:04.542
+
+2D volume
+method        geom       α_asm    α_mv
+bem_proxy     volume      1.13    1.44
+bem_nca       volume      1.21    1.42
+bem_nnca      volume      1.17    1.39
+h2m_cheb      volume      1.15    1.58
+h2m_ada       volume      0.92    1.54
+
+2D boundary
+method        geom       α_asm    α_mv
+bem_proxy     boundary    0.93    0.91
+bem_nca       boundary    0.98    0.98
+bem_nnca      boundary    1.11    0.97
+h2m_cheb      boundary    0.99    1.42
+h2m_ada       boundary    1.47    1.30
+
+3D volume
+method        geom       α_asm    α_mv
+bem_proxy     volume      1.26    1.70
+bem_nca       volume      1.40    1.54
+bem_nnca      volume      1.66    1.56
+h2m_cheb      volume      1.32    1.64
+h2m_ada       volume      2.45    2.03
+
+3D boundary
+method        geom       α_asm    α_mv
+bem_proxy     boundary    1.31    1.46
+bem_nca       boundary    1.17    1.17
+bem_nnca      boundary    1.40    1.20
+h2m_cheb      boundary    1.12    1.30
+h2m_ada       boundary    2.38    1.92
+

@@ -1,0 +1,8 @@
+dist,N,eps,p,nmax,threads,t_fmm3d_ms,t_bem_plan_ms,t_bem_apply_ms,t_bem_cold_ms,t_bem_treecode_ms,t_fm_default_ms,t_fm_matched_ms,err_bem_vs_fmm3d,err_bem_cold_vs_fmm3d,err_bem_treecode_vs_fmm3d,err_fm_default_vs_fmm3d,err_fm_matched_vs_fmm3d,err_fmm3d_vs_dense,err_bem_vs_dense,err_treecode_vs_dense,err_fm_default_vs_dense,err_fm_matched_vs_dense
+cube,2000,1e-06,16,200,6,16.2481,7.24803,12.5511,17.9786,NaN,5.57062,7.57181,8.04561e-08,8.04561e-08,NaN,1.41147e-06,3.6047e-08,3.6047e-08,7.08028e-08,NaN,1.40928e-06,2.04327e-15
+sphere,2000,1e-06,16,200,6,15.7163,3.54788,11.755,25.3479,NaN,5.28379,6.86538,1.25515e-08,1.25515e-08,NaN,3.43353e-07,9.24454e-09,9.24454e-09,9.16863e-09,NaN,3.43812e-07,1.45337e-15
+cube,10000,0.0001,16,200,6,36.9563,15.4059,28.1239,NaN,NaN,48.6547,58.006,4.48603e-08,NaN,NaN,5.27997e-06,3.62589e-08,,,,,
+cube,10000,1e-06,16,200,6,46.0344,15.3663,28.1527,NaN,NaN,51.8782,57.6736,4.33758e-08,NaN,NaN,5.2804e-06,3.43113e-08,,,,,
+sphere,10000,1e-06,16,200,6,91.8548,17.2057,96.8492,NaN,NaN,28.7014,59.7495,2.27088e-08,NaN,NaN,2.33736e-06,1.58504e-08,,,,,
+cube,40000,1e-06,16,200,6,198.109,119.048,287.925,NaN,NaN,365.664,497.212,7.25782e-08,NaN,NaN,9.33402e-06,4.40274e-08,,,,,
+sphere,40000,1e-06,16,200,6,467.67,77.1336,499.49,NaN,NaN,132.13,376.017,3.316e-08,NaN,NaN,2.93207e-06,2.07479e-08,,,,,

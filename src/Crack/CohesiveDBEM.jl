@@ -1,14 +1,14 @@
 # =============================================================================
 # Nonlinear cohesive-contact Dual BEM (Cordeiro et al. 2024)
 # =============================================================================
-# Builds on [`DualMesh`](@ref) / [`assemble_dual!`](@ref). Crack face pairs
+# Builds on BEMdata dual assembly ([`assemble_dual!`](@ref)). Crack face pairs
 # (twins) carry a cohesive law with four surface conditions:
 #   (i) contact  (ii) softening  (iii) unloading/reloading  (iv) complete failure
 #
 # Discrete system (compact form of Cordeiro eq. 24):
 #   A(u) u = f(λ)
 # where cohesive stiffness K(δ) couples tractions on ± faces to the opening
-# Δu = u⁺ − u⁻ through the already-assembled H, G operators.
+# Δu = u⁺ − u⁻ through the already-assembled nodal H, G operators.
 #
 # Solution: Newton–Raphson with optional single-DOF displacement control
 # (arc-length-like continuation on a monitored DOF).
@@ -43,10 +43,10 @@ end
 """
     CohesiveDBEMProblem
 
-Nonlinear cohesive DBEM problem on a pre-assembled [`DualMesh`](@ref).
+Nonlinear cohesive DBEM problem on a pre-assembled elasticity [`BEMdata`](@ref).
 """
 mutable struct CohesiveDBEMProblem{L<:AbstractCohesiveLaw}
-    mesh::DualMesh
+    mesh::BEMdata{<:Elasticity}
     law::L
     pairs::Vector{CohesivePair}
     kn_pen::Float64                 # contact penalty
@@ -61,7 +61,7 @@ mutable struct CohesiveDBEMProblem{L<:AbstractCohesiveLaw}
 end
 
 function CohesiveDBEMProblem(
-        mesh::DualMesh,
+        mesh::BEMdata{<:Elasticity},
         law::AbstractCohesiveLaw;
         kn_pen = 1e12,
         tol = 1e-6,
@@ -90,35 +90,36 @@ opening normal `n̂` points **from − toward + through the gap**:
 
 so that under mode-I tension ``δn = n̂ · (u⁺ - u⁻) > 0``.
 """
-function build_cohesive_pairs(mesh::DualMesh)
+function build_cohesive_pairs(mesh::BEMdata{<:Elasticity})
+    parentmodule(@__MODULE__).has_cache(mesh, :twin) || prepare_crack!(mesh)
     pairs = CohesivePair[]
     seen = Set{Tuple{Int, Int}}()
-    for (i, nd) in enumerate(mesh.nodes)
-        tw = nd.twin
+    twin = mesh.twin
+    eq = mesh.eq_type
+    for i in 1:mesh.n
+        tw = twin[i]
         tw == 0 && continue
         a, b = minmax(i, tw)
         (a, b) in seen && continue
         push!(seen, (a, b))
-        na, nb = mesh.nodes[a], mesh.nodes[b]
-        # prefer eq=2 as +, eq=3 as −
-        if na.eq_type == 2 || nb.eq_type == 3
+        ea, eb = eq[a], eq[b]
+        if ea == 2 || eb == 3
             np, nm = a, b
-        elseif nb.eq_type == 2 || na.eq_type == 3
+        elseif eb == 2 || ea == 3
             np, nm = b, a
         else
             np, nm = a, b
         end
-        n_plus_out = mesh.nodes[np].normal
+        n_plus_out = mesh.Normal[np]
         nn = norm(n_plus_out)
         n_plus_out = nn > eps() ? n_plus_out / nn : Point2D(0.0, 1.0)
-        n_m = mesh.nodes[nm].normal
+        n_m = mesh.Normal[nm]
         nmn = norm(n_m)
         n_m = nmn > eps() ? n_m / nmn : -n_plus_out
         # Opening normal from − → + through the gap.
         # Solid-outward faces: n₊ ≈ −n₋ and both point into the gap → n̂ = −n₊ ≈ n₋.
         n̂ = -n_plus_out
         if dot(n̂, n_m) < 0
-            # prefer alignment with minus solid-outward (also into gap)
             n̂ = n_m
         end
         n̂ = n̂ / (norm(n̂) + eps())
@@ -167,7 +168,7 @@ With opening normal `n̂` (from − to + through the gap):
 - `t⁻ = -t⁺`
 """
 function _assemble_Kc(prob::CohesiveDBEMProblem)
-    n = length(prob.mesh.nodes)
+    n = prob.mesh.n
     Kc = zeros(2n, 2n)
     for cp in prob.pairs
         R = local_to_global_R(cp.n̂)
@@ -186,7 +187,7 @@ end
 
 """Nodal cohesive traction vector `t_coh` of length 2n (global components)."""
 function _cohesive_traction_vector(prob::CohesiveDBEMProblem, u::AbstractVector)
-    n = length(prob.mesh.nodes)
+    n = prob.mesh.n
     t = zeros(2n)
     for cp in prob.pairs
         δn, δt, R, _ = _pair_opening(prob, cp, u)
@@ -205,44 +206,34 @@ function _cohesive_traction_vector(prob::CohesiveDBEMProblem, u::AbstractVector)
 end
 
 # ---------------------------------------------------------------------------
-# Linear operators from DualMesh with exterior BCs
+# Linear operators from BEMdata with exterior BCs
 # ---------------------------------------------------------------------------
 
 """
 Build free/fixed partitioning for exterior BCs (crack faces free of
 prescribed traction — cohesive supplies them).
 
-Returns named tuple with:
-- `free`, `fixed` DOF index sets
-- `u_fixed` values at λ=1 (scaled by λ later)
-- `Hff, Hffix` blocks
-- `G` full, and map from nodal traction 2n → element traction 6nel via lumping
+Returns named tuple with `is_dir`, `u_bar`, `free`, `fixed`.
 """
-function _bc_partition(mesh::DualMesh, load_dofs::Vector{Int}, load_ū::Vector{Float64})
-    n = length(mesh.nodes)
+function _bc_partition(mesh::BEMdata{<:Elasticity}, load_dofs::Vector{Int},
+        load_ū::Vector{Float64})
+    n = mesh.n
     ndof = 2n
     is_dir = falses(ndof)
     u_bar = zeros(ndof)
-    # Outer-boundary Dirichlet only. Crack-face nodes stay free (cohesive traction).
-    for el in mesh.elements
-        el.eq_type == 1 || continue
-        for loc in 1:3, dir in 1:2
-            j = el.fis[loc]
-            dof = 2(j - 1) + dir
-            if el.bc_type[loc, dir] == 0
+    eq = mesh.eq_type
+    @inbounds for i in 1:n
+        if eq[i] in (2, 3)
+            continue
+        end
+        for dir in 1:2
+            dof = 2(i - 1) + dir
+            if mesh.BC[dof] == 0
                 is_dir[dof] = true
-                u_bar[dof] = el.bc_val[loc, dir]
+                u_bar[dof] = mesh.BV[dof]
             end
         end
     end
-    # force crack-face DOFs free even if element table says Dirichlet
-    for (j, nd) in enumerate(mesh.nodes)
-        if nd.eq_type in (2, 3)
-            is_dir[2j - 1] = false
-            is_dir[2j] = false
-        end
-    end
-    # proportional load dofs override
     for (k, dof) in enumerate(load_dofs)
         is_dir[dof] = true
         u_bar[dof] = load_ū[k]
@@ -250,32 +241,6 @@ function _bc_partition(mesh::DualMesh, load_dofs::Vector{Int}, load_ū::Vector{
     free = findall(!, is_dir)
     fixed = findall(identity, is_dir)
     return (; is_dir, u_bar, free, fixed)
-end
-
-"""
-Map nodal tractions `t_nodal` (2n) onto element traction vector (6nel)
-by scattering to owning element local nodes (first owner wins, same as dual BC).
-"""
-function _nodal_to_element_traction(mesh::DualMesh, t_nodal::AbstractVector)
-    n = length(mesh.nodes)
-    nel = length(mesh.elements)
-    t_el = zeros(6nel)
-    owner = fill((0, 0), n)
-    for (ie, el) in enumerate(mesh.elements)
-        for loc in 1:3
-            j = el.fis[loc]
-            owner[j] == (0, 0) && (owner[j] = (ie, loc))
-        end
-    end
-    for j in 1:n
-        ie, loc = owner[j]
-        ie == 0 && continue
-        for dir in 1:2
-            gcol = 6(ie - 1) + 2(loc - 1) + dir
-            t_el[gcol] = t_nodal[2(j - 1) + dir]
-        end
-    end
-    return t_el
 end
 
 # ---------------------------------------------------------------------------
@@ -294,28 +259,25 @@ function _residual!(
         part,
     )
     mesh = prob.mesh
-    n = length(mesh.nodes)
+    n = mesh.n
     u = zeros(2n)
     u[part.free] .= u_free
     u[part.fixed] .= λ .* part.u_bar[part.fixed]
 
     _update_constitutive!(prob, u)
-    t_coh = _cohesive_traction_vector(prob, u)
-    t_el = _nodal_to_element_traction(mesh, t_coh)
-
-    # Prescribed Neumann on *outer* boundary only (eq_type==1).
-    # Crack faces (eq 2/3) get traction solely from the cohesive law.
-    for (ie, el) in enumerate(mesh.elements)
-        el.eq_type == 1 || continue
-        for loc in 1:3, dir in 1:2
-            if el.bc_type[loc, dir] == 1
-                gcol = 6(ie - 1) + 2(loc - 1) + dir
-                t_el[gcol] += el.bc_val[loc, dir]
+    t = _cohesive_traction_vector(prob, u)
+    eq = mesh.eq_type
+    @inbounds for i in 1:n
+        eq[i] == 1 || continue
+        for dir in 1:2
+            dof = 2(i - 1) + dir
+            if mesh.BC[dof] == 1
+                t[dof] += mesh.BV[dof]
             end
         end
     end
 
-    res = mesh.H * u - mesh.G * t_el
+    res = mesh.H * u - mesh.G * t
     r .= res[part.free]
     return r, u
 end
@@ -329,29 +291,7 @@ function _jacobian(prob::CohesiveDBEMProblem, u::AbstractVector, part)
     mesh = prob.mesh
     _update_constitutive!(prob, u)
     Kc = _assemble_Kc(prob)
-    # t_el = P * t_nodal, t_nodal ≈ Kc u  (for cohesive part)
-    # residual = H u − G P Kc u − G t_ext
-    # J_full = H − G P Kc
-    n = length(mesh.nodes)
-    # build P (6nel × 2n)
-    nel = length(mesh.elements)
-    P = zeros(6nel, 2n)
-    owner = fill((0, 0), n)
-    for (ie, el) in enumerate(mesh.elements)
-        for loc in 1:3
-            j = el.fis[loc]
-            owner[j] == (0, 0) && (owner[j] = (ie, loc))
-        end
-    end
-    for j in 1:n
-        ie, loc = owner[j]
-        ie == 0 && continue
-        for dir in 1:2
-            gcol = 6(ie - 1) + 2(loc - 1) + dir
-            P[gcol, 2(j - 1) + dir] = 1.0
-        end
-    end
-    Jfull = mesh.H - mesh.G * (P * Kc)
+    Jfull = mesh.H - mesh.G * Kc
     return Jfull[part.free, part.free]
 end
 
@@ -393,7 +333,7 @@ function solve_cohesive_dbem!(
     u_free = fill(1e-12, nfree)
     u_hist = Vector{Vector{Float64}}()
     λ_hist = Float64[]
-    n = length(mesh.nodes)
+    n = mesh.n
 
     # legacy alias
     if control_dof > 0 && method === :load
@@ -419,7 +359,7 @@ function solve_cohesive_dbem!(
             u[cd] = u_target
             mesh.u = u
             t_coh = _cohesive_traction_vector(prob, u)
-            mesh.t_el = _nodal_to_element_traction(mesh, t_coh)
+            mesh.traction = t_coh
             push!(u_hist, copy(u))
             push!(λ_hist, prob.λ)
             prob.verbose && @info "DOF-control step" step u_target ok
@@ -435,7 +375,7 @@ function solve_cohesive_dbem!(
             u[part.fixed] .= λ .* part.u_bar[part.fixed]
             mesh.u = u
             t_coh = _cohesive_traction_vector(prob, u)
-            mesh.t_el = _nodal_to_element_traction(mesh, t_coh)
+            mesh.traction = t_coh
             push!(u_hist, copy(u))
             push!(λ_hist, λ)
             prob.verbose && @info "load step" step λ conv
@@ -451,7 +391,7 @@ function _solve_arclength!(
         prob, part, u_free, nsteps, Δs, ψ, λ_end, u_hist, λ_hist,
     )
     mesh = prob.mesh
-    n = length(mesh.nodes)
+    n = mesh.n
     nf = length(u_free)
     λ = 0.0
     prob.λ = λ
@@ -532,7 +472,7 @@ function _solve_arclength!(
 
         prob.λ = λ
         mesh.u = u
-        mesh.t_el = _nodal_to_element_traction(mesh, _cohesive_traction_vector(prob, u))
+        mesh.traction = _cohesive_traction_vector(prob, u)
         push!(u_hist, copy(u))
         push!(λ_hist, λ)
         prob.verbose && @info "arclength step" step λ conv s = s_auto
@@ -588,7 +528,7 @@ function _newton_step_control!(
         prob, part, free2, cd, u_cd, u_free_full; idx_c,
     )
     # Rebuild partition treating cd as fixed
-    n = length(prob.mesh.nodes)
+    n = prob.mesh.n
     is_dir = copy(part.is_dir)
     is_dir[cd] = true
     u_bar = copy(part.u_bar)
@@ -639,137 +579,147 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    modeI_patch_mesh(; L=0.1, E=32e9, ν=0.2, n_coh=4, n_side=3) -> DualMesh
+    modeI_patch_mesh(; L=0.1, E=32e9, ν=0.2, n_coh=4, n_side=3) -> (BEMdata, top_elems)
 
 Square plate with a horizontal cohesive interface at mid-height (mode I).
-Bottom fixed, top Dirichlet uy.
+Bottom fixed, top Dirichlet uy (set by the caller via `load_dofs`).
 """
-function modeI_patch_mesh(; L = 0.1, E = 32e9, ν = 0.2, n_coh = 4, n_side = 3, plane_strain = true)
-    geo = Point2D[]
-    nodes = DualNode[]
-    elems = DualElement[]
-    # Helper to push a linear edge as one discontinuous quadratic element
-    # with collocation at ±2/3,0 mapped to the segment.
-    function add_edge!(p1, p2, eq, bc_type, bc_val; crack_face = 0)
-        g0 = length(geo)
-        mid = 0.5 * (p1 + p2)
-        push!(geo, p1); push!(geo, mid); push!(geo, p2)
-        # physical nodes
+function modeI_patch_mesh(; L=0.1, E=32e9, ν=0.2, n_coh=4, n_side=3,
+        plane_strain=true, ordem=2)
+    B = parentmodule(@__MODULE__)
+    p = Int(ordem)
+    qsi, wi = B.discontinuous_nodes_weights(p)
+    n_per = p + 1
+    poly_geo = B.Equispaced(p)
+    Ngeo, dNgeo = B.shapefun(poly_geo, qsi)
+
+    nodes = Point2D[]
+    normals = Point2D[]
+    elems = B.Element[]
+    BC = Int[]
+    BV = Float64[]
+    eq_acc = Int[]
+
+    function add_edge!(p1, p2, eq, bc_type, bc_val)
+        X = [p1 + ((k - 1) / p) * (p2 - p1) for k in 1:n_per]
+        NOS = Ngeo * X
+        dx = dNgeo * X
+        J = norm.(dx)
+        nrm = B.tan2normal.(dx ./ J)
+        Lseg = abs(dot(J, wi))
         n0 = length(nodes)
-        t̂ = (p2 - p1) / (norm(p2 - p1) + eps())
-        n̂ = Point2D(t̂[2], -t̂[1])   # right-hand normal
-        for (k, ξ) in enumerate((-2 / 3, 0.0, 2 / 3))
-            N = N_cont(ξ)
-            x = N[1] * p1 + N[2] * mid + N[3] * p2
-            push!(nodes, DualNode(n0 + k, Point2D(x), eq, n̂, 0))
+        idx = collect((n0 + 1):(n0 + n_per))
+        append!(nodes, Point2D.(NOS))
+        append!(normals, nrm)
+        append!(eq_acc, fill(eq, n_per))
+        for _ in 1:n_per
+            append!(BC, Int[bc_type[1], bc_type[2]])
+            append!(BV, Float64[bc_val[1], bc_val[2]])
         end
-        bt = Matrix{Int}(undef, 3, 2)
-        bv = Matrix{Float64}(undef, 3, 2)
-        for loc in 1:3, dir in 1:2
-            bt[loc, dir] = bc_type[dir]
-            bv[loc, dir] = bc_val[dir]
-        end
-        push!(elems, DualElement(length(elems) + 1,
-            (g0 + 1, g0 + 2, g0 + 3),
-            (n0 + 1, n0 + 2, n0 + 3),
-            eq, bt, bv))
+        push!(elems, B.Element(idx, collect(Float64, J), Float64(Lseg), 0))
         return length(elems)
     end
 
     h = L / 2
-    # outer boundary (eq=1): bottom, right lower, right upper, top, left upper, left lower
-    # bottom y=0
-    xs = range(0, L; length = n_side + 1)
+    xs = range(0, L; length=n_side + 1)
     for i in 1:n_side
         add_edge!(Point2D(xs[i], 0.0), Point2D(xs[i + 1], 0.0), 1, (0, 0), (0.0, 0.0))
     end
-    # right x=L lower + upper
-    ys = range(0, h; length = max(n_side ÷ 2, 2))
+    ys = range(0, h; length=max(n_side ÷ 2, 2))
     for i in 1:length(ys)-1
         add_edge!(Point2D(L, ys[i]), Point2D(L, ys[i + 1]), 1, (1, 1), (0.0, 0.0))
     end
-    ys2 = range(h, L; length = max(n_side ÷ 2, 2))
+    ys2 = range(h, L; length=max(n_side ÷ 2, 2))
     for i in 1:length(ys2)-1
         add_edge!(Point2D(L, ys2[i]), Point2D(L, ys2[i + 1]), 1, (1, 1), (0.0, 0.0))
     end
-    # top y=L (Dirichlet uy will be set as load)
-    xs_top = range(L, 0; length = n_side + 1)
+    xs_top = range(L, 0; length=n_side + 1)
     top_elems = Int[]
     for i in 1:n_side
         e = add_edge!(Point2D(xs_top[i], L), Point2D(xs_top[i + 1], L), 1, (1, 0), (0.0, 0.0))
         push!(top_elems, e)
     end
-    # left x=0 upper + lower
-    ys3 = range(L, h; length = max(n_side ÷ 2, 2))
+    ys3 = range(L, h; length=max(n_side ÷ 2, 2))
     for i in 1:length(ys3)-1
         add_edge!(Point2D(0.0, ys3[i]), Point2D(0.0, ys3[i + 1]), 1, (1, 1), (0.0, 0.0))
     end
-    ys4 = range(h, 0; length = max(n_side ÷ 2, 2))
+    ys4 = range(h, 0; length=max(n_side ÷ 2, 2))
     for i in 1:length(ys4)-1
         add_edge!(Point2D(0.0, ys4[i]), Point2D(0.0, ys4[i + 1]), 1, (1, 1), (0.0, 0.0))
     end
 
-    # Cohesive interface at y=h.
-    # Normals = solid-outward (into the gap), same convention as Gmsh dual cracks:
-    #   face + (upper body bottom, eq=2): n = (0, -1)
-    #   face − (lower body top,    eq=3): n = (0, +1)
-    xs_c = range(0, L; length = n_coh + 1)
+    xs_c = range(0, L; length=n_coh + 1)
     face_a = Int[]
     face_b = Int[]
     nodes_plus = Int[]
     nodes_minus = Int[]
     for i in 1:n_coh
-        # upper face: left → right, solid above → outward into gap is down
         e = add_edge!(Point2D(xs_c[i], h), Point2D(xs_c[i + 1], h), 2, (1, 1), (0.0, 0.0))
         el = elems[e]
-        for loc in 1:3
-            nodes[el.fis[loc]].normal = Point2D(0.0, -1.0)
-            nodes[el.fis[loc]].eq_type = 2
-            push!(nodes_plus, el.fis[loc])
+        for j in el.index
+            normals[j] = Point2D(0.0, -1.0)
+            eq_acc[j] = 2
+            push!(nodes_plus, j)
         end
         push!(face_a, e)
     end
     for i in n_coh:-1:1
-        # lower face: right → left, solid below → outward into gap is up
         e = add_edge!(Point2D(xs_c[i + 1], h), Point2D(xs_c[i], h), 3, (1, 1), (0.0, 0.0))
         el = elems[e]
-        for loc in 1:3
-            nodes[el.fis[loc]].normal = Point2D(0.0, 1.0)
-            nodes[el.fis[loc]].eq_type = 3
-            push!(nodes_minus, el.fis[loc])
+        for j in el.index
+            normals[j] = Point2D(0.0, 1.0)
+            eq_acc[j] = 3
+            push!(nodes_minus, j)
         end
         push!(face_b, e)
     end
-    # twin pairing by x-coordinate
+
+    n = length(nodes)
+    twin = zeros(Int, n)
     for ip in nodes_plus
-        xp = nodes[ip].pos
+        xp = nodes[ip]
         best, dmin = 0, Inf
         for im in nodes_minus
-            d = abs(nodes[im].pos[1] - xp[1])
+            d = abs(nodes[im][1] - xp[1])
             if d < dmin
                 dmin, best = d, im
             end
         end
         if best > 0
-            nodes[ip].twin = best
-            nodes[best].twin = ip
+            twin[ip] = best
+            twin[best] = ip
         end
     end
 
-    mesh = DualMesh(geo, nodes, elems; E = E, ν = ν, plane_strain = plane_strain)
-    mesh.crack_face_a = face_a
-    mesh.crack_face_b = face_b
-    return mesh, top_elems
+    dad = B.BEMdata(
+        "modeI_patch",
+        2,
+        elems,
+        B.Legendre(p),
+        SVector{n_per}(Float64.(wi)),
+        nodes,
+        normals,
+        B.Elasticity(E, ν, 1.0; plane_strain=plane_strain),
+        BC,
+        BV,
+        n,
+        0,
+        n,
+        B.BEMCache(),
+    )
+    B.set_cache!(dad; eq_type=eq_acc, twin=twin,
+        crack_face_a=face_a, crack_face_b=face_b, crack_bc=:traction_free,
+        tip_nodes=isempty(nodes_plus) ? Int[] : [nodes_plus[1], nodes_plus[end]])
+    return dad, top_elems
 end
 
 """
-    modeII_patch_mesh(; ...) -> DualMesh
+    modeII_patch_mesh(; ...) -> (BEMdata, top_elems)
 
 Square with horizontal cohesive interface, shear loading (mode II).
 """
 function modeII_patch_mesh(; kwargs...)
     mesh, top = modeI_patch_mesh(; kwargs...)
-    # change top BC: free uy, prescribe ux (shear) — done via load_dofs in problem setup
     return mesh, top
 end
 
@@ -778,26 +728,25 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    contact_compression_mesh(; L=0.1, gap0=0.0, ...) -> (DualMesh, top_elems)
+    contact_compression_mesh(; L=0.1, gap0=0.0, ...) -> (BEMdata, top_elems)
 
 Mode-I geometry with a closed (or nearly closed) cohesive interface for
 **compression / contact** tests. Top face Dirichlet `uy < 0` drives contact.
 """
-function contact_compression_mesh(; gap0 = 0.0, kwargs...)
+function contact_compression_mesh(; gap0=0.0, kwargs...)
     mesh, top = modeI_patch_mesh(; kwargs...)
     if gap0 != 0
+        coll = getfield(mesh, :collocation)
         for elid in mesh.crack_face_a
-            el = mesh.elements[elid]
-            for j in el.fis
-                p = mesh.nodes[j].pos
-                mesh.nodes[j].pos = Point2D(p[1], p[2] + gap0 / 2)
+            for j in mesh.elements[elid].index
+                p = coll[j]
+                coll[j] = Point2D(p[1], p[2] + gap0 / 2)
             end
         end
         for elid in mesh.crack_face_b
-            el = mesh.elements[elid]
-            for j in el.fis
-                p = mesh.nodes[j].pos
-                mesh.nodes[j].pos = Point2D(p[1], p[2] - gap0 / 2)
+            for j in mesh.elements[elid].index
+                p = coll[j]
+                coll[j] = Point2D(p[1], p[2] - gap0 / 2)
             end
         end
     end
@@ -805,100 +754,102 @@ function contact_compression_mesh(; gap0 = 0.0, kwargs...)
 end
 
 """
-    extend_cohesive_process_zone!(mesh, tip_node, da; n_new=2) -> new_face_a_ids
+    extend_cohesive_process_zone!(dad, tip_node, da; n_new=2) -> new_face_a_ids
 
 Extend both crack faces by length `da` ahead of `tip_node`, adding `n_new`
 discontinuous cohesive elements per face and twin-pairing the new nodes.
-Call `assemble_dual!` again after extension.
+Call `assemble_dual!` again after extension. Requires `dad.ni == 0`.
 """
 function extend_cohesive_process_zone!(
-        mesh::DualMesh,
+        mesh::BEMdata{<:Elasticity},
         tip_node::Int,
         da::Float64;
-        n_new::Int = 2,
+        n_new::Int=2,
     )
-    tip = mesh.nodes[tip_node]
+    B = parentmodule(@__MODULE__)
+    mesh.ni == 0 || error("extend_cohesive_process_zone!: no internal nodes")
+    p = length(mesh.elements[1]) - 1
+    n_per = p + 1
+    qsi, wi = B.discontinuous_nodes_weights(p)
+    poly_geo = B.Equispaced(p)
+    Ngeo, dNgeo = B.shapefun(poly_geo, qsi)
+
     faceA_nodes = Int[]
     for elid in mesh.crack_face_a
-        append!(faceA_nodes, mesh.elements[elid].fis)
+        append!(faceA_nodes, mesh.elements[elid].index)
     end
     unique!(faceA_nodes)
-    centroid = sum(mesh.nodes[i].pos for i in faceA_nodes) / max(length(faceA_nodes), 1)
-    d = tip.pos - centroid
+    tip_pos = mesh.Nodes[tip_node]
+    centroid = sum(mesh.Nodes[i] for i in faceA_nodes) / max(length(faceA_nodes), 1)
+    d = tip_pos - centroid
     if norm(d) < 1e-14
-        d = tip.normal
+        d = mesh.Normal[tip_node]
     end
     d = d / (norm(d) + eps())
-    n̂_plus = tip.normal / (norm(tip.normal) + eps())
+    n̂_plus = mesh.Normal[tip_node]
+    n̂_plus = n̂_plus / (norm(n̂_plus) + eps())
+    n̂_minus = -n̂_plus
 
-    xs = [tip.pos + (k / n_new) * da * d for k in 0:n_new]
+    xs = [tip_pos + (k / n_new) * da * d for k in 0:n_new]
     new_a = Int[]
     nodes_plus = Int[]
     nodes_minus = Int[]
+    eq_type = copy(mesh.eq_type)
+    twin = copy(mesh.twin)
+    face_a = copy(mesh.crack_face_a)
+    face_b = copy(mesh.crack_face_b)
+    coll = getfield(mesh, :collocation)
+
+    function add_seg!(p1, p2, eq, nfix)
+        X = [p1 + ((k - 1) / p) * (p2 - p1) for k in 1:n_per]
+        NOS = Ngeo * X
+        dx = dNgeo * X
+        J = norm.(dx)
+        Lseg = abs(dot(J, wi))
+        n0 = mesh.n
+        idx = collect((n0 + 1):(n0 + n_per))
+        append!(coll, Point2D.(NOS))
+        append!(mesh.Normal, fill(nfix, n_per))
+        for _ in 1:n_per
+            append!(mesh.BC, [1, 1])
+            append!(mesh.BV, [0.0, 0.0])
+        end
+        append!(eq_type, fill(eq, n_per))
+        append!(twin, zeros(Int, n_per))
+        mesh.n = n0 + n_per
+        mesh.nt = mesh.n
+        push!(mesh.elements, B.Element(idx, collect(Float64, J), Float64(Lseg), 0))
+        return idx, length(mesh.elements)
+    end
 
     for i in 1:n_new
         p1, p2 = xs[i], xs[i + 1]
-        mid = 0.5 * (p1 + p2)
-        g0 = length(mesh.geo_nodes)
-        push!(mesh.geo_nodes, p1, mid, p2)
-        n0 = length(mesh.nodes)
-        for ξ in (-2 / 3, 0.0, 2 / 3)
-            N = N_cont(ξ)
-            x = N[1] * p1 + N[2] * mid + N[3] * p2
-            push!(mesh.nodes, DualNode(length(mesh.nodes) + 1, Point2D(x), 2, n̂_plus, 0))
-            push!(nodes_plus, length(mesh.nodes))
-        end
-        bt = ones(Int, 3, 2)
-        bv = zeros(3, 2)
-        el = DualElement(
-            length(mesh.elements) + 1,
-            (g0 + 1, g0 + 2, g0 + 3),
-            (n0 + 1, n0 + 2, n0 + 3),
-            2, bt, bv,
-        )
-        push!(mesh.elements, el)
-        push!(mesh.crack_face_a, el.id)
-        push!(new_a, el.id)
-
-        g0 = length(mesh.geo_nodes)
-        push!(mesh.geo_nodes, p2, mid, p1)
-        n0 = length(mesh.nodes)
-        n̂_minus = -n̂_plus
-        for ξ in (-2 / 3, 0.0, 2 / 3)
-            N = N_cont(ξ)
-            x = N[1] * p2 + N[2] * mid + N[3] * p1
-            push!(mesh.nodes, DualNode(length(mesh.nodes) + 1, Point2D(x), 3, n̂_minus, 0))
-            push!(nodes_minus, length(mesh.nodes))
-        end
-        el = DualElement(
-            length(mesh.elements) + 1,
-            (g0 + 1, g0 + 2, g0 + 3),
-            (n0 + 1, n0 + 2, n0 + 3),
-            3, bt, bv,
-        )
-        push!(mesh.elements, el)
-        push!(mesh.crack_face_b, el.id)
+        idx, ie = add_seg!(p1, p2, 2, n̂_plus)
+        append!(nodes_plus, idx)
+        push!(face_a, ie)
+        push!(new_a, ie)
+        idx, ie = add_seg!(p2, p1, 3, n̂_minus)
+        append!(nodes_minus, idx)
+        push!(face_b, ie)
     end
 
     for ip in nodes_plus
-        xp = mesh.nodes[ip].pos
+        xp = coll[ip]
         best, dmin = 0, Inf
         for im in nodes_minus
-            dd = norm(mesh.nodes[im].pos - xp)
+            dd = norm(coll[im] - xp)
             dd < dmin && ((dmin, best) = (dd, im))
         end
         if best > 0
-            mesh.nodes[ip].twin = best
-            mesh.nodes[best].twin = ip
+            twin[ip] = best
+            twin[best] = ip
         end
     end
 
-    nn = length(mesh.nodes)
-    nel = length(mesh.elements)
-    mesh.H = zeros(2nn, 2nn)
-    mesh.G = zeros(2nn, 6nel)
-    mesh.u = zeros(2nn)
-    mesh.t_el = zeros(6nel)
-    mesh.tip_nodes = [nodes_plus[end]]
+    B.set_cache!(mesh; eq_type=eq_type, twin=twin,
+        crack_face_a=face_a, crack_face_b=face_b,
+        tip_nodes=[nodes_plus[end]],
+        H=nothing, G=nothing, A=nothing, B=nothing, b=nothing, u=nothing)
     return new_a
 end
+

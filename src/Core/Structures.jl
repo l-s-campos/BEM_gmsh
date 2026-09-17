@@ -1,10 +1,14 @@
 # (BEM) structures
 export Point2D, Point3D, Point, BEMdata, Element, Problem, Scalar, Vectorial
 export Laplace, Helmholtz, Elasticity, AnisotropicElasticity, LekhnitskiiParams
-export OrthotropicLaplace, AxisymmetricElasticity
+export AnisotropicElasticity3D
+export OrthotropicLaplace, AnisotropicLaplace, AxisymmetricElasticity
+export AbstractThinPlate, ThinPlate
+export AbstractFSDT, FSDT, n_dof
 export BEMCache, has_cache, set_cache!
 export shear_modulus, lame_λ, lame_mu, lame_constants, plane_strain_κ, effective_nu,
        plane_stress, refresh_lame!, thermal_modulus
+export singularity_orders, singularity_order_G, singularity_order_H, kernel_eltype
 export point, all_points, all_points!, set_internal_nodes!
 
 """
@@ -25,6 +29,70 @@ abstract type Problem end
 abstract type Scalar <: Problem end
 abstract type Vectorial <: Problem end
 
+"""Kirchhoff (thin) plate — 2 DOFs/node ``(w, ∂w/∂n)``. See [`ThinPlate`](@ref)."""
+abstract type AbstractThinPlate <: Vectorial end
+
+"""
+FSDT / Reissner (thick) plate — 3 DOFs/node ``(ψx, ψy, w)``.
+Geometry is still 2-D (`dad.dimension == 2`); see [`n_dof`](@ref).
+"""
+abstract type AbstractFSDT <: Vectorial end
+
+"""
+Isotropic Kirchhoff plate. ``D = E h³ / [12(1-ν²)]``.
+Distributed load ``q = q_a x + q_b y + q_c``.
+
+`BEMdata{<:ThinPlate}` uses the same collocation assembly as 2-D elasticity
+([`H_G_full_direct`](@ref)): Gauss nodes, far lumping, sinh near-field,
+on-element Guiggiani.
+"""
+@kwdef mutable struct ThinPlate <: AbstractThinPlate
+    E::Float64 = 1.0
+    ν::Float64 = 0.3
+    h::Float64 = 0.01
+    q_a::Float64 = 0.0
+    q_b::Float64 = 0.0
+    q_c::Float64 = 0.0
+    ρ::Float64 = 1.0
+end
+
+"""
+Isotropic FSDT / Reissner plate. ``λ = √10 / h`` (κ=5/6). Load ``q = q_c``.
+
+`BEMdata{<:FSDT}` uses the same collocation assembly as 2-D elasticity
+([`H_G_full_direct`](@ref)): Gauss nodes, far lumping, sinh near-field,
+on-element Guiggiani. Prefer [`FSDTProps`](@ref) when `using BEM.Plate`.
+"""
+@kwdef mutable struct FSDT <: AbstractFSDT
+    E::Float64 = 1.0
+    ν::Float64 = 0.3
+    h::Float64 = 0.01
+    ρ::Float64 = 1.0
+    q_c::Float64 = 0.0
+end
+
+"""Field DOFs per collocation node. Distinct from geometry `dad.dimension`."""
+n_dof(::Scalar, ::Integer) = 1
+n_dof(::Vectorial, d::Integer) = Int(d)
+n_dof(::AbstractThinPlate, ::Integer) = 2
+n_dof(::AbstractFSDT, ::Integer) = 3
+n_dof(p::Problem) = n_dof(p, 2)
+
+# On-element Guiggiani Laurent orders for (single-layer G, double-layer H).
+# Convention matches `guiggiani_integral`: 0 = log, -1 = CPV 1/ρ, -2 = HFP 1/ρ².
+"""Laurent orders `(order_G, order_H)` for on-element BIE kernels."""
+singularity_orders(::Problem) = (0, -1)
+# Kirchhoff P has 1/r² (HBIE-like); G is log-singular.
+singularity_orders(::AbstractThinPlate) = (0, -2)
+# Vander Weeën P is CPV 1/r (elasticity-like); G is log.
+singularity_orders(::AbstractFSDT) = (0, -1)
+
+singularity_order_G(p::Problem) = singularity_orders(p)[1]
+singularity_order_H(p::Problem) = singularity_orders(p)[2]
+
+"""Element type of single-layer / double-layer kernels for `p`."""
+kernel_eltype(::Problem) = Float64
+
 # ---------------------------------------------------------------------------
 # Scalar problems
 # ---------------------------------------------------------------------------
@@ -37,8 +105,9 @@ end
 """
     Helmholtz(; ω=1.0, c=1.0)
 
-2D Helmholtz / time-harmonic acoustics with wavenumber ``κ = ω/c``.
-Fundamental solution uses Hankel functions of the first kind.
+Helmholtz / time-harmonic acoustics with wavenumber ``κ = ω/c``.
+2-D kernels use Hankel ``H_0^{(1)}, H_1^{(1)}``; 3-D kernels use
+``e^{iκR}/(4πR)``. Hypersingular kernels: [`fundamental_hyper`](@ref).
 """
 @kwdef mutable struct Helmholtz{T} <: Scalar
     ω::T = 1.0          # angular frequency
@@ -46,6 +115,7 @@ Fundamental solution uses Hankel functions of the first kind.
 end
 
 wavenumber(h::Helmholtz) = h.ω / h.c
+kernel_eltype(::Helmholtz) = ComplexF64
 
 # ---------------------------------------------------------------------------
 # Vectorial problems
@@ -221,31 +291,36 @@ AnisotropicElasticity(params::LekhnitskiiParams{T}; rho=one(T)) where {T} =
     AnisotropicElasticity{T}(params, rho)
 
 """
+3D anisotropic linear elasticity (Ting–Lee / Barnett–Lothe Green’s function).
+
+`C` is the 6×6 Voigt stiffness. `C4` is the equivalent ``C_{ijkl}`` tensor.
+"""
+mutable struct AnisotropicElasticity3D{T} <: Vectorial
+    C::SMatrix{6,6,T,36}
+    C4::Array{T,4}
+    rho::T
+    nψ::Int
+end
+thermal_modulus(::AnisotropicElasticity3D) = 0.0
+
+"""
     Element
 
 Boundary element connectivity and metrics.
 
 # Fields
-- `index` — global indices into `dad.Nodes` (Lagrange nodes **or** Bézier / NURBS
-  control points when `extraction` is set)
+- `index` — global indices into `dad.Nodes`
 - `Jacobian` — ``|dx/dξ|`` samples (collocation or quadrature)
 - `Length` — element arc length
 - `Region` — Gmsh entity / physical region tag
-- `extraction` — optional Bézier extraction operator `C` so that
-  `N(ξ) = B(ξ) * C` with Bernstein row `B` (see `Bernstein`);
-  `nothing` ⇒ classical Lagrange / polynomial element
-- `nurbs_weights` — optional NURBS weights on the local controls (with
-  `extraction`); `nothing` ⇒ pure B-spline / polynomial Bézier
 """
 @kwdef mutable struct Element
     index::Vector{Int64}
     Jacobian::Vector{Float64}
     Length::Float64
     Region::Int64
-    extraction::Union{Nothing, Matrix{Float64}} = nothing
-    nurbs_weights::Union{Nothing, Vector{Float64}} = nothing
-    """Bézier/NURBS control points for geometry (when set, used instead of `Nodes[index]`)."""
-    controls::Union{Nothing, Vector} = nothing
+    """CAD / geometric nodes (ξ = −1…1 Lagrange). Empty → geometry from `index`."""
+    geo::Vector{Point2D} = Point2D[]
 end
 
 # Positional 4-arg ctor (Gmsh tags may be Int32)
@@ -293,10 +368,26 @@ field access and does not rebuild the whole object.
 | Operators | `H`, `G`, `A`, `B`, `b`, `M` |
 | Quadrature | `qsi`, `w` |
 | Solutions | `T`, `q`, `u`, `traction`, `time` |
+| Recovery | `strain`, `stress` (Voigt, from `∇u`) |
 | Extras | `analytical`, `ode_sol`, `gmres_stats`, `extras::Dict` |
 
 Unset fields are `nothing`. Use [`has_cache`](@ref)`(dad, :H)` or
 `haskey(dad.cache, :H)`.
+
+Unknown `set_cache!` names go in `extras`. Common keys:
+
+| Key | Set by |
+|-----|--------|
+| `:cells` | `format2d` (Gmsh 2-D elements) |
+| `:dibem_F`, `:dibem_c`, `:dibem_ID`, `:dibem_D`, `:dibem_rbf`, `:dibem_method` | `DIBEM` |
+| `:dibem_IF`, `:dibem_IP`, `:dibem_U`, `:dibem_Q`, `:dibem_centers` | DIBEM variants |
+| `:surf_dibem` | 3-D face DIBEM (`nearfield=:dibem`): `(nedge, ξ, η, c)` |
+| `:bc_idx`, `:hg_blocks`, `:block_lu` | mixed-BC block path |
+| `:sbm` | `assemble_sbm!` |
+| `:lbem_*` | local BEM |
+| `:twin`, `:eq_type` | dual BEM |
+| `:topology` | `bemdata_from_loops` |
+| `:modal_basis`, `:M_DA`, `:H_hyper`, `:galerkin_*` | Laplace specialty methods |
 """
 mutable struct BEMCache
     H::Any
@@ -312,6 +403,8 @@ mutable struct BEMCache
     u::Any
     traction::Any   # elasticity traction
     time::Any       # time grid for transient
+    strain::Any     # Voigt ε at collocation (n × 3 or n × 6)
+    stress::Any     # Voigt σ at collocation
     analytical::Any
     ode_sol::Any
     gmres_stats::Any
@@ -323,6 +416,7 @@ function BEMCache()
         nothing, nothing, nothing, nothing, nothing, nothing,
         nothing, nothing,
         nothing, nothing, nothing, nothing, nothing,
+        nothing, nothing,
         nothing, nothing, nothing,
         Dict{Symbol,Any}(),
     )
@@ -345,7 +439,7 @@ function Base.haskey(c::BEMCache, sym::Symbol)
     if hasfield(BEMCache, sym) && sym !== :extras
         return getfield(c, sym) !== nothing
     end
-    return haskey(c.extras, sym)
+    return haskey(c.extras, sym) && c.extras[sym] !== nothing
 end
 
 function Base.getindex(c::BEMCache, sym::Symbol)
@@ -505,6 +599,8 @@ Return the live `collocation` storage (boundary then internal). **No copy.**
 """
 all_points(dad::BEMdata) = getfield(dad, :collocation)
 
+n_dof(dad::BEMdata) = n_dof(dad.properties, dad.dimension)
+
 """
     all_points!(pts, dad) -> pts
 
@@ -547,12 +643,22 @@ function Base.show(io::IO, d::BEMdata{P}) where {P<:Problem}
     println(io, "  elements: $ne")
     if d.properties isa Laplace
         println(io, "  properties: k=$(d.properties.k)")
+    elseif d.properties isa OrthotropicLaplace
+        println(io, "  properties: k1=$(d.properties.k1), k2=$(d.properties.k2)")
+    elseif d.properties isa AnisotropicLaplace
+        println(io, "  properties: anisotropic Laplace K=$(d.properties.K)")
     elseif d.properties isa Helmholtz
         println(io, "  properties: ω=$(d.properties.ω), c=$(d.properties.c), κ=$(wavenumber(d.properties))")
     elseif d.properties isa Elasticity
         println(io, "  properties: E=$(d.properties.E), ν=$(d.properties.nu), ρ=$(d.properties.rho), plane_strain=$(d.properties.plane_strain)")
     elseif d.properties isa AnisotropicElasticity
         println(io, "  properties: anisotropic (Lekhnitskii), ρ=$(d.properties.rho)")
+    elseif d.properties isa AnisotropicElasticity3D
+        println(io, "  properties: anisotropic 3D, ρ=$(d.properties.rho)")
+    elseif d.properties isa ThinPlate
+        println(io, "  properties: Kirchhoff E=$(d.properties.E), ν=$(d.properties.ν), h=$(d.properties.h)")
+    elseif d.properties isa AbstractThinPlate
+        println(io, "  properties: Kirchhoff anisotropic")
     else
         println(io, "  properties: $(d.properties)")
     end

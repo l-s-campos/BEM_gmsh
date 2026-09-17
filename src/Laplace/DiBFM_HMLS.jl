@@ -290,9 +290,8 @@ build_hmls_condensation!(dib::DiBFMData; kwargs...) =
 # -----------------------------------------------------------------------------
 
 """φ = r³ PHS and radial derivative φ' = 3 r² (used if `rbf` is PHS3-like)."""
-function _phi_dphi(rbf, r2)
-    φ = rbf(r2)
-    r = sqrt(max(r2, 0.0))
+function _phi_dphi(rbf, r)
+    φ = rbf(r)
     # generic finite-diff φ' if not PHS; for r³: φ'=3r²
     dφ = 3 * r  # d(r³)/dr / r * r wait: ∇φ = φ'(r) x̂, |∇φ|=|φ'|
     # For φ=r^3, φ'=3r^2, ∂φ/∂x_k = 3r (x_k)
@@ -332,7 +331,7 @@ function _rbf2d_rows(d::DLIMData, iv::Int, ids::Vector{Int}, nrm_v, rbf; hermite
         rij = pts[i] - pts[j]
         r2 = dot(rij, rij)
         r = sqrt(max(r2, 0.0))
-        φ = rbf(r2)
+        φ = rbf(r)
         # ∂φ_j/∂n_i at x_i: ∇_x φ · n_i = 3r (x_i-x_j)·n_i
         coeff = 3 * r   # ∇φ = coeff * (x - xj)
         dφ_dni = coeff * dot(rij, ns[i])          # at xi, x-xj = rij
@@ -390,7 +389,7 @@ function _rbf2d_rows(d::DLIMData, iv::Int, ids::Vector{Int}, nrm_v, rbf; hermite
             rij = pv - pts[j]
             r2 = dot(rij, rij)
             r = sqrt(max(r2, 0.0))
-            φ = rbf(r2)
+            φ = rbf(r)
             coeff = 3 * r
             ψ = -coeff * dot(rij, ns[j])   # 3r (xj-pv)·nj = -3r (pv-xj)·nj
             uval += α[j] * φ + β[j] * ψ

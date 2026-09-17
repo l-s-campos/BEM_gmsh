@@ -76,30 +76,13 @@ forces `(Nxx, Nyy, Nxy)`.
 Returns load factors ``λ`` such that ``N_{cr} = λ N_{ref}``, mode shapes on
 free DOFs, and non-dimensional ``k = N_{cr} a² / (π² D)`` when `a` is provided.
 """
-function plate_buckling(plate::ThinPlate.PlateMesh;
+function plate_buckling(plate;
     Nxx=1.0, Nyy=0.0, Nxy=0.0, nmodes=3, a=nothing)
 
-    isempty(plate.H) && assemble_plate!(plate)
+    has_cache(plate, :H) || assemble_plate!(plate)
     A, b, is_kin, known = apply_bc_plate(plate)
     free = findall(!, is_kin)
-    # Build RBF ops on w-sample points
-    n = length(plate.nodes)
-    ni = length(plate.internal)
-    nc = length(plate.corners)
-    pts = SVector{2,Float64}[]
-    w_index = Int[]
-    for i in 1:n
-        push!(pts, plate.nodes[i].pos)
-        push!(w_index, 2i - 1)
-    end
-    for k in 1:ni
-        push!(pts, plate.internal[k])
-        push!(w_index, 2n + k)
-    end
-    for c in 1:nc
-        push!(pts, plate.corners[c].pos)
-        push!(w_index, 2n + ni + c)
-    end
+    pts, w_index = ThinPlate._plate_w_samples(plate)
     ops = rbf_gradient_ops(pts; rbf=PHS(3; poly_deg=1))
     nw = length(w_index)
     Nxxv = fill(float(Nxx), nw)
@@ -146,7 +129,7 @@ function plate_buckling(plate::ThinPlate.PlateMesh;
         modes = [zeros(nfree)]
         m = 1
     end
-    D = bending_stiffness(plate.props)
+    D = bending_stiffness(plate.properties)
     kfac = if a !== nothing && abs(Nxx) > 0
         # N_cr = λ * Nxx_ref; k = N_cr a² /(π² D)
         [λs[i] * abs(Nxx) * a^2 / (π^2 * D) for i in 1:m]
@@ -162,11 +145,11 @@ end
 Thermal buckling under uniform temperature rise.
 Membrane force ``N_{αβ} = -\\frac{E h α ΔT}{1-ν} δ_{αβ}`` (plane stress, constrained).
 """
-function thermal_buckling(plate::ThinPlate.PlateMesh;
+function thermal_buckling(plate;
     α=1e-5, ΔT=1.0, nmodes=3, a=nothing)
-    E = plate.props.E
-    ν = plate.props.ν
-    h = plate.props.h
+    E = plate.properties.E
+    ν = plate.properties.ν
+    h = plate.properties.h
     # isotropic constrained thermal force (compression for ΔT>0)
     Nth = -E * h * α * ΔT / (1 - ν)
     return plate_buckling(plate; Nxx=Nth, Nyy=Nth, Nxy=0.0, nmodes=nmodes, a=a)

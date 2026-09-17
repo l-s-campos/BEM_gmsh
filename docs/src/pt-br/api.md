@@ -1,23 +1,26 @@
-# Referência de API
+# API (assinaturas em inglês)
 
-> 🌐 As páginas de API com `@docs` ficam em **inglês** (nomes dos símbolos Julia).
-> Use os links abaixo.
+As páginas de API geram `@docs` a partir do código (identificadores em inglês).
+Use os links abaixo; o texto de apoio está em inglês ao lado das assinaturas.
 
-| Tópico | Página |
-|--------|--------|
-| Estruturas de dados | [Data structures](../api/structures.md) |
-| Soluções fundamentais | [Fundamentals](../api/fundamentals.md) |
-| Entrada de malha | [Mesh I/O](../api/input.md) |
-| Montagem | [Assembly](../api/assembly.md) |
-| Solvers | [Solvers](../api/solvers.md) |
-| Soluções analíticas | [Analytical](../api/analytical.md) |
-| Visualização | [Visualization](../api/visualization.md) |
-| H-matrizes | [H-matrices](../api/hmatrices.md) |
-| Contato half-space | [Contact](../api/contact.md) |
-| Trincas | [Crack](../api/crack.md) |
-
-Convenções importantes (também em [Notas de teoria](theory.md)):
-
-- Fluxo Laplace: ``q = -k\,\partial T/\partial n`` (normal exterior)
-- Colocação descontínua Gauss em `format2d` (`tipo` = nº de nós − 1)
-- Onda: `solve_Houbolt` e `solve_transient_o2` no sistema completo ``M ü + A u = b``
+- [Estruturas](../api/structures.md) — `BEMdata`, `Laplace`, `Elasticity`
+- [Soluções fundamentais](../api/fundamentals.md)
+- [Malha](../api/input.md) — `format2d`, `quadrado`
+- [Montagem](../api/assembly.md) — `assemble!`
+- [Solvers](../api/solvers.md) — `solve`, transientes
+- [DIBEM](../api/dibem.md)
+- [BEM local](../api/local_bem.md)
+- [SBM / DRM](../api/sbm.md)
+- [Helmholtz](../api/helmholtz.md)
+- [Elasticidade](../api/elasticity.md)
+- [Analíticas](../api/analytical.md)
+- [Visualização](../api/visualization.md)
+- [H-matrizes](../api/hmatrices.md)
+- [FMM](../api/fmm.md)
+- [Trinca](../api/crack.md) — `using BEM.Crack`
+- [Coesivo](../api/cohesive.md)
+- [Contato](../api/contact.md) — `using BEM.Contact`
+- [Multirregião](../api/multiregion.md)
+- [Placas](../api/plates.md)
+- [Topologia](../api/topology.md)
+- [Exemplos](../api/examples.md)

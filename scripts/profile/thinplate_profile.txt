@@ -1,0 +1,173 @@
+[32m[1m  Activating[22m[39m project at `/data/OneDrive/pesquisa/BEM_gmsh`
+ThinPlate vs Laplace profile  n_el=8  threads=8
+Julia 1.13.0-rc3
+
+========================================================================
+1. Kernel micro-benchmarks (1e5 evals)
+========================================================================
+  plate_kernels iso typed          60.16 ns/call   alloc 0 B
+  plate_kernels via Abstract       56.48 ns/call   alloc 0 B
+  plate_kernels aniso             261.84 ns/call   alloc 0 B
+  fundamental Laplace              14.14 ns/call   alloc 0 B
+  elem_geom                      5575.90 ns/call   alloc 2704 B
+  shapefun(Legendre(2), ξ)       4229.04 ns/call   alloc 1536 B
+
+  kernel cost ratio iso/Laplace = 4.26
+  kernel cost ratio aniso/iso   = 4.35
+  abstract-props slowdown       = 0.94  (mesh.props is AbstractThinPlateProps)
+
+========================================================================
+2. Hot-path allocations (single call)
+========================================================================
+  _plate_singular_guiggiani!  710.62 KiB
+  integraelemsing (analytic)  16.02 KiB
+  compute_q_el                45.02 KiB
+  compute_Rw                  288 B
+  _poly_moments               5.69 KiB
+  PlateMesh.props type        ThinPlateProps  declared=AbstractThinPlateProps
+  element_type field          BEM.Legendre{Float64, Vector{Float64}, Vector{Float64}, Matrix{Float64}}  declared=Any
+
+========================================================================
+3. Assembly: ThinPlate vs Laplace  (n_el/edge=8, p=2, npg=12)
+========================================================================
+  Plate:  elements=32  nodes=96  ndof=197  (2n+ni+nc)
+  PlateMesh size = 634.86 KiB
+  assemble_plate! :guiggiani               0.877 s   alloc 465.92 MiB
+  assemble_plate! :analytic                0.751 s   alloc 395.38 MiB
+  assemble_plate! q_c=0 analytic           0.751 s   alloc 395.38 MiB
+  apply_bc_plate                           0.000 s   alloc 1.36 MiB
+  solve_plate!                             0.001 s   alloc 1.66 MiB
+
+  Laplace: elements=32  n=96  nt=96
+  BEMdata size = 24.64 KiB
+  H_G_full_direct serial                   0.042 s   alloc 23.31 MiB
+  H_G_full_direct threaded                 0.016 s   alloc 23.32 MiB
+  H_G_full_direct near=Inf                 0.457 s   alloc 150.15 MiB
+  applyBC + solve Laplace                  0.000 s   alloc 211.12 KiB
+
+  plate t / Laplace serial t     = 20.83x
+  plate analytic / Laplace       = 17.82x
+  plate ndof² / Laplace n²       = 4.21  (matrix work ratio)
+  plate t / N_src / n_el         = 285.58 μs  (src=nodes, all elems quad)
+  Laplace t / n / n_el           = 13.71 μs
+  plate H+G memory               = 606.48 KiB  (197×197 × 2)
+  Laplace H+G memory             = 144.09 KiB  (H (96, 96), G (96, 96))
+  q_c=0 vs q_c=1 (analytic)      = -1 ms extra for particular integral
+  guiggiani vs analytic          = 1.17x slower
+  Laplace far-lumping speedup    = 10.84x  (near=1.5 vs Inf)
+  Laplace thread speedup         = 2.67x  (nthreads=8)
+  apply_bc_plate copies H and G: 1.36 MiB
+
+========================================================================
+4. Scaling scan (analytic singular, npg=12, p=2)
+========================================================================
+  n_el   Nsrc   ndof    t[s]    alloc     t/ndof² [ns]   t/Nsrc/nel [μs]
+     4     48    101    0.192  105.06 MiB       18870.7          250.65
+     6     72    149    0.430  227.00 MiB       19383.0          249.03
+     8     96    197    0.811  395.38 MiB       20901.1          264.05
+    12    144    293    1.660  871.43 MiB       19335.9          240.16
+
+  Laplace dense (ordem=2, npg=12, serial, default near=1.5)
+  ndiv    n     nel     t[s]    alloc     t/n² [ns]      t/n/nel [μs]
+     5     48     16    0.019  10.75 MiB        8191.4           24.57
+     7     72     24    0.030  16.68 MiB        5723.2           17.17
+     9     96     32    0.042  23.31 MiB        4586.8           13.76
+    13    144     48    0.070  37.57 MiB        3368.5           10.11
+
+========================================================================
+5. Type stability
+========================================================================
+  plate_kernels(::ThinPlateProps)
+    Any≈0  ::Any≈0  Union{≈0  Core.Box≈0
+  plate_kernels(mesh.props Abstract)
+    Any≈0  ::Any≈0  Union{≈0  Core.Box≈0
+  fundamental(Laplace)
+    Any≈0  ::Any≈0  Union{≈0  Core.Box≈0
+  elem_geom
+    Any≈7  ::Any≈0  Union{≈3  Core.Box≈0
+  shapefun
+    Any≈0  ::Any≈0  Union{≈0  Core.Box≈0
+
+========================================================================
+6. CPU sample profile  assemble_plate! :guiggiani  n_el=8
+========================================================================
+ Count  Overhead File                    Line Function
+ =====  ======== ====                    ==== ========
+     8         0 @Base/multidimensional.jl  996 _unsafe_getindex(::IndexLinear, :…
+     8         0 @Base/abstractarray.jl  825 similar
+     8         0 @Base/abstractarray.jl  836 similar
+     8         0 @Base/array.jl          407 similar
+     8         0 @Base/boot.jl           662 Array
+     8         0 @BEM/…Core/Interpolation.jl   20 Equispaced
+     8         8 @Base/boot.jl           588 GenericMemory
+     8         5 @BEM/…rc/Plate/ThinPlate.jl  484 compute_q_el(pf::SVector{2, Float…
+     9         0 @BEM/…rc/Plate/ThinPlate.jl  619 (::BEM.Plate.ThinPlate.var"#assem…
+     9         0 @BEM/…rc/Plate/ThinPlate.jl  365 _plate_singular_guiggiani!
+     9         0 @BEM/…rc/Plate/ThinPlate.jl  594 (::BEM.Plate.ThinPlate.var"#assem…
+     9         9 @BEM/…rc/Plate/ThinPlate.jl  491 compute_q_el(pf::SVector{2, Float…
+    10         3 @Base/boot.jl           652 Array
+    10         4 @BEM/…rc/Plate/ThinPlate.jl  554 macro expansion
+    11        11 @Base/tuple.jl          163 indexed_iterate
+    11         0 @BEM/…Core/Interpolation.jl   19 Equispaced
+    11         0 @BEM/…Core/Interpolation.jl   57 nodes_weights(::Type{BEM.Equispac…
+    11         0 @BEM/…Core/Interpolation.jl  128 nodes
+    11         0 @Base/range.jl          157 range
+    11         0 @Base/range.jl          157 #range#29
+    11         0 @Base/range.jl          176 _range
+    12         0 @Base/multidimensional.jl  984 _getindex
+    12        11 @BEM/…rc/Plate/ThinPlate.jl  134 elem_geom(el::Element, ξ::Float64)
+    13         0 @BEM/…rc/Plate/ThinPlate.jl  634 (::BEM.Plate.ThinPlate.var"#assem…
+    13         0 @Base/abstractarray.jl 1363 getindex
+    13        10 @BEM/…rc/Plate/ThinPlate.jl  553 macro expansion
+    14         8 @BEM/…Core/Interpolation.jl  217 shapefun(poly::BEM.Equispaced{Flo…
+    15        14 @BEM/…rc/Plate/ThinPlate.jl  488 compute_q_el(pf::SVector{2, Float…
+    16        15 @BEM/…Core/Interpolation.jl  159 interpolation_matrix(poly::BEM.Le…
+    17         0 @BEM/…rc/Plate/ThinPlate.jl  378 (::BEM.Plate.ThinPlate.var"#8#9"{…
+    18         0 @Base/array.jl          864 collect_to_with_first!
+    18        15 @BEM/…rc/Plate/ThinPlate.jl  135 elem_geom(el::Element, ξ::Float64)
+    19         0 @BEM/…Core/Interpolation.jl   28 Equispaced
+    19         0 @BEM/…Core/Interpolation.jl   26 Equispaced
+    20         0 @Base/array.jl          886 collect_to!
+    21        19 @BEM/…Core/Interpolation.jl  160 interpolation_matrix(poly::BEM.Eq…
+    22         0 @BEM/…rc/Plate/ThinPlate.jl  377 _plate_singular_guiggiani!(h_el::…
+    27        25 @BEM/…Core/Interpolation.jl  173 interpolation_matrix(poly::BEM.Le…
+    32         0 @BEM/…rc/Plate/ThinPlate.jl  647 assemble_plate!(mesh::PlateMesh; …
+    32         0 @BEM/…rc/Plate/ThinPlate.jl  650 macro expansion
+    34         0 @BEM/…late/ThinPlateDual.jl  281 _plate_Nwt(el::Element, poly::BEM…
+    37         0 @BEM/…rc/Plate/ThinPlate.jl  374 (::BEM.Plate.ThinPlate.var"#sampl…
+    38         0 @BEM/…rc/Plate/ThinPlate.jl  586 kwcall(::@NamedTuple{free_term::F…
+
+========================================================================
+7. Structure comparison (what Laplace has that plates do not)
+========================================================================
+  Laplace (BEMdata + Assembly_full)
+  ---------------------------------
+  • H_G_full_direct: row-wise Threads.@threads, thread-local h/g buffers
+  • far nodal lumping when r > 1.5 L  (skips Gauss on most pairs)
+  • nearly-singular sinh via transform / closest_point_1d
+  • on-element Guiggiani fused G+H (guiggiani_GH, one sample pass)
+  • shapefun(poly, eta_vector) once per element (all qp together)
+  • H-matrix (H_G_Hmat), GPU far field, method=:dense|:hmatrix|:gpu
+  • typed Problem (Laplace) on BEMdata{<:Laplace} — specialized kernels
+  • applyBC in-place on cache; solve via LinearSolve
+
+  ThinPlate (PlateMesh + assemble_plate!)
+  ---------------------------------------
+  • serial @showprogress loops; no threaded= kwarg
+  • always full Gauss on every source–element pair (no far lumping)
+  • no sinh / closest-point nearly-singular map
+  • on-element: 5 separate guiggiani_integral calls (G + 4 H entries),
+    each allocating a closure + zeros; regular Gauss is run then overwritten
+  • shapefun + elem_geom at every scalar ξ
+  • no H-matrix / GPU path; cannot call assemble!(dad; method=...)
+  • PlateMesh.props::AbstractThinPlateProps  (runtime dispatch)
+  • PlateMesh.element_type::Any
+  • nested assemble_w_row! closure over H,G,qsi,...
+  • compute_q_el even when q≡0; I(2) allocated in the free-term loop
+  • apply_bc_plate copies H and G
+  • 2 DOFs/node + corners + internals  (Kirchhoff physics, not a bug)
+
+
+========================================================================
+8. Done
+========================================================================
